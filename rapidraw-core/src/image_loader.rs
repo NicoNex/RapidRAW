@@ -13,7 +13,12 @@ use image::{DynamicImage, ImageReader};
 use rawler::Orientation;
 use std::io::Cursor;
 
+use std::path::Path;
+
+use crate::formats::is_raw_file;
+use crate::image_processing::apply_cpu_default_raw_processing;
 use crate::image_processing::apply_orientation;
+use crate::raw_processing::develop_raw_image;
 
 /// Decode standard image bytes, honoring EXIF orientation, into an Rgb32F image.
 pub fn load_image_with_orientation(bytes: &[u8]) -> Result<DynamicImage> {
@@ -43,4 +48,20 @@ pub fn load_image_with_orientation(bytes: &[u8]) -> Result<DynamicImage> {
     };
 
     Ok(DynamicImage::ImageRgb32F(oriented_image.to_rgb32f()))
+}
+
+/// Decode any supported image (standard or RAW) into a display-ready base image.
+///
+/// RAW files are developed via `develop_raw_image` (engine default `linear_mode`
+/// = "auto", matching `default_linear_raw_mode()` in src-tauri) followed by the
+/// CPU default RAW processing pass. Standard formats honor EXIF orientation.
+pub fn load_base_image(path: &Path) -> Result<DynamicImage> {
+    let bytes = std::fs::read(path).context("Failed to read image file")?;
+    if is_raw_file(path) {
+        let mut img = develop_raw_image(&bytes, false, 2.5, "auto".to_string(), None)?;
+        apply_cpu_default_raw_processing(&mut img);
+        Ok(img)
+    } else {
+        load_image_with_orientation(&bytes)
+    }
 }
