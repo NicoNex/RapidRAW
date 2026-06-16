@@ -9,3 +9,6 @@ pub mod image_loader;
 
 mod context;
 pub use context::headless_context;
+
+mod render;
+pub use render::render;
