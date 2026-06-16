@@ -6,3 +6,6 @@ pub mod lut_processing;
 pub mod image_processing;
 pub mod gpu_processing;
 pub mod image_loader;
+
+mod context;
+pub use context::headless_context;
