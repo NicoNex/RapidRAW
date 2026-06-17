@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gtk::prelude::*;
-use image::{GenericImageView, RgbaImage};
+use image::{DynamicImage, GenericImageView, RgbaImage};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
 
@@ -19,6 +21,7 @@ const THUMB_DIM: u32 = 300;
 enum AppMsg {
     OpenFolderDialog,
     FolderChosen(PathBuf),
+    OpenInEditor(PathBuf),
 }
 
 #[derive(Debug)]
@@ -26,12 +29,17 @@ enum CmdMsg {
     /// A worker finished decoding+downscaling a thumbnail. Carries the factory
     /// index and the raw RGBA pixels (the gdk texture is built on the main thread).
     ThumbReady(usize, RgbaImage),
+    /// A worker finished decoding the full base image for the editor.
+    BaseReady(PathBuf, DynamicImage),
 }
 
 struct AppModel {
     engine: Engine,
     session: Session,
     images: Vec<PathBuf>,
+    /// Mirror of `images`, shared into the FlowBox child-activated closure so a
+    /// clicked child index can be mapped back to its path.
+    images_shared: Rc<RefCell<Vec<PathBuf>>>,
     thumbs: FactoryVecDeque<Thumb>,
 }
 
@@ -57,19 +65,39 @@ impl Component for AppModel {
                     },
                 },
 
-                gtk::ScrolledWindow {
+                #[name = "stack"]
+                gtk::Stack {
                     set_vexpand: true,
                     set_hexpand: true,
-                    set_hscrollbar_policy: gtk::PolicyType::Never,
 
-                    #[local_ref]
-                    flow_box -> gtk::FlowBox {
-                        set_valign: gtk::Align::Start,
-                        set_selection_mode: gtk::SelectionMode::Single,
-                        set_homogeneous: true,
-                        set_column_spacing: 8,
-                        set_row_spacing: 8,
-                        set_margin_all: 8,
+                    add_named[Some("library")] = &gtk::ScrolledWindow {
+                        set_hscrollbar_policy: gtk::PolicyType::Never,
+
+                        #[local_ref]
+                        flow_box -> gtk::FlowBox {
+                            set_valign: gtk::Align::Start,
+                            set_selection_mode: gtk::SelectionMode::Single,
+                            set_homogeneous: true,
+                            set_column_spacing: 8,
+                            set_row_spacing: 8,
+                            set_margin_all: 8,
+                            connect_child_activated[sender, images] => move |_, child| {
+                                let idx = child.index();
+                                if idx >= 0 {
+                                    if let Some(path) = images.borrow().get(idx as usize) {
+                                        sender.input(AppMsg::OpenInEditor(path.clone()));
+                                    }
+                                }
+                            },
+                        },
+                    },
+
+                    add_named[Some("editor")] = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        gtk::Label {
+                            set_vexpand: true,
+                            set_label: "Editor (Phase 8)",
+                        },
                     },
                 },
             },
@@ -89,15 +117,23 @@ impl Component for AppModel {
             engine,
             session: Session::default(),
             images: Vec::new(),
+            images_shared: Rc::new(RefCell::new(Vec::new())),
             thumbs,
         };
 
         let flow_box = model.thumbs.widget();
+        let images = model.images_shared.clone();
         let widgets = view_output!();
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        msg: Self::Input,
+        sender: ComponentSender<Self>,
+        root: &Self::Root,
+    ) {
         match msg {
             AppMsg::OpenFolderDialog => {
                 let dialog = gtk::FileDialog::builder().title("Select folder").build();
@@ -114,6 +150,7 @@ impl Component for AppModel {
             AppMsg::FolderChosen(path) => {
                 log::info!("Folder chosen: {}", path.display());
                 self.images = library::scan_dir(&path);
+                *self.images_shared.borrow_mut() = self.images.clone();
                 log::info!("{} images", self.images.len());
                 self.session.current_folder = Some(path);
 
@@ -151,7 +188,23 @@ impl Component for AppModel {
                     });
                 }
             }
+            AppMsg::OpenInEditor(path) => {
+                log::info!("Open in editor: {}", path.display());
+                self.session.active_path = Some(path.clone());
+                widgets.stack.set_visible_child_name("editor");
+                let p = path.clone();
+                sender.oneshot_command(async move {
+                    match rapidraw_core::load_base_image(&p) {
+                        Ok(img) => CmdMsg::BaseReady(p, img),
+                        Err(e) => {
+                            log::warn!("base decode failed for {}: {e}", p.display());
+                            CmdMsg::BaseReady(p, DynamicImage::new_rgba8(1, 1))
+                        }
+                    }
+                });
+            }
         }
+        self.update_view(widgets, sender);
     }
 
     fn update_cmd(
@@ -165,6 +218,11 @@ impl Component for AppModel {
                 // Build the gdk texture here, on the main thread.
                 let tex = library::texture_from_rgba(&rgba);
                 self.thumbs.send(i, ThumbMsg::SetTexture(tex));
+            }
+            CmdMsg::BaseReady(path, img) => {
+                let (w, h) = img.dimensions();
+                log::info!("base image ready: {} ({w}x{h})", path.display());
+                self.session.base_image = Some(Arc::new(img));
             }
         }
     }
