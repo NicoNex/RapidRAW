@@ -32,7 +32,7 @@ use thumb::{Thumb, ThumbMsg};
 /// Debounce window (ms) for coalescing rapid slider drags into one render.
 /// Small: the render thread also coalesces, and the cached GpuProcessor makes
 /// each render cheap, so a short debounce keeps the preview responsive.
-const RENDER_DEBOUNCE_MS: u64 = 15;
+const RENDER_DEBOUNCE_MS: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -316,10 +316,12 @@ impl Component for AppModel {
                         },
 
                         #[name = "editor_page"]
-                        gtk::Box {
+                        gtk::Paned {
                             set_vexpand: true,
-                            // Canvas on the left, adjustment panel on the right.
+                            // Canvas on the left, adjustment panel on the right,
+                            // with a draggable, mouse-resizable divider.
                             set_orientation: gtk::Orientation::Horizontal,
+                            set_wide_handle: true,
                         },
                     },
                 },
@@ -354,13 +356,23 @@ impl Component for AppModel {
         let flow_box = model.thumbs.widget();
         let images = model.images_shared.clone();
         let widgets = view_output!();
-        // Editor page: canvas on the left; right column = histogram on top of
-        // the adjustment panel.
-        widgets.editor_page.append(model.canvas.root());
+        // Editor page: canvas on the left; right column = scopes on top of the
+        // adjustment panel. A Paned divider keeps the panel at a fixed,
+        // mouse-resizable width that the photo zoom never disturbs.
         let right = gtk::Box::new(gtk::Orientation::Vertical, 4);
         right.append(model.scopes.root());
         right.append(model.panel.root());
-        widgets.editor_page.append(&right);
+        let paned = &widgets.editor_page;
+        paned.set_start_child(Some(model.canvas.root()));
+        paned.set_end_child(Some(&right));
+        // Start (canvas) absorbs window resizes and may shrink below its child's
+        // size (clipped); the panel keeps its width unless the user drags.
+        paned.set_resize_start_child(true);
+        paned.set_shrink_start_child(true);
+        paned.set_resize_end_child(false);
+        paned.set_shrink_end_child(false);
+        // Comfortable default panel width (~380px); window opens at 1440.
+        paned.set_position(1060);
         ComponentParts { model, widgets }
     }
 

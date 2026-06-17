@@ -26,7 +26,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            preview_dim: 2048,
+            preview_dim: 1600,
             thumb_dim: 300,
             background: Background::Default,
         }
@@ -34,7 +34,7 @@ impl Default for Settings {
 }
 
 // Option tables: index <-> value mappings shared between selection and read-back.
-const PREVIEW_DIMS: [u32; 3] = [1024, 2048, 4096];
+const PREVIEW_DIMS: [u32; 4] = [1024, 1600, 2048, 4096];
 const THUMB_DIMS: [u32; 3] = [200, 300, 400];
 
 fn background_to_index(bg: Background) -> u32 {
@@ -105,7 +105,7 @@ pub fn present(
 
     let preview_row = adw::ComboRow::new();
     preview_row.set_title("Preview quality");
-    let preview_model = gtk::StringList::new(&["1024 px", "2048 px", "4096 px"]);
+    let preview_model = gtk::StringList::new(&["1024 px", "1600 px", "2048 px", "4096 px"]);
     preview_row.set_model(Some(&preview_model));
     preview_row.set_selected(nearest_index(&PREVIEW_DIMS, current.preview_dim));
 
