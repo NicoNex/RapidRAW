@@ -146,6 +146,22 @@ impl EditorCanvas {
         }
     }
 
+    /// Swap in a new preview of the SAME image without changing the view:
+    /// keeps zoom/pan, compensating if the preview resolution differs.
+    pub fn update_texture(&self, texture: &gdk::MemoryTexture) {
+        let (nw, nh) = (texture.width(), texture.height());
+        let (onw, _) = self.view.natural.get();
+        if onw > 0 && nw > 0 {
+            // Keep the on-screen size (natural*scale) constant.
+            self.view
+                .scale
+                .set(self.view.scale.get() * onw as f64 / nw as f64);
+        }
+        self.view.natural.set((nw, nh));
+        self.picture.set_paintable(Some(texture));
+        apply(&self.picture, &self.root, &self.view);
+    }
+
     /// Show an image, fit + centered in the viewport.
     pub fn set_texture(&self, texture: &gdk::MemoryTexture) {
         self.view.natural.set((texture.width(), texture.height()));

@@ -399,6 +399,10 @@ impl Component for AppModel {
             thumb_gen: Arc::new(AtomicUsize::new(0)),
             thumb_loaded: Vec::new(),
         };
+        // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
+        // feather = 50) so effects behave like the original at zero amount.
+        let mut model = model;
+        controls::init_defaults(&mut model.session.adjustments.global);
 
         let flow_box = model.thumbs.widget();
         let images = model.images_shared.clone();
@@ -764,7 +768,8 @@ impl Component for AppModel {
                 }
                 self.scopes.set_data(&rgba);
                 let tex = library::texture_from_rgba(&rgba);
-                self.canvas.set_texture(&tex);
+                // Preserve the user's zoom/pan across preview updates.
+                self.canvas.update_texture(&tex);
             }
             CmdMsg::ExportDone(Ok(path)) => {
                 log::info!("export saved: {}", path.display());

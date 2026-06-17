@@ -1,9 +1,11 @@
 //! Right-side adjustment panel: all default (global) editor sections, visually
-//! grouped (Curves, Basic, Color, Details, Effects, LUT).
+//! grouped as cards (Curves, Basic, Color, Details, Effects, LUT).
 //!
-//! Plain GTK. Every scale writes one `GlobalAdjustments` field via a fn-pointer
-//! setter (`AppMsg::Adjust`); the UI value is divided by the per-field `scale`
-//! (mirroring `image_processing::SCALES`) so sensitivity matches the original.
+//! Every scale writes one `GlobalAdjustments` field via a fn-pointer setter
+//! (`AppMsg::Adjust`); the UI value is divided by the per-field `scale`
+//! (mirroring `image_processing::SCALES`). Each row also carries a UI `default`
+//! (mostly 0, but e.g. vignette midpoint/feather are 50) so sliders start where
+//! the original UI does and `init_defaults` seeds the engine struct to match.
 
 use gtk::prelude::*;
 use relm4::{ComponentSender, RelmWidgetExt};
@@ -14,79 +16,75 @@ use crate::{AppModel, AppMsg};
 use rapidraw_core::image_processing::GlobalAdjustments;
 
 type Setter = fn(&mut GlobalAdjustments, f32);
-/// `(label, min, max, step, scale, setter)`.
-type Row = (&'static str, f64, f64, f64, f64, Setter);
+/// `(label, min, max, step, scale, default, setter)`.
+type Row = (&'static str, f64, f64, f64, f64, f64, Setter);
 
 const BASIC: &[Row] = &[
-    ("Exposure", -5.0, 5.0, 0.01, 0.8, |g, v| g.exposure = v),
-    ("Contrast", -100.0, 100.0, 1.0, 100.0, |g, v| g.contrast = v),
-    ("Highlights", -100.0, 100.0, 1.0, 120.0, |g, v| g.highlights = v),
-    ("Shadows", -100.0, 100.0, 1.0, 120.0, |g, v| g.shadows = v),
-    ("Whites", -100.0, 100.0, 1.0, 30.0, |g, v| g.whites = v),
-    ("Blacks", -100.0, 100.0, 1.0, 70.0, |g, v| g.blacks = v),
+    ("Exposure", -5.0, 5.0, 0.01, 0.8, 0.0, |g, v| g.exposure = v),
+    ("Contrast", -100.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.contrast = v),
+    ("Highlights", -100.0, 100.0, 1.0, 120.0, 0.0, |g, v| g.highlights = v),
+    ("Shadows", -100.0, 100.0, 1.0, 120.0, 0.0, |g, v| g.shadows = v),
+    ("Whites", -100.0, 100.0, 1.0, 30.0, 0.0, |g, v| g.whites = v),
+    ("Blacks", -100.0, 100.0, 1.0, 70.0, 0.0, |g, v| g.blacks = v),
 ];
 
 const DETAILS: &[Row] = &[
-    ("Sharpness", -100.0, 100.0, 1.0, 50.0, |g, v| g.sharpness = v),
-    ("Sharpness Threshold", 0.0, 80.0, 1.0, 100.0, |g, v| {
+    ("Sharpness", -100.0, 100.0, 1.0, 50.0, 0.0, |g, v| g.sharpness = v),
+    ("Sharpness Threshold", 0.0, 80.0, 1.0, 100.0, 15.0, |g, v| {
         g.sharpness_threshold = v
     }),
-    ("Clarity", -100.0, 100.0, 1.0, 200.0, |g, v| g.clarity = v),
-    ("Dehaze", -100.0, 100.0, 1.0, 750.0, |g, v| g.dehaze = v),
-    ("Structure", -100.0, 100.0, 1.0, 200.0, |g, v| g.structure = v),
-    ("Centre", -100.0, 100.0, 1.0, 250.0, |g, v| g.centré = v),
-    ("Luminance NR", 0.0, 100.0, 1.0, 100.0, |g, v| {
+    ("Clarity", -100.0, 100.0, 1.0, 200.0, 0.0, |g, v| g.clarity = v),
+    ("Dehaze", -100.0, 100.0, 1.0, 750.0, 0.0, |g, v| g.dehaze = v),
+    ("Structure", -100.0, 100.0, 1.0, 200.0, 0.0, |g, v| g.structure = v),
+    ("Centre", -100.0, 100.0, 1.0, 250.0, 0.0, |g, v| g.centré = v),
+    ("Luminance NR", 0.0, 100.0, 1.0, 100.0, 0.0, |g, v| {
         g.luma_noise_reduction = v
     }),
-    ("Color NR", 0.0, 100.0, 1.0, 100.0, |g, v| {
+    ("Color NR", 0.0, 100.0, 1.0, 100.0, 0.0, |g, v| {
         g.color_noise_reduction = v
     }),
-    ("Chromatic Aberration R/C", -100.0, 100.0, 1.0, 10000.0, |g, v| {
+    ("Chromatic Aberration R/C", -100.0, 100.0, 1.0, 10000.0, 0.0, |g, v| {
         g.chromatic_aberration_red_cyan = v
     }),
-    ("Chromatic Aberration B/Y", -100.0, 100.0, 1.0, 10000.0, |g, v| {
+    ("Chromatic Aberration B/Y", -100.0, 100.0, 1.0, 10000.0, 0.0, |g, v| {
         g.chromatic_aberration_blue_yellow = v
     }),
 ];
 
 const EFFECTS: &[Row] = &[
-    ("Glow", 0.0, 100.0, 1.0, 100.0, |g, v| g.glow_amount = v),
-    ("Halation", 0.0, 100.0, 1.0, 100.0, |g, v| g.halation_amount = v),
-    ("Light Flares", 0.0, 100.0, 1.0, 100.0, |g, v| g.flare_amount = v),
-    ("Vignette Amount", -100.0, 100.0, 1.0, 100.0, |g, v| {
+    ("Glow", 0.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.glow_amount = v),
+    ("Halation", 0.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.halation_amount = v),
+    ("Light Flares", 0.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.flare_amount = v),
+    ("Vignette Amount", -100.0, 100.0, 1.0, 100.0, 0.0, |g, v| {
         g.vignette_amount = v
     }),
-    ("Vignette Midpoint", 0.0, 100.0, 1.0, 100.0, |g, v| {
+    ("Vignette Midpoint", 0.0, 100.0, 1.0, 100.0, 50.0, |g, v| {
         g.vignette_midpoint = v
     }),
-    ("Vignette Roundness", -100.0, 100.0, 1.0, 100.0, |g, v| {
+    ("Vignette Roundness", -100.0, 100.0, 1.0, 100.0, 0.0, |g, v| {
         g.vignette_roundness = v
     }),
-    ("Vignette Feather", 0.0, 100.0, 1.0, 100.0, |g, v| {
+    ("Vignette Feather", 0.0, 100.0, 1.0, 100.0, 50.0, |g, v| {
         g.vignette_feather = v
     }),
-    ("Grain Amount", 0.0, 100.0, 1.0, 200.0, |g, v| g.grain_amount = v),
-    ("Grain Size", 0.0, 100.0, 1.0, 50.0, |g, v| g.grain_size = v),
-    ("Grain Roughness", 0.0, 100.0, 1.0, 100.0, |g, v| {
+    ("Grain Amount", 0.0, 100.0, 1.0, 200.0, 0.0, |g, v| g.grain_amount = v),
+    ("Grain Size", 0.0, 100.0, 1.0, 50.0, 25.0, |g, v| g.grain_size = v),
+    ("Grain Roughness", 0.0, 100.0, 1.0, 100.0, 50.0, |g, v| {
         g.grain_roughness = v
     }),
 ];
 
-// White balance + presence (the flat Color sliders).
 const COLOR_WB: &[Row] = &[
-    ("Temperature", -100.0, 100.0, 1.0, 25.0, |g, v| g.temperature = v),
-    ("Tint", -100.0, 100.0, 1.0, 100.0, |g, v| g.tint = v),
+    ("Temperature", -100.0, 100.0, 1.0, 25.0, 0.0, |g, v| g.temperature = v),
+    ("Tint", -100.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.tint = v),
 ];
 const COLOR_PRESENCE: &[Row] = &[
-    ("Vibrance", -100.0, 100.0, 1.0, 100.0, |g, v| g.vibrance = v),
-    ("Saturation", -100.0, 100.0, 1.0, 100.0, |g, v| g.saturation = v),
-    ("Hue", -180.0, 180.0, 1.0, 1.0, |g, v| g.hue = v),
+    ("Vibrance", -100.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.vibrance = v),
+    ("Saturation", -100.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.saturation = v),
+    ("Hue", -180.0, 180.0, 1.0, 1.0, 0.0, |g, v| g.hue = v),
 ];
 
-// HSL mixer: hue is multiplied by 0.3 in the engine, so scale = 1/0.3.
 const HSL_HUE_SCALE: f64 = 1.0 / 0.3;
-/// `(band, hue_set, sat_set, lum_set)` — indices are literal so these stay fn
-/// pointers (no capture).
 const HSL_BANDS: &[(&str, Setter, Setter, Setter)] = &[
     ("Reds", |g, v| g.hsl[0].hue = v, |g, v| g.hsl[0].saturation = v, |g, v| g.hsl[0].luminance = v),
     ("Oranges", |g, v| g.hsl[1].hue = v, |g, v| g.hsl[1].saturation = v, |g, v| g.hsl[1].luminance = v),
@@ -99,28 +97,55 @@ const HSL_BANDS: &[(&str, Setter, Setter, Setter)] = &[
 ];
 
 const CALIBRATION: &[Row] = &[
-    ("Shadows Tint", -100.0, 100.0, 1.0, 400.0, |g, v| {
+    ("Shadows Tint", -100.0, 100.0, 1.0, 400.0, 0.0, |g, v| {
         g.color_calibration.shadows_tint = v
     }),
-    ("Red Hue", -100.0, 100.0, 1.0, 400.0, |g, v| {
+    ("Red Hue", -100.0, 100.0, 1.0, 400.0, 0.0, |g, v| {
         g.color_calibration.red_hue = v
     }),
-    ("Red Saturation", -100.0, 100.0, 1.0, 120.0, |g, v| {
+    ("Red Saturation", -100.0, 100.0, 1.0, 120.0, 0.0, |g, v| {
         g.color_calibration.red_saturation = v
     }),
-    ("Green Hue", -100.0, 100.0, 1.0, 400.0, |g, v| {
+    ("Green Hue", -100.0, 100.0, 1.0, 400.0, 0.0, |g, v| {
         g.color_calibration.green_hue = v
     }),
-    ("Green Saturation", -100.0, 100.0, 1.0, 120.0, |g, v| {
+    ("Green Saturation", -100.0, 100.0, 1.0, 120.0, 0.0, |g, v| {
         g.color_calibration.green_saturation = v
     }),
-    ("Blue Hue", -100.0, 100.0, 1.0, 400.0, |g, v| {
+    ("Blue Hue", -100.0, 100.0, 1.0, 400.0, 0.0, |g, v| {
         g.color_calibration.blue_hue = v
     }),
-    ("Blue Saturation", -100.0, 100.0, 1.0, 120.0, |g, v| {
+    ("Blue Saturation", -100.0, 100.0, 1.0, 120.0, 0.0, |g, v| {
         g.color_calibration.blue_saturation = v
     }),
 ];
+
+const GRADING_EXTRA: &[Row] = &[
+    ("Blending", 0.0, 100.0, 1.0, 100.0, 0.0, |g, v| {
+        g.color_grading_blending = v
+    }),
+    ("Balance", -100.0, 100.0, 1.0, 200.0, 0.0, |g, v| {
+        g.color_grading_balance = v
+    }),
+];
+
+/// Seed `g` with the UI defaults (most 0, but e.g. vignette feather/midpoint
+/// are 50). Keeps the engine struct in sync with the slider start positions.
+pub fn init_defaults(g: &mut GlobalAdjustments) {
+    for table in [
+        BASIC,
+        DETAILS,
+        EFFECTS,
+        COLOR_WB,
+        COLOR_PRESENCE,
+        CALIBRATION,
+        GRADING_EXTRA,
+    ] {
+        for &(_, _, _, _, scale, default, set) in table {
+            set(g, (default / scale) as f32);
+        }
+    }
+}
 
 pub struct AdjustPanel {
     root: gtk::ScrolledWindow,
@@ -140,7 +165,6 @@ impl AdjustPanel {
 
         let vadj = root.vadjustment();
 
-        // Curves first, like the original UI. Each section is a "card".
         let curves = CurveEditor::new(sender);
         list.append(&card(&expander("Curves", curves.root(), true)));
         list.append(&card(&section("Basic", BASIC, sender, &vadj)));
@@ -157,8 +181,8 @@ impl AdjustPanel {
     }
 }
 
-/// Wrap a section widget in a libadwaita `.card` so the groups read as
-/// distinct panels (like the default UI).
+/// Wrap a section widget in a libadwaita `.card` so groups read as distinct
+/// panels (like the default UI).
 fn card(child: &impl IsA<gtk::Widget>) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
     b.add_css_class("card");
@@ -172,7 +196,6 @@ fn card(child: &impl IsA<gtk::Widget>) -> gtk::Box {
     b
 }
 
-/// Wrap `child` in an expanded `Expander` titled `title`.
 fn expander(title: &str, child: &impl IsA<gtk::Widget>, expanded: bool) -> gtk::Expander {
     let e = gtk::Expander::new(Some(title));
     e.set_expanded(expanded);
@@ -180,7 +203,6 @@ fn expander(title: &str, child: &impl IsA<gtk::Widget>, expanded: bool) -> gtk::
     e
 }
 
-/// A bold sub-group header inside a section.
 fn subheader(text: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.set_halign(gtk::Align::Start);
@@ -189,7 +211,6 @@ fn subheader(text: &str) -> gtk::Label {
     l
 }
 
-/// Build an expander whose body is a vertical box of slider rows.
 fn section(
     title: &str,
     rows: &[Row],
@@ -208,12 +229,11 @@ fn append_rows(
     sender: &ComponentSender<AppModel>,
     vadj: &gtk::Adjustment,
 ) {
-    for &(label, min, max, step, scale, set) in rows {
-        body.append(&build_row(label, min, max, step, scale, set, sender, vadj));
+    for &(label, min, max, step, scale, default, set) in rows {
+        body.append(&build_row(label, min, max, step, scale, default, set, sender, vadj));
     }
 }
 
-/// The Color section: white balance, presence, grading wheels, HSL, calibration.
 fn build_color(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Expander {
     let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
     body.set_margin_all(4);
@@ -236,7 +256,6 @@ fn build_color(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gt
     expander("Color", &body, true)
 }
 
-/// Four color-grading wheels (shadows/midtones/highlights/global) + blending/balance.
 fn build_grading(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Box {
     let wrap = gtk::Box::new(gtk::Orientation::Vertical, 4);
 
@@ -277,29 +296,19 @@ fn build_grading(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> 
         flow.append(w.root());
     }
     wrap.append(&flow);
-
-    let bl: &[Row] = &[
-        ("Blending", 0.0, 100.0, 1.0, 100.0, |g, v| {
-            g.color_grading_blending = v
-        }),
-        ("Balance", -100.0, 100.0, 1.0, 200.0, |g, v| {
-            g.color_grading_balance = v
-        }),
-    ];
-    append_rows(&wrap, bl, sender, vadj);
+    append_rows(&wrap, GRADING_EXTRA, sender, vadj);
     wrap
 }
 
-/// HSL mixer: one collapsible sub-group per color band, each with H/S/L sliders.
 fn build_hsl(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Box {
     let wrap = gtk::Box::new(gtk::Orientation::Vertical, 2);
     for &(band, hue_set, sat_set, lum_set) in HSL_BANDS {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
         body.set_margin_all(4);
         let rows: [Row; 3] = [
-            ("Hue", -100.0, 100.0, 1.0, HSL_HUE_SCALE, hue_set),
-            ("Saturation", -100.0, 100.0, 1.0, 100.0, sat_set),
-            ("Luminance", -100.0, 100.0, 1.0, 100.0, lum_set),
+            ("Hue", -100.0, 100.0, 1.0, HSL_HUE_SCALE, 0.0, hue_set),
+            ("Saturation", -100.0, 100.0, 1.0, 100.0, 0.0, sat_set),
+            ("Luminance", -100.0, 100.0, 1.0, 100.0, 0.0, lum_set),
         ];
         append_rows(&body, &rows, sender, vadj);
         wrap.append(&expander(band, &body, false));
@@ -314,6 +323,7 @@ fn build_row(
     max: f64,
     step: f64,
     scale: f64,
+    default: f64,
     set: Setter,
     sender: &ComponentSender<AppModel>,
     vadj: &gtk::Adjustment,
@@ -328,7 +338,7 @@ fn build_row(
     s.set_hexpand(true);
     s.set_draw_value(true);
     s.set_digits(if step < 1.0 { 2 } else { 0 });
-    s.set_value(0.0);
+    s.set_value(default); // before connecting, so this doesn't emit
 
     forward_wheel(&s, vadj);
 
@@ -342,12 +352,13 @@ fn build_row(
         });
     }
 
+    // Double-click resets to the field's default.
     let reset = gtk::GestureClick::new();
     {
         let s = s.clone();
         reset.connect_pressed(move |_, n, _, _| {
             if n == 2 {
-                s.set_value(0.0);
+                s.set_value(default);
             }
         });
     }
@@ -358,7 +369,7 @@ fn build_row(
     row
 }
 
-/// Make a slider's mouse wheel scroll the panel (`vadj`) instead of changing
+/// Make a widget's mouse wheel scroll the panel (`vadj`) instead of changing
 /// its value. Captured before the widget's own handler runs.
 pub fn forward_wheel(widget: &impl IsA<gtk::Widget>, vadj: &gtk::Adjustment) {
     let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
@@ -374,7 +385,6 @@ pub fn forward_wheel(widget: &impl IsA<gtk::Widget>, vadj: &gtk::Adjustment) {
     widget.as_ref().add_controller(wheel);
 }
 
-/// The LUT section: load/clear a .cube/.3dl file plus an intensity slider.
 fn build_lut_section(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Expander {
     let lut_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     lut_box.set_margin_all(6);
