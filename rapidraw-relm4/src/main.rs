@@ -77,6 +77,10 @@ enum AppMsg {
     RequestRender,
     /// Debounce timer fired: actually launch the background render.
     DoRender,
+    /// Export button: open the save dialog.
+    ExportDialog,
+    /// A save path was chosen: full-res render + JPEG encode to it.
+    ExportTo(PathBuf),
 }
 
 #[derive(Debug)]
@@ -89,6 +93,8 @@ enum CmdMsg {
     /// A worker finished a preview render. Carries the RGBA pixels (the gdk
     /// texture is built on the main thread).
     RenderReady(RgbaImage),
+    /// A worker finished a full-res export: Ok(path) or Err(message).
+    ExportDone(Result<PathBuf, String>),
 }
 
 struct AppModel {
@@ -128,6 +134,10 @@ impl Component for AppModel {
                     pack_start = &gtk::Button {
                         set_label: "Open Folder",
                         connect_clicked => AppMsg::OpenFolderDialog,
+                    },
+                    pack_end = &gtk::Button {
+                        set_label: "Export",
+                        connect_clicked => AppMsg::ExportDialog,
                     },
                 },
 
@@ -332,6 +342,52 @@ impl Component for AppModel {
                     }
                 });
             }
+            AppMsg::ExportDialog => {
+                if self.session.base_image.is_none() {
+                    log::warn!("export: no image open");
+                    return;
+                }
+                // Default filename: <source stem>.jpg.
+                let suggested = self
+                    .session
+                    .active_path
+                    .as_ref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| format!("{}.jpg", s.to_string_lossy()))
+                    .unwrap_or_else(|| "export.jpg".to_string());
+                let dialog = gtk::FileDialog::builder()
+                    .title("Export JPEG")
+                    .initial_name(suggested)
+                    .build();
+                let parent = root.clone();
+                let sender = sender.clone();
+                dialog.save(Some(&parent), gtk::gio::Cancellable::NONE, move |res| {
+                    if let Ok(file) = res {
+                        if let Some(path) = file.path() {
+                            sender.input(AppMsg::ExportTo(path));
+                        }
+                    }
+                });
+            }
+            AppMsg::ExportTo(path) => {
+                let Some(base) = self.session.base_image.clone() else {
+                    return;
+                };
+                let ctx = self.engine.ctx.clone();
+                let adj = self.session.adjustments.clone();
+                log::info!("exporting to {}", path.display());
+                sender.oneshot_command(async move {
+                    // Full-res render (no downscale), then JPEG encode to the path.
+                    let result = rapidraw_core::render(&ctx, &base, &adj, None)
+                        .and_then(|out| {
+                            out.to_rgb8()
+                                .save_with_format(&path, image::ImageFormat::Jpeg)
+                                .map_err(|e| e.to_string())
+                        })
+                        .map(|()| path);
+                    CmdMsg::ExportDone(result)
+                });
+            }
         }
         self.update_view(widgets, sender);
     }
@@ -369,6 +425,12 @@ impl Component for AppModel {
                 }
                 let tex = library::texture_from_rgba(&rgba);
                 self.canvas.set_texture(&tex);
+            }
+            CmdMsg::ExportDone(Ok(path)) => {
+                log::info!("export saved: {}", path.display());
+            }
+            CmdMsg::ExportDone(Err(e)) => {
+                log::warn!("export failed: {e}");
             }
         }
     }
