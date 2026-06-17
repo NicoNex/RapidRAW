@@ -4,6 +4,7 @@ use std::sync::Arc;
 use gtk::prelude::*;
 use relm4::prelude::*;
 
+mod library;
 mod state;
 use state::{Engine, Session};
 
@@ -16,6 +17,7 @@ enum AppMsg {
 struct AppModel {
     engine: Engine,
     session: Session,
+    images: Vec<PathBuf>,
 }
 
 #[relm4::component]
@@ -56,6 +58,7 @@ impl Component for AppModel {
         let model = AppModel {
             engine,
             session: Session::default(),
+            images: Vec::new(),
         };
         let widgets = view_output!();
         ComponentParts { model, widgets }
@@ -81,8 +84,9 @@ impl Component for AppModel {
             }
             AppMsg::FolderChosen(path) => {
                 log::info!("Folder chosen: {}", path.display());
+                self.images = library::scan_dir(&path);
+                log::info!("{} images", self.images.len());
                 self.session.current_folder = Some(path);
-                // Phase 7: kick off scan
             }
         }
     }
