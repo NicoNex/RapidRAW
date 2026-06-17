@@ -33,12 +33,16 @@ pub fn scan_dir(dir: &Path) -> Vec<PathBuf> {
 /// main thread — gdk objects are not `Send`.
 pub fn texture_from_rgba(rgba: &RgbaImage) -> gdk::MemoryTexture {
     let (w, h) = rgba.dimensions();
-    let bytes = Bytes::from(rgba.as_raw());
-    gdk::MemoryTexture::new(
+    // from_owned takes ownership of the buffer copy, removing any lifetime
+    // ambiguity about what backs the texture.
+    let bytes = Bytes::from_owned(rgba.as_raw().clone());
+    let tex = gdk::MemoryTexture::new(
         w as i32,
         h as i32,
         gdk::MemoryFormat::R8g8b8a8,
         &bytes,
         (w * 4) as usize,
-    )
+    );
+    log::debug!("texture built {}x{}", w, h);
+    tex
 }

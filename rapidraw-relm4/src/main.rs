@@ -4,8 +4,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use adw::prelude::*;
 use gtk::glib;
-use gtk::prelude::*;
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
@@ -17,6 +17,7 @@ mod state;
 mod thumb;
 use controls::AdjustPanel;
 use editor::EditorCanvas;
+use rapidraw_core::image_processing::GlobalAdjustments;
 use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
 
@@ -27,43 +28,19 @@ const PREVIEW_DIM: u32 = 2048;
 /// Debounce window (ms) for coalescing rapid slider drags into one render.
 const RENDER_DEBOUNCE_MS: u64 = 80;
 
-/// Identifies a single exposed `GlobalAdjustments` f32 field. The slider panel
-/// in `controls.rs` builds one row per variant; `with` packages a new value
-/// into the `Adjust` message the model applies.
-#[derive(Debug, Clone, Copy)]
-pub enum AdjustField {
-    Exposure,
-    Contrast,
-    Highlights,
-    Shadows,
-    Whites,
-    Blacks,
-    Temperature,
-    Tint,
-    Vibrance,
-    Saturation,
-    Clarity,
-    Dehaze,
-    Structure,
-    Sharpness,
-    LumaNoiseReduction,
-    ColorNoiseReduction,
-    Vignette,
-    Grain,
-}
-
-impl AdjustField {
-    /// Pair this field with a new value for delivery via `AppMsg::Adjust`.
-    pub fn with(self, value: f32) -> Adjust {
-        Adjust { field: self, value }
-    }
-}
-
-/// A field/value pair written into `session.adjustments.global` on apply.
-#[derive(Debug, Clone, Copy)]
+/// A slider change: a setter that writes one `GlobalAdjustments` field plus the
+/// new value. Using a fn pointer keeps the field list entirely in `controls.rs`
+/// (no enum + match to keep in sync).
+#[derive(Clone, Copy)]
 pub struct Adjust {
-    field: AdjustField,
-    value: f32,
+    pub set: fn(&mut GlobalAdjustments, f32),
+    pub value: f32,
+}
+
+impl std::fmt::Debug for Adjust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Adjust({})", self.value)
+    }
 }
 
 #[derive(Debug)]
@@ -123,14 +100,12 @@ impl Component for AppModel {
     type CommandOutput = CmdMsg;
 
     view! {
-        gtk::Window {
+        adw::ApplicationWindow {
             set_title: Some("RapidRAW"),
             set_default_size: (1440, 900),
 
-            gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
-
-                gtk::HeaderBar {
+            adw::ToolbarView {
+                add_top_bar = &adw::HeaderBar {
                     pack_start = &gtk::Button {
                         set_label: "Open Folder",
                         connect_clicked => AppMsg::OpenFolderDialog,
@@ -141,8 +116,9 @@ impl Component for AppModel {
                     },
                 },
 
+                #[wrap(Some)]
                 #[name = "stack"]
-                gtk::Stack {
+                set_content = &gtk::Stack {
                     set_vexpand: true,
                     set_hexpand: true,
 
@@ -284,28 +260,8 @@ impl Component for AppModel {
                     }
                 });
             }
-            AppMsg::Adjust(Adjust { field, value }) => {
-                let g = &mut self.session.adjustments.global;
-                match field {
-                    AdjustField::Exposure => g.exposure = value,
-                    AdjustField::Contrast => g.contrast = value,
-                    AdjustField::Highlights => g.highlights = value,
-                    AdjustField::Shadows => g.shadows = value,
-                    AdjustField::Whites => g.whites = value,
-                    AdjustField::Blacks => g.blacks = value,
-                    AdjustField::Temperature => g.temperature = value,
-                    AdjustField::Tint => g.tint = value,
-                    AdjustField::Vibrance => g.vibrance = value,
-                    AdjustField::Saturation => g.saturation = value,
-                    AdjustField::Clarity => g.clarity = value,
-                    AdjustField::Dehaze => g.dehaze = value,
-                    AdjustField::Structure => g.structure = value,
-                    AdjustField::Sharpness => g.sharpness = value,
-                    AdjustField::LumaNoiseReduction => g.luma_noise_reduction = value,
-                    AdjustField::ColorNoiseReduction => g.color_noise_reduction = value,
-                    AdjustField::Vignette => g.vignette_amount = value,
-                    AdjustField::Grain => g.grain_amount = value,
-                }
+            AppMsg::Adjust(Adjust { set, value }) => {
+                set(&mut self.session.adjustments.global, value);
                 sender.input(AppMsg::RequestRender);
             }
             AppMsg::RequestRender => {

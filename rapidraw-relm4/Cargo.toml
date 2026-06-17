@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 rapidraw-core = { path = "../rapidraw-core" }
-relm4 = "0.9"
+relm4 = { version = "0.9", features = ["libadwaita"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_4"] }
 gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 gdk = { version = "0.9", package = "gdk4" }
 image = "0.25.10"
