@@ -181,6 +181,9 @@ struct AppModel {
     canvas: EditorCanvas,
     /// Right-side adjustment slider panel, appended next to the canvas in `init`.
     panel: AdjustPanel,
+    /// The right column (scopes + panel); kept so the panel can be rebuilt
+    /// (reset) when a new image opens.
+    right_col: gtk::Box,
     /// Preview scopes (histogram/waveform/vectorscope) above the panel.
     scopes: Scopes,
     /// Overlay for transient status toasts (export done, LUT loaded, …).
@@ -398,6 +401,7 @@ impl Component for AppModel {
             thumbs,
             canvas: EditorCanvas::new(),
             panel: AdjustPanel::new(&sender),
+            right_col: gtk::Box::new(gtk::Orientation::Vertical, 4),
             scopes: Scopes::new(),
             toasts: adw::ToastOverlay::new(), // replaced by the view's overlay below
             render_timer: None,
@@ -418,12 +422,11 @@ impl Component for AppModel {
         // Editor page: canvas on the left; right column = scopes on top of the
         // adjustment panel. A Paned divider keeps the panel at a fixed,
         // mouse-resizable width that the photo zoom never disturbs.
-        let right = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        right.append(model.scopes.root());
-        right.append(model.panel.root());
+        model.right_col.append(model.scopes.root());
+        model.right_col.append(model.panel.root());
         let paned = &widgets.editor_page;
         paned.set_start_child(Some(model.canvas.root()));
-        paned.set_end_child(Some(&right));
+        paned.set_end_child(Some(&model.right_col));
         // Start (canvas) absorbs window resizes and may shrink below its child's
         // size (clipped); the panel keeps its width unless the user drags.
         paned.set_resize_start_child(true);
@@ -758,6 +761,17 @@ impl Component for AppModel {
             CmdMsg::BaseReady(path, img) => {
                 let (w, h) = img.dimensions();
                 log::info!("base image ready: {} ({w}x{h})", path.display());
+                // Start each image from defaults (unless disabled in settings),
+                // rebuilding the panel so the controls reflect the reset.
+                if self.settings.reset_on_open {
+                    self.session.adjustments = Default::default();
+                    controls::init_defaults(&mut self.session.adjustments.global);
+                    self.session.lut = None;
+                    let fresh = AdjustPanel::new(&sender);
+                    self.right_col.remove(self.panel.root());
+                    self.right_col.append(fresh.root());
+                    self.panel = fresh;
+                }
                 // Show the un-adjusted base immediately. We're on the GTK main
                 // thread here, so building the gdk texture is safe.
                 let rgba = img.to_rgba8();

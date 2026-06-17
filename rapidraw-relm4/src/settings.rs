@@ -21,6 +21,8 @@ pub struct Settings {
     /// Thumbnail max edge in px.
     pub thumb_dim: u32,
     pub background: Background,
+    /// Reset adjustments to defaults when opening a new image.
+    pub reset_on_open: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             preview_dim: 1600,
             thumb_dim: 300,
             background: Background::Default,
+            reset_on_open: true,
         }
     }
 }
@@ -109,8 +112,18 @@ pub fn present(
     preview_row.set_model(Some(&preview_model));
     preview_row.set_selected(nearest_index(&PREVIEW_DIMS, current.preview_dim));
 
+    let reset_row = adw::ActionRow::new();
+    reset_row.set_title("Reset adjustments on open");
+    reset_row.set_subtitle("Start each image from defaults");
+    let reset_switch = gtk::Switch::new();
+    reset_switch.set_valign(gtk::Align::Center);
+    reset_switch.set_active(current.reset_on_open);
+    reset_row.add_suffix(&reset_switch);
+    reset_row.set_activatable_widget(Some(&reset_switch));
+
     editor_group.add(&background_row);
     editor_group.add(&preview_row);
+    editor_group.add(&reset_row);
 
     // --- Library group ---
     let library_group = adw::PreferencesGroup::new();
@@ -132,11 +145,13 @@ pub fn present(
     let background_row = Rc::new(background_row);
     let preview_row = Rc::new(preview_row);
     let thumb_row = Rc::new(thumb_row);
+    let reset_switch = Rc::new(reset_switch);
 
     let emit = {
         let background_row = Rc::clone(&background_row);
         let preview_row = Rc::clone(&preview_row);
         let thumb_row = Rc::clone(&thumb_row);
+        let reset_switch = Rc::clone(&reset_switch);
         let sender = sender.clone();
         move || {
             let preview_idx = preview_row.selected() as usize;
@@ -148,6 +163,7 @@ pub fn present(
                     .unwrap_or(2048),
                 thumb_dim: THUMB_DIMS.get(thumb_idx).copied().unwrap_or(300),
                 background: index_to_background(background_row.selected()),
+                reset_on_open: reset_switch.is_active(),
             };
             sender.input(crate::AppMsg::SettingsChanged(settings));
         }
@@ -164,6 +180,10 @@ pub fn present(
     {
         let emit = emit.clone();
         thumb_row.connect_selected_notify(move |_| emit());
+    }
+    {
+        let emit = emit.clone();
+        reset_switch.connect_active_notify(move |_| emit());
     }
 
     dialog.present();
