@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -142,7 +143,9 @@ enum RenderJob {
 enum CmdMsg {
     /// A worker finished decoding+downscaling a thumbnail. Carries the factory
     /// index and the raw RGBA pixels (the gdk texture is built on the main thread).
-    ThumbReady(usize, RgbaImage),
+    /// `(generation, index, pixels)`. Stale generations are ignored so paused
+    /// thumbnail jobs (left the library) don't update the grid.
+    ThumbReady(usize, usize, RgbaImage),
     /// A worker finished decoding the full base image for the editor.
     BaseReady(PathBuf, DynamicImage),
     /// A worker finished a preview render. Carries the RGBA pixels (the gdk
@@ -187,6 +190,48 @@ struct AppModel {
     settings: Settings,
     /// Channel to the persistent render thread.
     render_tx: std::sync::mpsc::Sender<RenderJob>,
+    /// Thumbnail-decode generation. Bumped to cancel in-flight decodes (queued
+    /// jobs check it and skip), e.g. when leaving the library for the editor.
+    thumb_gen: Arc<AtomicUsize>,
+    /// Which thumbnails have decoded, so returning to the library only resumes
+    /// the missing ones.
+    thumb_loaded: Vec<bool>,
+}
+
+/// Spawn background decode jobs for thumbnails at `indices` under `gen`; each
+/// job skips its work if `gen` is stale (the user left the library).
+fn dispatch_thumbs(
+    sender: &ComponentSender<AppModel>,
+    gen_tok: &Arc<AtomicUsize>,
+    gen: usize,
+    thumb_dim: u32,
+    images: &[PathBuf],
+    indices: impl IntoIterator<Item = usize>,
+) {
+    for i in indices {
+        let p = images[i].clone();
+        let tok = gen_tok.clone();
+        sender.oneshot_command(async move {
+            if tok.load(Ordering::Relaxed) != gen {
+                return CmdMsg::ThumbReady(gen, i, RgbaImage::new(1, 1)); // skipped
+            }
+            match rapidraw_core::load_base_image(&p) {
+                Ok(img) => {
+                    let (w, h) = img.dimensions();
+                    let scaled = if w.max(h) > thumb_dim {
+                        img.resize(thumb_dim, thumb_dim, image::imageops::FilterType::Triangle)
+                    } else {
+                        img
+                    };
+                    CmdMsg::ThumbReady(gen, i, scaled.to_rgba8())
+                }
+                Err(e) => {
+                    log::warn!("thumb decode failed for {}: {e}", p.display());
+                    CmdMsg::ThumbReady(gen, i, RgbaImage::new(1, 1))
+                }
+            }
+        });
+    }
 }
 
 /// Spawn the single long-lived render thread. It owns the GpuProcessor cache
@@ -351,6 +396,8 @@ impl Component for AppModel {
             render_timer: None,
             settings: Settings::default(),
             render_tx,
+            thumb_gen: Arc::new(AtomicUsize::new(0)),
+            thumb_loaded: Vec::new(),
         };
 
         let flow_box = model.thumbs.widget();
@@ -411,35 +458,22 @@ impl Component for AppModel {
                 }
                 drop(guard);
 
-                // Kick off a background decode per image; results stream back as
-                // CmdMsg::ThumbReady and the texture is built on the main thread.
-                let thumb_dim = self.settings.thumb_dim;
-                for (i, p) in self.images.iter().cloned().enumerate() {
-                    sender.oneshot_command(async move {
-                        match rapidraw_core::load_base_image(&p) {
-                            Ok(img) => {
-                                let (w, h) = img.dimensions();
-                                let scaled = if w.max(h) > thumb_dim {
-                                    img.resize(
-                                        thumb_dim,
-                                        thumb_dim,
-                                        image::imageops::FilterType::Triangle,
-                                    )
-                                } else {
-                                    img
-                                };
-                                CmdMsg::ThumbReady(i, scaled.to_rgba8())
-                            }
-                            Err(e) => {
-                                log::warn!("thumb decode failed for {}: {e}", p.display());
-                                CmdMsg::ThumbReady(i, RgbaImage::new(1, 1))
-                            }
-                        }
-                    });
-                }
+                // New generation; decode every thumbnail in the background.
+                self.thumb_loaded = vec![false; self.images.len()];
+                let gen = self.thumb_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                dispatch_thumbs(
+                    &sender,
+                    &self.thumb_gen,
+                    gen,
+                    self.settings.thumb_dim,
+                    &self.images,
+                    0..self.images.len(),
+                );
             }
             AppMsg::OpenInEditor(path) => {
                 log::info!("Open in editor: {}", path.display());
+                // Pause thumbnail decoding while editing (frees the CPU).
+                self.thumb_gen.fetch_add(1, Ordering::Relaxed);
                 self.session.active_path = Some(path.clone());
                 widgets.stack.set_visible_child_name("editor");
                 let p = path.clone();
@@ -641,6 +675,25 @@ impl Component for AppModel {
             }
             AppMsg::ShowLibrary => {
                 widgets.stack.set_visible_child_name("library");
+                // Resume decoding any thumbnails that never finished.
+                let missing: Vec<usize> = self
+                    .thumb_loaded
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, done)| !**done)
+                    .map(|(i, _)| i)
+                    .collect();
+                if !missing.is_empty() {
+                    let gen = self.thumb_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                    dispatch_thumbs(
+                        &sender,
+                        &self.thumb_gen,
+                        gen,
+                        self.settings.thumb_dim,
+                        &self.images,
+                        missing,
+                    );
+                }
             }
             AppMsg::OpenSettings => {
                 settings::present(root, self.settings, &sender);
@@ -677,8 +730,16 @@ impl Component for AppModel {
         _root: &Self::Root,
     ) {
         match msg {
-            CmdMsg::ThumbReady(i, rgba) => {
-                // Build the gdk texture here, on the main thread.
+            CmdMsg::ThumbReady(gen, i, rgba) => {
+                // Ignore stale (paused/cancelled) generations and skip markers.
+                if gen != self.thumb_gen.load(Ordering::Relaxed)
+                    || (rgba.width() <= 1 && rgba.height() <= 1)
+                {
+                    return;
+                }
+                if let Some(done) = self.thumb_loaded.get_mut(i) {
+                    *done = true;
+                }
                 let tex = library::texture_from_rgba(&rgba);
                 self.thumbs.send(i, ThumbMsg::SetTexture(tex));
             }
