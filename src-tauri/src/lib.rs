@@ -18,21 +18,20 @@ mod denoising;
 mod exif_processing;
 mod export_processing;
 mod file_management;
-mod formats;
 mod gpu_processing;
 mod image_loader;
 mod image_processing;
 mod lens_correction;
-mod lut_processing;
 mod mask_generation;
 mod negative_conversion;
 mod panorama_stitching;
 mod panorama_utils;
 mod preset_converter;
-mod raw_processing;
 mod tagging;
 mod tagging_utils;
 mod window_customizer;
+
+use rapidraw_core::{formats, lut_processing, raw_processing};
 
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
@@ -77,13 +76,14 @@ use crate::formats::is_raw_file;
 use crate::image_loader::{
     composite_patches_on_image, load_and_composite, load_base_image_from_bytes,
 };
+use crate::gpu_processing::{get_or_init_gpu_context, process_and_get_dynamic_image};
 use crate::image_processing::{
-    Crop, GeometryParams, RenderRequest, apply_coarse_rotation, apply_cpu_default_raw_processing,
-    apply_flip, apply_geometry_warp, apply_linear_to_srgb, apply_srgb_to_linear,
-    downscale_f32_image, get_all_adjustments_from_json, get_or_init_gpu_context,
-    process_and_get_dynamic_image, resolve_tonemapper_override,
+    Crop, GeometryParams, apply_coarse_rotation, apply_cpu_default_raw_processing, apply_flip,
+    apply_geometry_warp, apply_linear_to_srgb, apply_srgb_to_linear, downscale_f32_image,
+    get_all_adjustments_from_json, resolve_tonemapper_override,
     resolve_tonemapper_override_from_handle, warp_image_geometry,
 };
+use rapidraw_core::gpu_processing::RenderRequest;
 use crate::lut_processing::Lut;
 use crate::mask_generation::{
     MaskDefinition, generate_mask_bitmap, get_cached_or_generate_mask,

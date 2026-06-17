@@ -12,8 +12,8 @@ use wgpu::{Texture, TextureView};
 
 use crate::ai_processing::AiState;
 use crate::cache_utils::DecodedImageCache;
-use crate::gpu_processing::GpuProcessor;
 use crate::image_processing::GpuContext;
+use rapidraw_core::gpu_processing::GpuProcessor;
 use crate::lens_correction::LensDatabase;
 use crate::lut_processing::Lut;
 
