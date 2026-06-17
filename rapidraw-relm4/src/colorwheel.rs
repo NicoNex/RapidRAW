@@ -19,6 +19,9 @@ use rapidraw_core::image_processing::GlobalAdjustments;
 type Setter = fn(&mut GlobalAdjustments, f32);
 
 const DISC: i32 = 110;
+/// Divisor for color-grading saturation/luminance (matches `SCALES`), so the
+/// engine receives the same magnitude as the original UI.
+const CG_SCALE: f64 = 500.0;
 
 pub struct ColorWheel {
     root: gtk::Box,
@@ -30,6 +33,7 @@ impl ColorWheel {
     pub fn new(
         title: &str,
         sender: &ComponentSender<AppModel>,
+        vadj: &gtk::Adjustment,
         hue_set: Setter,
         sat_set: Setter,
         lum_set: Setter,
@@ -71,11 +75,12 @@ impl ColorWheel {
                 area_w.queue_draw();
                 sender.input(AppMsg::Adjust(crate::Adjust {
                     set: hue_set,
-                    value: hue as f32,
+                    value: hue as f32, // hue stays in degrees
                 }));
                 sender.input(AppMsg::Adjust(crate::Adjust {
                     set: sat_set,
-                    value: (sat * 100.0) as f32,
+                    // radius 0..1 -> 0..100 slider-equiv -> / CG_SCALE
+                    value: (sat * 100.0 / CG_SCALE) as f32,
                 }));
             });
         }
@@ -85,12 +90,13 @@ impl ColorWheel {
         lum.set_hexpand(true);
         lum.set_draw_value(true);
         lum.set_value(0.0);
+        crate::controls::forward_wheel(&lum, vadj); // wheel scrolls panel, not the slider
         {
             let sender = sender.clone();
             lum.connect_value_changed(move |s| {
                 sender.input(AppMsg::Adjust(crate::Adjust {
                     set: lum_set,
-                    value: s.value() as f32,
+                    value: (s.value() / CG_SCALE) as f32,
                 }));
             });
         }
