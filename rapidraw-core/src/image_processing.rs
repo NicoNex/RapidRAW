@@ -1200,6 +1200,18 @@ pub struct Point {
     _pad2: f32,
 }
 
+impl Point {
+    /// A curve control point in the engine's 0..255 domain.
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            x,
+            y,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
 #[repr(C)]
 pub struct HslColor {

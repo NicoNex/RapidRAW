@@ -6,7 +6,6 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::prelude::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Background {

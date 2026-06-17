@@ -14,6 +14,7 @@ use gtk::prelude::*;
 use relm4::{ComponentSender, RelmWidgetExt};
 
 use crate::colorwheel::ColorWheel;
+use crate::curves::CurveEditor;
 use crate::{AppModel, AppMsg};
 use rapidraw_core::image_processing::GlobalAdjustments;
 
@@ -131,6 +132,13 @@ impl AdjustPanel {
         root.set_width_request(320);
 
         let vadj = root.vadjustment();
+
+        // Curves at the top, like the original UI.
+        let curves = CurveEditor::new(sender);
+        let curves_exp = gtk::Expander::new(Some("Curves"));
+        curves_exp.set_expanded(true);
+        curves_exp.set_child(Some(curves.root()));
+        list.append(&curves_exp);
 
         for (title, rows) in SECTIONS {
             let section = gtk::Box::new(gtk::Orientation::Vertical, 2);

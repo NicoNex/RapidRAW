@@ -68,7 +68,6 @@ pub fn render(
     let mut adj = *adj;
     adj.global.has_lut = if lut.is_some() { 1 } else { 0 };
 
-    let processor = GpuProcessor::new(ctx.clone(), width, height)?;
     let request = RenderRequest {
         adjustments: adj,
         mask_bitmaps: &[],
@@ -76,10 +75,30 @@ pub fn render(
         roi: None,
     };
 
-    let (pixels, out_w, out_h, _x, _y) =
-        processor.run(&input_view, width, height, request, false, false)?;
+    // Reuse a per-thread GpuProcessor keyed by size: building one compiles the
+    // (large) shader, so doing it every frame makes slider drags choppy. Drive
+    // renders from a single persistent worker thread and the processor is built
+    // once per image size, not per frame.
+    let (pixels, out_w, out_h) = PROCESSOR_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        let reuse = matches!(&*slot, Some((w, h, _)) if *w == width && *h == height);
+        if !reuse {
+            *slot = Some((width, height, GpuProcessor::new(ctx.clone(), width, height)?));
+        }
+        let (_, _, processor) = slot.as_ref().unwrap();
+        let (pixels, out_w, out_h, _x, _y) =
+            processor.run(&input_view, width, height, request, false, false)?;
+        Ok::<_, String>((pixels, out_w, out_h))
+    })?;
 
     let img = RgbaImage::from_raw(out_w, out_h, pixels)
         .ok_or_else(|| "readback buffer size mismatch".to_string())?;
     Ok(DynamicImage::ImageRgba8(img))
+}
+
+thread_local! {
+    /// Per-thread cached processor `(width, height, processor)`; rebuilt only
+    /// when the render size changes.
+    static PROCESSOR_CACHE: std::cell::RefCell<Option<(u32, u32, GpuProcessor)>> =
+        const { std::cell::RefCell::new(None) };
 }

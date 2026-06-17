@@ -12,15 +12,17 @@ use relm4::prelude::*;
 
 mod colorwheel;
 mod controls;
+mod curves;
 mod editor;
 mod library;
 mod settings;
 mod state;
 mod thumb;
 use controls::AdjustPanel;
+use curves::Channel;
 use editor::EditorCanvas;
-use rapidraw_core::image_processing::GlobalAdjustments;
-use rapidraw_core::lut_processing::parse_lut_file;
+use rapidraw_core::image_processing::{GlobalAdjustments, Point};
+use rapidraw_core::lut_processing::{parse_lut_file, Lut};
 use settings::Settings;
 use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
@@ -81,6 +83,27 @@ enum AppMsg {
     OpenSettings,
     /// Settings changed in the settings window.
     SettingsChanged(Settings),
+    /// A tone curve changed: channel + points (x,y in 0..255).
+    CurveChanged(Channel, Vec<(f32, f32)>),
+}
+
+/// Work sent to the persistent render thread. Keeping a single long-lived
+/// thread lets the GpuProcessor (and its compiled shader) be reused across
+/// renders instead of rebuilt per frame.
+enum RenderJob {
+    Preview {
+        base: Arc<DynamicImage>,
+        adj: Box<rapidraw_core::image_processing::AllAdjustments>,
+        lut: Option<Arc<Lut>>,
+        dim: u32,
+    },
+    Export {
+        base: Arc<DynamicImage>,
+        adj: Box<rapidraw_core::image_processing::AllAdjustments>,
+        lut: Option<Arc<Lut>>,
+        path: PathBuf,
+        opts: ExportOpts,
+    },
 }
 
 #[derive(Debug)]
@@ -112,7 +135,6 @@ where
 }
 
 struct AppModel {
-    engine: Engine,
     session: Session,
     images: Vec<PathBuf>,
     /// Mirror of `images`, shared into the FlowBox child-activated closure so a
@@ -129,6 +151,49 @@ struct AppModel {
     render_timer: Option<glib::SourceId>,
     /// User settings (preview/thumbnail size, editor background).
     settings: Settings,
+    /// Channel to the persistent render thread.
+    render_tx: std::sync::mpsc::Sender<RenderJob>,
+}
+
+/// Spawn the single long-lived render thread. It owns the GpuProcessor cache
+/// (via the thread-local in `rapidraw_core::render`), so the shader compiles
+/// once per image size rather than every frame.
+fn spawn_render_worker(
+    ctx: Arc<rapidraw_core::image_processing::GpuContext>,
+    sender: ComponentSender<AppModel>,
+) -> std::sync::mpsc::Sender<RenderJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<RenderJob>();
+    let cmd = sender.command_sender().clone();
+    std::thread::spawn(move || {
+        while let Ok(job) = rx.recv() {
+            match job {
+                RenderJob::Preview {
+                    base,
+                    adj,
+                    lut,
+                    dim,
+                } => match rapidraw_core::render(&ctx, &base, &adj, lut, Some(dim)) {
+                    Ok(out) => {
+                        let _ = cmd.send(CmdMsg::RenderReady(out.to_rgba8()));
+                    }
+                    Err(e) => log::warn!("preview render failed: {e}"),
+                },
+                RenderJob::Export {
+                    base,
+                    adj,
+                    lut,
+                    path,
+                    opts,
+                } => {
+                    let res = rapidraw_core::render(&ctx, &base, &adj, lut, None)
+                        .and_then(|out| encode_image(&out, &path, opts))
+                        .map(|()| path);
+                    let _ = cmd.send(CmdMsg::ExportDone(res));
+                }
+            }
+        }
+    });
+    tx
 }
 
 #[relm4::component]
@@ -222,8 +287,9 @@ impl Component for AppModel {
             .launch(gtk::FlowBox::default())
             .detach();
 
+        let render_tx = spawn_render_worker(engine.ctx.clone(), sender.clone());
+
         let model = AppModel {
-            engine,
             session: Session::default(),
             images: Vec::new(),
             images_shared: Rc::new(RefCell::new(Vec::new())),
@@ -232,6 +298,7 @@ impl Component for AppModel {
             panel: AdjustPanel::new(&sender),
             render_timer: None,
             settings: Settings::default(),
+            render_tx,
         };
 
         let flow_box = model.thumbs.widget();
@@ -341,22 +408,13 @@ impl Component for AppModel {
                 let Some(base) = self.session.base_image.clone() else {
                     return;
                 };
-                let ctx = self.engine.ctx.clone();
-                let adj = self.session.adjustments.clone();
-                let lut = self.session.lut.clone();
-                let preview_dim = self.settings.preview_dim;
-                // ponytail: build a new GpuProcessor per render call; cache one
-                // keyed by max dimensions if slider latency is too high.
-                spawn_bg(&sender, move || {
-                    match rapidraw_core::render(&ctx, &base, &adj, lut, Some(preview_dim)) {
-                        Ok(out) => CmdMsg::RenderReady(out.to_rgba8()),
-                        Err(e) => {
-                            log::warn!("preview render failed: {e}");
-                            // Reuse RenderReady with an empty image as a no-op
-                            // signal; update_cmd ignores 1x1 results.
-                            CmdMsg::RenderReady(RgbaImage::new(1, 1))
-                        }
-                    }
+                // Hand off to the persistent render thread (reuses the cached
+                // GpuProcessor, so slider drags stay smooth).
+                let _ = self.render_tx.send(RenderJob::Preview {
+                    base,
+                    adj: Box::new(self.session.adjustments),
+                    lut: self.session.lut.clone(),
+                    dim: self.settings.preview_dim,
                 });
             }
             AppMsg::ExportDialog => {
@@ -432,16 +490,13 @@ impl Component for AppModel {
                 let Some(base) = self.session.base_image.clone() else {
                     return;
                 };
-                let ctx = self.engine.ctx.clone();
-                let adj = self.session.adjustments.clone();
-                let lut = self.session.lut.clone();
                 log::info!("exporting to {}", path.display());
-                spawn_bg(&sender, move || {
-                    // Full-res render (no downscale), then encode to the path.
-                    let result = rapidraw_core::render(&ctx, &base, &adj, lut, None)
-                        .and_then(|out| encode_image(&out, &path, opts))
-                        .map(|()| path);
-                    CmdMsg::ExportDone(result)
+                let _ = self.render_tx.send(RenderJob::Export {
+                    base,
+                    adj: Box::new(self.session.adjustments),
+                    lut: self.session.lut.clone(),
+                    path,
+                    opts,
                 });
             }
             AppMsg::LoadLut => {
@@ -492,6 +547,21 @@ impl Component for AppModel {
                 self.settings = s;
                 self.canvas.set_background(s.background);
                 // Re-render the preview at the (possibly new) preview size.
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::CurveChanged(ch, pts) => {
+                let g = &mut self.session.adjustments.global;
+                let (arr, count) = match ch {
+                    Channel::Luma => (&mut g.luma_curve, &mut g.luma_curve_count),
+                    Channel::Red => (&mut g.red_curve, &mut g.red_curve_count),
+                    Channel::Green => (&mut g.green_curve, &mut g.green_curve_count),
+                    Channel::Blue => (&mut g.blue_curve, &mut g.blue_curve_count),
+                };
+                for (i, (x, y)) in pts.iter().take(16).enumerate() {
+                    arr[i] = Point::new(*x, *y);
+                }
+                // count < 2 means "identity" in the shader, so a 2-point line is a no-op.
+                *count = pts.len().min(16) as u32;
                 sender.input(AppMsg::RequestRender);
             }
         }
