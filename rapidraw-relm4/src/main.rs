@@ -10,24 +10,32 @@ use image::{DynamicImage, GenericImageView, RgbaImage};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
 
+mod colorwheel;
 mod controls;
 mod editor;
 mod library;
+mod settings;
 mod state;
 mod thumb;
 use controls::AdjustPanel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::GlobalAdjustments;
 use rapidraw_core::lut_processing::parse_lut_file;
+use settings::Settings;
 use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
 
-/// Longest-edge size (px) used for library thumbnails.
-const THUMB_DIM: u32 = 300;
-/// Longest-edge size (px) for the live editor preview render.
-const PREVIEW_DIM: u32 = 2048;
 /// Debounce window (ms) for coalescing rapid slider drags into one render.
 const RENDER_DEBOUNCE_MS: u64 = 80;
+
+/// Output options for export.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportOpts {
+    /// PNG when true, otherwise JPEG.
+    pub png: bool,
+    /// JPEG quality 1..=100 (ignored for PNG).
+    pub quality: u8,
+}
 
 /// A slider change: a setter that writes one `GlobalAdjustments` field plus the
 /// new value. Using a fn pointer keeps the field list entirely in `controls.rs`
@@ -55,16 +63,24 @@ enum AppMsg {
     RequestRender,
     /// Debounce timer fired: actually launch the background render.
     DoRender,
-    /// Export button: open the save dialog.
+    /// Export button: open the export-options dialog.
     ExportDialog,
-    /// A save path was chosen: full-res render + JPEG encode to it.
-    ExportTo(PathBuf),
+    /// Options were chosen: open the save dialog for them.
+    ExportConfigured(ExportOpts),
+    /// A save path was chosen: full-res render + encode to it.
+    ExportTo(PathBuf, ExportOpts),
     /// LUT section: open a .cube/.3dl file picker.
     LoadLut,
     /// A LUT file was chosen: parse and apply it.
     LutChosen(PathBuf),
     /// Remove the active LUT.
     ClearLut,
+    /// Return from the editor to the thumbnail grid.
+    ShowLibrary,
+    /// Open the settings window.
+    OpenSettings,
+    /// Settings changed in the settings window.
+    SettingsChanged(Settings),
 }
 
 #[derive(Debug)]
@@ -111,6 +127,8 @@ struct AppModel {
     /// Pending debounce timer for the next render; replaced (restarting the
     /// timer) on each `RequestRender` so rapid drags coalesce into one render.
     render_timer: Option<glib::SourceId>,
+    /// User settings (preview/thumbnail size, editor background).
+    settings: Settings,
 }
 
 #[relm4::component]
@@ -130,6 +148,11 @@ impl Component for AppModel {
                     pack_start = &gtk::Button {
                         set_label: "Open Folder",
                         connect_clicked => AppMsg::OpenFolderDialog,
+                    },
+                    pack_end = &gtk::Button {
+                        set_icon_name: "emblem-system-symbolic",
+                        set_tooltip_text: Some("Settings"),
+                        connect_clicked => AppMsg::OpenSettings,
                     },
                     pack_end = &gtk::Button {
                         set_label: "Export",
@@ -165,10 +188,25 @@ impl Component for AppModel {
                         },
                     },
 
-                    #[name = "editor_page"]
                     add_named[Some("editor")] = &gtk::Box {
-                        // Canvas on the left, adjustment panel on the right.
-                        set_orientation: gtk::Orientation::Horizontal,
+                        set_orientation: gtk::Orientation::Vertical,
+
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_margin_all: 4,
+                            gtk::Button {
+                                set_icon_name: "go-previous-symbolic",
+                                set_label: "Library",
+                                connect_clicked => AppMsg::ShowLibrary,
+                            },
+                        },
+
+                        #[name = "editor_page"]
+                        gtk::Box {
+                            set_vexpand: true,
+                            // Canvas on the left, adjustment panel on the right.
+                            set_orientation: gtk::Orientation::Horizontal,
+                        },
                     },
                 },
             },
@@ -193,6 +231,7 @@ impl Component for AppModel {
             canvas: EditorCanvas::new(),
             panel: AdjustPanel::new(&sender),
             render_timer: None,
+            settings: Settings::default(),
         };
 
         let flow_box = model.thumbs.widget();
@@ -242,15 +281,16 @@ impl Component for AppModel {
 
                 // Kick off a background decode per image; results stream back as
                 // CmdMsg::ThumbReady and the texture is built on the main thread.
+                let thumb_dim = self.settings.thumb_dim;
                 for (i, p) in self.images.iter().cloned().enumerate() {
                     sender.oneshot_command(async move {
                         match rapidraw_core::load_base_image(&p) {
                             Ok(img) => {
                                 let (w, h) = img.dimensions();
-                                let scaled = if w.max(h) > THUMB_DIM {
+                                let scaled = if w.max(h) > thumb_dim {
                                     img.resize(
-                                        THUMB_DIM,
-                                        THUMB_DIM,
+                                        thumb_dim,
+                                        thumb_dim,
                                         image::imageops::FilterType::Triangle,
                                     )
                                 } else {
@@ -304,10 +344,11 @@ impl Component for AppModel {
                 let ctx = self.engine.ctx.clone();
                 let adj = self.session.adjustments.clone();
                 let lut = self.session.lut.clone();
+                let preview_dim = self.settings.preview_dim;
                 // ponytail: build a new GpuProcessor per render call; cache one
                 // keyed by max dimensions if slider latency is too high.
                 spawn_bg(&sender, move || {
-                    match rapidraw_core::render(&ctx, &base, &adj, lut, Some(PREVIEW_DIM)) {
+                    match rapidraw_core::render(&ctx, &base, &adj, lut, Some(preview_dim)) {
                         Ok(out) => CmdMsg::RenderReady(out.to_rgba8()),
                         Err(e) => {
                             log::warn!("preview render failed: {e}");
@@ -323,16 +364,58 @@ impl Component for AppModel {
                     log::warn!("export: no image open");
                     return;
                 }
-                // Default filename: <source stem>.jpg.
+                // Small modal: choose format + JPEG quality, then the save dialog.
+                let win = gtk::Window::builder()
+                    .title("Export options")
+                    .modal(true)
+                    .transient_for(root)
+                    .default_width(280)
+                    .build();
+                let vb = gtk::Box::new(gtk::Orientation::Vertical, 8);
+                vb.set_margin_all(12);
+
+                let fmt = gtk::DropDown::from_strings(&["JPEG", "PNG"]);
+                let q = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+                q.set_value(90.0);
+                let qrow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                qrow.append(&gtk::Label::new(Some("JPEG quality")));
+                qrow.append(&q);
+                // Quality only applies to JPEG.
+                {
+                    let q = q.clone();
+                    fmt.connect_selected_notify(move |d| q.set_sensitive(d.selected() == 0));
+                }
+
+                let go = gtk::Button::with_label("Export…");
+                go.add_css_class("suggested-action");
+                vb.append(&fmt);
+                vb.append(&qrow);
+                vb.append(&go);
+                win.set_child(Some(&vb));
+
+                let sender = sender.clone();
+                let win_c = win.clone();
+                go.connect_clicked(move |_| {
+                    let opts = ExportOpts {
+                        png: fmt.selected() == 1,
+                        quality: q.value() as u8,
+                    };
+                    win_c.close();
+                    sender.input(AppMsg::ExportConfigured(opts));
+                });
+                win.present();
+            }
+            AppMsg::ExportConfigured(opts) => {
+                let ext = if opts.png { "png" } else { "jpg" };
                 let suggested = self
                     .session
                     .active_path
                     .as_ref()
                     .and_then(|p| p.file_stem())
-                    .map(|s| format!("{}.jpg", s.to_string_lossy()))
-                    .unwrap_or_else(|| "export.jpg".to_string());
+                    .map(|s| format!("{}.{ext}", s.to_string_lossy()))
+                    .unwrap_or_else(|| format!("export.{ext}"));
                 let dialog = gtk::FileDialog::builder()
-                    .title("Export JPEG")
+                    .title("Export")
                     .initial_name(suggested)
                     .build();
                 let parent = root.clone();
@@ -340,12 +423,12 @@ impl Component for AppModel {
                 dialog.save(Some(&parent), gtk::gio::Cancellable::NONE, move |res| {
                     if let Ok(file) = res {
                         if let Some(path) = file.path() {
-                            sender.input(AppMsg::ExportTo(path));
+                            sender.input(AppMsg::ExportTo(path, opts));
                         }
                     }
                 });
             }
-            AppMsg::ExportTo(path) => {
+            AppMsg::ExportTo(path, opts) => {
                 let Some(base) = self.session.base_image.clone() else {
                     return;
                 };
@@ -354,13 +437,9 @@ impl Component for AppModel {
                 let lut = self.session.lut.clone();
                 log::info!("exporting to {}", path.display());
                 spawn_bg(&sender, move || {
-                    // Full-res render (no downscale), then JPEG encode to the path.
+                    // Full-res render (no downscale), then encode to the path.
                     let result = rapidraw_core::render(&ctx, &base, &adj, lut, None)
-                        .and_then(|out| {
-                            out.to_rgb8()
-                                .save_with_format(&path, image::ImageFormat::Jpeg)
-                                .map_err(|e| e.to_string())
-                        })
+                        .and_then(|out| encode_image(&out, &path, opts))
                         .map(|()| path);
                     CmdMsg::ExportDone(result)
                 });
@@ -401,6 +480,18 @@ impl Component for AppModel {
             },
             AppMsg::ClearLut => {
                 self.session.lut = None;
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::ShowLibrary => {
+                widgets.stack.set_visible_child_name("library");
+            }
+            AppMsg::OpenSettings => {
+                settings::present(root, self.settings, &sender);
+            }
+            AppMsg::SettingsChanged(s) => {
+                self.settings = s;
+                self.canvas.set_background(s.background);
+                // Re-render the preview at the (possibly new) preview size.
                 sender.input(AppMsg::RequestRender);
             }
         }
@@ -448,6 +539,27 @@ impl Component for AppModel {
                 log::warn!("export failed: {e}");
             }
         }
+    }
+}
+
+/// Encode a rendered image to `path` as JPEG (with quality) or PNG.
+fn encode_image(img: &DynamicImage, path: &std::path::Path, opts: ExportOpts) -> Result<(), String> {
+    use image::ImageEncoder;
+    let rgb = img.to_rgb8();
+    if opts.png {
+        rgb.save_with_format(path, image::ImageFormat::Png)
+            .map_err(|e| e.to_string())
+    } else {
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let enc =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), opts.quality);
+        enc.write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 

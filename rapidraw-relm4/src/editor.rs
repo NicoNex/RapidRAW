@@ -15,7 +15,9 @@ use std::rc::Rc;
 use gtk::gdk;
 use gtk::prelude::*;
 
-const ZOOM_MIN: f64 = 0.02;
+use crate::settings::Background;
+
+const ZOOM_MIN: f64 = 0.002;
 const ZOOM_MAX: f64 = 20.0;
 const ZOOM_STEP: f64 = 1.1;
 
@@ -51,6 +53,7 @@ impl EditorCanvas {
         root.set_hexpand(true);
         root.set_vexpand(true);
         root.put(&picture, 0.0, 0.0);
+        install_bg_css();
 
         let view = View {
             natural: Rc::new(Cell::new((0, 0))),
@@ -132,6 +135,17 @@ impl EditorCanvas {
         &self.root
     }
 
+    /// Set the canvas background: themed default, or a solid white/black.
+    pub fn set_background(&self, bg: Background) {
+        self.root.remove_css_class("editor-bg-white");
+        self.root.remove_css_class("editor-bg-black");
+        match bg {
+            Background::White => self.root.add_css_class("editor-bg-white"),
+            Background::Black => self.root.add_css_class("editor-bg-black"),
+            Background::Default => {}
+        }
+    }
+
     /// Show an image, fit + centered in the viewport.
     pub fn set_texture(&self, texture: &gdk::MemoryTexture) {
         self.view.natural.set((texture.width(), texture.height()));
@@ -156,6 +170,26 @@ impl Default for EditorCanvas {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Install the canvas background CSS once for the default display.
+fn install_bg_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(
+            ".editor-bg-white { background-color: #ffffff; } \
+             .editor-bg-black { background-color: #000000; }",
+        );
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
 }
 
 /// Compute and apply the fit-to-viewport scale, centered.

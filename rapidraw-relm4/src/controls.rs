@@ -12,6 +12,7 @@
 use gtk::prelude::*;
 use relm4::{ComponentSender, RelmWidgetExt};
 
+use crate::colorwheel::ColorWheel;
 use crate::{AppModel, AppMsg};
 use rapidraw_core::image_processing::GlobalAdjustments;
 
@@ -100,8 +101,8 @@ pub struct AdjustPanel {
 
 impl AdjustPanel {
     pub fn new(sender: &ComponentSender<AppModel>) -> Self {
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        list.set_margin_all(8);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        list.set_margin_all(6);
 
         let root = gtk::ScrolledWindow::new();
         root.set_hscrollbar_policy(gtk::PolicyType::Never);
@@ -116,10 +117,14 @@ impl AdjustPanel {
         let vadj = root.vadjustment();
 
         for (title, rows) in SECTIONS {
-            let section = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            section.set_margin_all(6);
+            let section = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            section.set_margin_all(4);
             for &(label, min, max, step, set) in *rows {
                 section.append(&build_row(label, min, max, step, set, sender, &vadj));
+            }
+            // Color grading wheels live under the Color section.
+            if *title == "Color" {
+                section.append(&build_grading_wheels(sender));
             }
 
             let expander = gtk::Expander::new(Some(title));
@@ -154,7 +159,7 @@ fn build_row(
 
     let lbl = gtk::Label::new(Some(label));
     lbl.set_halign(gtk::Align::Start);
-    lbl.set_margin_top(4);
+    lbl.add_css_class("caption");
 
     let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
     scale.set_hexpand(true);
@@ -165,17 +170,68 @@ fn build_row(
 
     forward_wheel(&scale, vadj);
 
-    let sender = sender.clone();
-    scale.connect_value_changed(move |s| {
-        sender.input(AppMsg::Adjust(crate::Adjust {
-            set,
-            value: s.value() as f32,
-        }));
-    });
+    {
+        let sender = sender.clone();
+        scale.connect_value_changed(move |s| {
+            sender.input(AppMsg::Adjust(crate::Adjust {
+                set,
+                value: s.value() as f32,
+            }));
+        });
+    }
+
+    // Double-click resets the field to its default (0); set_value fires the
+    // value-changed handler above, which applies it and triggers a render.
+    let reset = gtk::GestureClick::new();
+    {
+        let scale = scale.clone();
+        reset.connect_pressed(move |_, n, _, _| {
+            if n == 2 {
+                scale.set_value(0.0);
+            }
+        });
+    }
+    scale.add_controller(reset);
 
     row.append(&lbl);
     row.append(&scale);
     row
+}
+
+/// The three color-grading wheels (shadows / midtones / highlights) in a
+/// wrapping FlowBox under the Color section.
+fn build_grading_wheels(sender: &ComponentSender<AppModel>) -> gtk::FlowBox {
+    let flow = gtk::FlowBox::new();
+    flow.set_selection_mode(gtk::SelectionMode::None);
+    flow.set_column_spacing(4);
+    flow.set_row_spacing(4);
+    flow.set_homogeneous(true);
+
+    let shadows = ColorWheel::new(
+        "Shadows",
+        sender,
+        |g, v| g.color_grading_shadows.hue = v,
+        |g, v| g.color_grading_shadows.saturation = v,
+        |g, v| g.color_grading_shadows.luminance = v,
+    );
+    let midtones = ColorWheel::new(
+        "Midtones",
+        sender,
+        |g, v| g.color_grading_midtones.hue = v,
+        |g, v| g.color_grading_midtones.saturation = v,
+        |g, v| g.color_grading_midtones.luminance = v,
+    );
+    let highlights = ColorWheel::new(
+        "Highlights",
+        sender,
+        |g, v| g.color_grading_highlights.hue = v,
+        |g, v| g.color_grading_highlights.saturation = v,
+        |g, v| g.color_grading_highlights.luminance = v,
+    );
+    flow.append(shadows.root());
+    flow.append(midtones.root());
+    flow.append(highlights.root());
+    flow
 }
 
 /// Make a slider's mouse wheel scroll the panel (`vadj`) instead of changing
