@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use image::DynamicImage;
 use rapidraw_core::image_processing::{AllAdjustments, GpuContext};
+use rapidraw_core::lut_processing::Lut;
 
 /// Shared, cheaply-clonable handle to the GPU engine context.
 #[derive(Clone)]
@@ -17,6 +18,8 @@ pub struct Session {
     pub active_path: Option<PathBuf>,
     pub base_image: Option<Arc<DynamicImage>>,
     pub adjustments: AllAdjustments,
+    /// Loaded 3D LUT (.cube/.3dl), applied at `adjustments.global.lut_intensity`.
+    pub lut: Option<Arc<Lut>>,
 }
 
 impl Default for Session {
@@ -26,6 +29,7 @@ impl Default for Session {
             active_path: None,
             base_image: None,
             adjustments: AllAdjustments::default(),
+            lut: None,
         }
     }
 }

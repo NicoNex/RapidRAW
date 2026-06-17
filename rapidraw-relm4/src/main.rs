@@ -18,6 +18,7 @@ mod thumb;
 use controls::AdjustPanel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::GlobalAdjustments;
+use rapidraw_core::lut_processing::parse_lut_file;
 use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
 
@@ -58,6 +59,12 @@ enum AppMsg {
     ExportDialog,
     /// A save path was chosen: full-res render + JPEG encode to it.
     ExportTo(PathBuf),
+    /// LUT section: open a .cube/.3dl file picker.
+    LoadLut,
+    /// A LUT file was chosen: parse and apply it.
+    LutChosen(PathBuf),
+    /// Remove the active LUT.
+    ClearLut,
 }
 
 #[derive(Debug)]
@@ -72,6 +79,20 @@ enum CmdMsg {
     RenderReady(RgbaImage),
     /// A worker finished a full-res export: Ok(path) or Err(message).
     ExportDone(Result<PathBuf, String>),
+}
+
+/// Run `f` on a dedicated OS thread and deliver its `CmdMsg` to `update_cmd`.
+/// Used for user-facing work (open image, preview render, export) so it never
+/// queues behind the flood of background thumbnail-decode tasks on relm4's
+/// shared command pool.
+fn spawn_bg<F>(sender: &ComponentSender<AppModel>, f: F)
+where
+    F: FnOnce() -> CmdMsg + Send + 'static,
+{
+    let tx = sender.command_sender().clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
 }
 
 struct AppModel {
@@ -250,13 +271,11 @@ impl Component for AppModel {
                 self.session.active_path = Some(path.clone());
                 widgets.stack.set_visible_child_name("editor");
                 let p = path.clone();
-                sender.oneshot_command(async move {
-                    match rapidraw_core::load_base_image(&p) {
-                        Ok(img) => CmdMsg::BaseReady(p, img),
-                        Err(e) => {
-                            log::warn!("base decode failed for {}: {e}", p.display());
-                            CmdMsg::BaseReady(p, DynamicImage::new_rgba8(1, 1))
-                        }
+                spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {
+                    Ok(img) => CmdMsg::BaseReady(p, img),
+                    Err(e) => {
+                        log::warn!("base decode failed for {}: {e}", p.display());
+                        CmdMsg::BaseReady(p, DynamicImage::new_rgba8(1, 1))
                     }
                 });
             }
@@ -284,10 +303,11 @@ impl Component for AppModel {
                 };
                 let ctx = self.engine.ctx.clone();
                 let adj = self.session.adjustments.clone();
+                let lut = self.session.lut.clone();
                 // ponytail: build a new GpuProcessor per render call; cache one
                 // keyed by max dimensions if slider latency is too high.
-                sender.oneshot_command(async move {
-                    match rapidraw_core::render(&ctx, &base, &adj, Some(PREVIEW_DIM)) {
+                spawn_bg(&sender, move || {
+                    match rapidraw_core::render(&ctx, &base, &adj, lut, Some(PREVIEW_DIM)) {
                         Ok(out) => CmdMsg::RenderReady(out.to_rgba8()),
                         Err(e) => {
                             log::warn!("preview render failed: {e}");
@@ -331,10 +351,11 @@ impl Component for AppModel {
                 };
                 let ctx = self.engine.ctx.clone();
                 let adj = self.session.adjustments.clone();
+                let lut = self.session.lut.clone();
                 log::info!("exporting to {}", path.display());
-                sender.oneshot_command(async move {
+                spawn_bg(&sender, move || {
                     // Full-res render (no downscale), then JPEG encode to the path.
-                    let result = rapidraw_core::render(&ctx, &base, &adj, None)
+                    let result = rapidraw_core::render(&ctx, &base, &adj, lut, None)
                         .and_then(|out| {
                             out.to_rgb8()
                                 .save_with_format(&path, image::ImageFormat::Jpeg)
@@ -343,6 +364,44 @@ impl Component for AppModel {
                         .map(|()| path);
                     CmdMsg::ExportDone(result)
                 });
+            }
+            AppMsg::LoadLut => {
+                let filter = gtk::FileFilter::new();
+                filter.set_name(Some("3D LUT (.cube, .3dl)"));
+                filter.add_pattern("*.cube");
+                filter.add_pattern("*.3dl");
+                let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                let dialog = gtk::FileDialog::builder()
+                    .title("Load LUT")
+                    .filters(&filters)
+                    .build();
+                let parent = root.clone();
+                let sender = sender.clone();
+                dialog.open(Some(&parent), gtk::gio::Cancellable::NONE, move |res| {
+                    if let Ok(file) = res {
+                        if let Some(path) = file.path() {
+                            sender.input(AppMsg::LutChosen(path));
+                        }
+                    }
+                });
+            }
+            AppMsg::LutChosen(path) => match parse_lut_file(&path.to_string_lossy()) {
+                Ok(lut) => {
+                    log::info!("LUT loaded: {}", path.display());
+                    self.session.lut = Some(Arc::new(lut));
+                    // Default to full strength so the effect is visible at once;
+                    // the LUT intensity slider (0..100) overrides this.
+                    if self.session.adjustments.global.lut_intensity <= 0.0 {
+                        self.session.adjustments.global.lut_intensity = 1.0;
+                    }
+                    sender.input(AppMsg::RequestRender);
+                }
+                Err(e) => log::warn!("LUT parse failed for {}: {e}", path.display()),
+            },
+            AppMsg::ClearLut => {
+                self.session.lut = None;
+                sender.input(AppMsg::RequestRender);
             }
         }
         self.update_view(widgets, sender);

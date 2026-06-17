@@ -22,7 +22,7 @@ fn exposure_bump_brightens() {
     let mut adj = AllAdjustments::default();
     adj.global.exposure = 1.0; // +1 stop
 
-    let out = render(&ctx, &base, &adj, None).expect("render ok");
+    let out = render(&ctx, &base, &adj, None, None).expect("render ok");
     assert!(
         mean_luma(&out) > mean_luma(&base) + 5.0,
         "expected brighter output, base={} out={}",
