@@ -140,15 +140,14 @@ impl AdjustPanel {
 
         let vadj = root.vadjustment();
 
-        // Curves first, like the original UI.
+        // Curves first, like the original UI. Each section is a "card".
         let curves = CurveEditor::new(sender);
-        list.append(&expander("Curves", curves.root(), true));
-
-        list.append(&section("Basic", BASIC, sender, &vadj));
-        list.append(&build_color(sender, &vadj));
-        list.append(&section("Details", DETAILS, sender, &vadj));
-        list.append(&section("Effects", EFFECTS, sender, &vadj));
-        list.append(&build_lut_section(sender, &vadj));
+        list.append(&card(&expander("Curves", curves.root(), true)));
+        list.append(&card(&section("Basic", BASIC, sender, &vadj)));
+        list.append(&card(&build_color(sender, &vadj)));
+        list.append(&card(&section("Details", DETAILS, sender, &vadj)));
+        list.append(&card(&section("Effects", EFFECTS, sender, &vadj)));
+        list.append(&card(&build_lut_section(sender, &vadj)));
 
         Self { root }
     }
@@ -156,6 +155,21 @@ impl AdjustPanel {
     pub fn root(&self) -> &gtk::ScrolledWindow {
         &self.root
     }
+}
+
+/// Wrap a section widget in a libadwaita `.card` so the groups read as
+/// distinct panels (like the default UI).
+fn card(child: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    b.add_css_class("card");
+    b.set_margin_top(3);
+    b.set_margin_bottom(3);
+    child.as_ref().set_margin_start(8);
+    child.as_ref().set_margin_end(8);
+    child.as_ref().set_margin_top(6);
+    child.as_ref().set_margin_bottom(6);
+    b.append(child);
+    b
 }
 
 /// Wrap `child` in an expanded `Expander` titled `title`.
@@ -368,6 +382,7 @@ fn build_lut_section(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment)
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let load = gtk::Button::with_label("Load .cube");
     let clear = gtk::Button::with_label("Clear");
+    let export = gtk::Button::with_label("Export look as .cube");
     {
         let sender = sender.clone();
         load.connect_clicked(move |_| sender.input(AppMsg::LoadLut));
@@ -376,9 +391,14 @@ fn build_lut_section(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment)
         let sender = sender.clone();
         clear.connect_clicked(move |_| sender.input(AppMsg::ClearLut));
     }
+    {
+        let sender = sender.clone();
+        export.connect_clicked(move |_| sender.input(AppMsg::ExportLutDialog));
+    }
     buttons.append(&load);
     buttons.append(&clear);
     lut_box.append(&buttons);
+    lut_box.append(&export);
 
     let lbl = gtk::Label::new(Some("Intensity"));
     lbl.set_halign(gtk::Align::Start);

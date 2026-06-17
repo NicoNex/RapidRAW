@@ -14,13 +14,13 @@ mod colorwheel;
 mod controls;
 mod curves;
 mod editor;
-mod histogram;
 mod library;
+mod scopes;
 mod settings;
 mod state;
 mod thumb;
 use controls::AdjustPanel;
-use histogram::Histogram;
+use scopes::Scopes;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
@@ -34,13 +34,31 @@ use thumb::{Thumb, ThumbMsg};
 /// each render cheap, so a short debounce keeps the preview responsive.
 const RENDER_DEBOUNCE_MS: u64 = 15;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Jpeg,
+    Png,
+    Tiff,
+}
+
+impl ExportFormat {
+    fn ext(self) -> &'static str {
+        match self {
+            ExportFormat::Jpeg => "jpg",
+            ExportFormat::Png => "png",
+            ExportFormat::Tiff => "tiff",
+        }
+    }
+}
+
 /// Output options for export.
 #[derive(Debug, Clone, Copy)]
 pub struct ExportOpts {
-    /// PNG when true, otherwise JPEG.
-    pub png: bool,
-    /// JPEG quality 1..=100 (ignored for PNG).
+    pub format: ExportFormat,
+    /// JPEG quality 1..=100 (ignored for PNG/TIFF).
     pub quality: u8,
+    /// Optional resize: clamp the longest edge to this many px.
+    pub resize: Option<u32>,
 }
 
 /// A slider change: a setter that writes one `GlobalAdjustments` field plus the
@@ -81,6 +99,10 @@ enum AppMsg {
     LutChosen(PathBuf),
     /// Remove the active LUT.
     ClearLut,
+    /// Export the current look as a .cube LUT: open the save dialog.
+    ExportLutDialog,
+    /// A path was chosen for the .cube export.
+    ExportLutTo(PathBuf),
     /// Return from the editor to the thumbnail grid.
     ShowLibrary,
     /// Open the settings window.
@@ -107,6 +129,12 @@ enum RenderJob {
         lut: Option<Arc<Lut>>,
         path: PathBuf,
         opts: ExportOpts,
+    },
+    /// Bake the current look into a .cube LUT file.
+    ExportLut {
+        adj: Box<rapidraw_core::image_processing::AllAdjustments>,
+        lut: Option<Arc<Lut>>,
+        path: PathBuf,
     },
 }
 
@@ -150,8 +178,8 @@ struct AppModel {
     canvas: EditorCanvas,
     /// Right-side adjustment slider panel, appended next to the canvas in `init`.
     panel: AdjustPanel,
-    /// RGB histogram of the current preview, above the panel.
-    hist: Histogram,
+    /// Preview scopes (histogram/waveform/vectorscope) above the panel.
+    scopes: Scopes,
     /// Pending debounce timer for the next render; replaced (restarting the
     /// timer) on each `RequestRender` so rapid drags coalesce into one render.
     render_timer: Option<glib::SourceId>,
@@ -190,6 +218,10 @@ fn spawn_render_worker(
                         let res = rapidraw_core::render(&ctx, &base, &adj, lut, None)
                             .and_then(|out| encode_image(&out, &path, opts))
                             .map(|()| path);
+                        let _ = cmd.send(CmdMsg::ExportDone(res));
+                    }
+                    RenderJob::ExportLut { adj, lut, path } => {
+                        let res = export_lut(&ctx, &adj, lut, &path).map(|()| path);
                         let _ = cmd.send(CmdMsg::ExportDone(res));
                     }
                 }
@@ -313,7 +345,7 @@ impl Component for AppModel {
             thumbs,
             canvas: EditorCanvas::new(),
             panel: AdjustPanel::new(&sender),
-            hist: Histogram::new(),
+            scopes: Scopes::new(),
             render_timer: None,
             settings: Settings::default(),
             render_tx,
@@ -326,7 +358,7 @@ impl Component for AppModel {
         // the adjustment panel.
         widgets.editor_page.append(model.canvas.root());
         let right = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        right.append(model.hist.root());
+        right.append(model.scopes.root());
         right.append(model.panel.root());
         widgets.editor_page.append(&right);
         ComponentParts { model, widgets }
@@ -453,31 +485,45 @@ impl Component for AppModel {
                 let vb = gtk::Box::new(gtk::Orientation::Vertical, 8);
                 vb.set_margin_all(12);
 
-                let fmt = gtk::DropDown::from_strings(&["JPEG", "PNG"]);
+                let fmt = gtk::DropDown::from_strings(&["JPEG", "PNG", "TIFF"]);
                 let q = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
                 q.set_value(90.0);
                 let qrow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 qrow.append(&gtk::Label::new(Some("JPEG quality")));
                 qrow.append(&q);
-                // Quality only applies to JPEG.
                 {
                     let q = q.clone();
                     fmt.connect_selected_notify(move |d| q.set_sensitive(d.selected() == 0));
                 }
 
+                // Resize: 0 = full resolution.
+                let resize = gtk::SpinButton::with_range(0.0, 20000.0, 100.0);
+                resize.set_value(0.0);
+                let rrow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                rrow.append(&gtk::Label::new(Some("Resize long edge (0=full)")));
+                rrow.append(&resize);
+
                 let go = gtk::Button::with_label("Export…");
                 go.add_css_class("suggested-action");
                 vb.append(&fmt);
                 vb.append(&qrow);
+                vb.append(&rrow);
                 vb.append(&go);
                 win.set_child(Some(&vb));
 
                 let sender = sender.clone();
                 let win_c = win.clone();
                 go.connect_clicked(move |_| {
+                    let format = match fmt.selected() {
+                        1 => ExportFormat::Png,
+                        2 => ExportFormat::Tiff,
+                        _ => ExportFormat::Jpeg,
+                    };
+                    let r = resize.value() as u32;
                     let opts = ExportOpts {
-                        png: fmt.selected() == 1,
+                        format,
                         quality: q.value() as u8,
+                        resize: (r > 0).then_some(r),
                     };
                     win_c.close();
                     sender.input(AppMsg::ExportConfigured(opts));
@@ -485,7 +531,7 @@ impl Component for AppModel {
                 win.present();
             }
             AppMsg::ExportConfigured(opts) => {
-                let ext = if opts.png { "png" } else { "jpg" };
+                let ext = opts.format.ext();
                 let suggested = self
                     .session
                     .active_path
@@ -558,6 +604,29 @@ impl Component for AppModel {
                 self.session.lut = None;
                 sender.input(AppMsg::RequestRender);
             }
+            AppMsg::ExportLutDialog => {
+                let dialog = gtk::FileDialog::builder()
+                    .title("Export LUT")
+                    .initial_name("look.cube")
+                    .build();
+                let parent = root.clone();
+                let sender = sender.clone();
+                dialog.save(Some(&parent), gtk::gio::Cancellable::NONE, move |res| {
+                    if let Ok(file) = res {
+                        if let Some(path) = file.path() {
+                            sender.input(AppMsg::ExportLutTo(path));
+                        }
+                    }
+                });
+            }
+            AppMsg::ExportLutTo(path) => {
+                log::info!("exporting LUT to {}", path.display());
+                let _ = self.render_tx.send(RenderJob::ExportLut {
+                    adj: Box::new(self.session.adjustments),
+                    lut: self.session.lut.clone(),
+                    path,
+                });
+            }
             AppMsg::ShowLibrary => {
                 widgets.stack.set_visible_child_name("library");
             }
@@ -620,7 +689,7 @@ impl Component for AppModel {
                 if rgba.width() <= 1 && rgba.height() <= 1 {
                     return;
                 }
-                self.hist.set_data(&rgba);
+                self.scopes.set_data(&rgba);
                 let tex = library::texture_from_rgba(&rgba);
                 self.canvas.set_texture(&tex);
             }
@@ -634,25 +703,55 @@ impl Component for AppModel {
     }
 }
 
-/// Encode a rendered image to `path` as JPEG (with quality) or PNG.
+/// Encode a rendered image to `path` per `opts` (format, JPEG quality, resize).
 fn encode_image(img: &DynamicImage, path: &std::path::Path, opts: ExportOpts) -> Result<(), String> {
-    use image::ImageEncoder;
-    let rgb = img.to_rgb8();
-    if opts.png {
-        rgb.save_with_format(path, image::ImageFormat::Png)
+    use image::{GenericImageView, ImageEncoder};
+    let img = match opts.resize {
+        Some(m) if img.dimensions().0.max(img.dimensions().1) > m => {
+            img.resize(m, m, image::imageops::FilterType::Lanczos3)
+        }
+        _ => img.clone(),
+    };
+    match opts.format {
+        ExportFormat::Png => img
+            .to_rgb8()
+            .save_with_format(path, image::ImageFormat::Png)
+            .map_err(|e| e.to_string()),
+        ExportFormat::Tiff => img
+            .to_rgb8()
+            .save_with_format(path, image::ImageFormat::Tiff)
+            .map_err(|e| e.to_string()),
+        ExportFormat::Jpeg => {
+            let rgb = img.to_rgb8();
+            let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                std::io::BufWriter::new(file),
+                opts.quality,
+            );
+            enc.write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
             .map_err(|e| e.to_string())
-    } else {
-        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        let enc =
-            image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), opts.quality);
-        enc.write_image(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|e| e.to_string())
+        }
     }
+}
+
+/// Bake the current look into a 33-point .cube LUT: process the identity HALD
+/// through the engine, then convert it back to a cube file.
+fn export_lut(
+    ctx: &rapidraw_core::image_processing::GpuContext,
+    adj: &rapidraw_core::image_processing::AllAdjustments,
+    lut: Option<Arc<Lut>>,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    const SIZE: u32 = 33;
+    let identity = rapidraw_core::lut_processing::generate_identity_lut_image(SIZE);
+    let processed = rapidraw_core::render(ctx, &identity, adj, lut, None)?;
+    let cube = rapidraw_core::lut_processing::convert_image_to_cube_lut(&processed, SIZE)?;
+    std::fs::write(path, cube).map_err(|e| e.to_string())
 }
 
 fn main() {
