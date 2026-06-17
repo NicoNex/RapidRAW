@@ -8,9 +8,11 @@ use image::{DynamicImage, GenericImageView, RgbaImage};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
 
+mod editor;
 mod library;
 mod state;
 mod thumb;
+use editor::EditorCanvas;
 use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
 
@@ -41,6 +43,9 @@ struct AppModel {
     /// clicked child index can be mapped back to its path.
     images_shared: Rc<RefCell<Vec<PathBuf>>>,
     thumbs: FactoryVecDeque<Thumb>,
+    /// Editor-page canvas (Picture + zoom/pan), owned by the model. Its root
+    /// widget is appended to the Stack's "editor" page in `init`.
+    canvas: EditorCanvas,
 }
 
 #[relm4::component]
@@ -92,12 +97,9 @@ impl Component for AppModel {
                         },
                     },
 
+                    #[name = "editor_page"]
                     add_named[Some("editor")] = &gtk::Box {
                         set_orientation: gtk::Orientation::Vertical,
-                        gtk::Label {
-                            set_vexpand: true,
-                            set_label: "Editor (Phase 8)",
-                        },
                     },
                 },
             },
@@ -119,11 +121,14 @@ impl Component for AppModel {
             images: Vec::new(),
             images_shared: Rc::new(RefCell::new(Vec::new())),
             thumbs,
+            canvas: EditorCanvas::new(),
         };
 
         let flow_box = model.thumbs.widget();
         let images = model.images_shared.clone();
         let widgets = view_output!();
+        // Attach the editor canvas into the (otherwise empty) editor page.
+        widgets.editor_page.append(model.canvas.root());
         ComponentParts { model, widgets }
     }
 
@@ -222,6 +227,11 @@ impl Component for AppModel {
             CmdMsg::BaseReady(path, img) => {
                 let (w, h) = img.dimensions();
                 log::info!("base image ready: {} ({w}x{h})", path.display());
+                // Show the un-adjusted base immediately. We're on the GTK main
+                // thread here, so building the gdk texture is safe.
+                let rgba = img.to_rgba8();
+                let tex = library::texture_from_rgba(&rgba);
+                self.canvas.set_texture(&tex);
                 self.session.base_image = Some(Arc::new(img));
             }
         }
