@@ -183,6 +183,8 @@ struct AppModel {
     panel: AdjustPanel,
     /// Preview scopes (histogram/waveform/vectorscope) above the panel.
     scopes: Scopes,
+    /// Overlay for transient status toasts (export done, LUT loaded, …).
+    toasts: adw::ToastOverlay,
     /// Pending debounce timer for the next render; replaced (restarting the
     /// timer) on each `RequestRender` so rapid drags coalesce into one render.
     render_timer: Option<glib::SourceId>,
@@ -320,8 +322,11 @@ impl Component for AppModel {
                 },
 
                 #[wrap(Some)]
-                #[name = "stack"]
-                set_content = &gtk::Stack {
+                #[name = "toast_overlay"]
+                set_content = &adw::ToastOverlay {
+                    #[wrap(Some)]
+                    #[name = "stack"]
+                    set_child = &gtk::Stack {
                     set_vexpand: true,
                     set_hexpand: true,
 
@@ -369,6 +374,7 @@ impl Component for AppModel {
                             set_wide_handle: true,
                         },
                     },
+                    },
                 },
             },
         }
@@ -393,6 +399,7 @@ impl Component for AppModel {
             canvas: EditorCanvas::new(),
             panel: AdjustPanel::new(&sender),
             scopes: Scopes::new(),
+            toasts: adw::ToastOverlay::new(), // replaced by the view's overlay below
             render_timer: None,
             settings: Settings::default(),
             render_tx,
@@ -407,6 +414,7 @@ impl Component for AppModel {
         let flow_box = model.thumbs.widget();
         let images = model.images_shared.clone();
         let widgets = view_output!();
+        model.toasts = widgets.toast_overlay.clone();
         // Editor page: canvas on the left; right column = scopes on top of the
         // adjustment panel. A Paned divider keeps the panel at a fixed,
         // mouse-resizable width that the photo zoom never disturbs.
@@ -773,9 +781,16 @@ impl Component for AppModel {
             }
             CmdMsg::ExportDone(Ok(path)) => {
                 log::info!("export saved: {}", path.display());
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.toasts.add_toast(adw::Toast::new(&format!("Saved {name}")));
             }
             CmdMsg::ExportDone(Err(e)) => {
                 log::warn!("export failed: {e}");
+                self.toasts
+                    .add_toast(adw::Toast::new(&format!("Export failed: {e}")));
             }
         }
     }

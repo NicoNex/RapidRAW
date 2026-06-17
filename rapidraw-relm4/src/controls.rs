@@ -428,6 +428,17 @@ fn build_lut_section(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment)
             }));
         });
     }
+    // Double-click resets intensity to its default (100%).
+    let reset = gtk::GestureClick::new();
+    {
+        let scale = scale.clone();
+        reset.connect_pressed(move |_, n, _, _| {
+            if n == 2 {
+                scale.set_value(100.0);
+            }
+        });
+    }
+    scale.add_controller(reset);
     lut_box.append(&lbl);
     lut_box.append(&scale);
 

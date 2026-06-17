@@ -100,6 +100,17 @@ impl ColorWheel {
                 }));
             });
         }
+        // Double-click the luminance slider resets it to 0.
+        let lum_reset = gtk::GestureClick::new();
+        {
+            let lum = lum.clone();
+            lum_reset.connect_pressed(move |_, n, _, _| {
+                if n == 2 {
+                    lum.set_value(0.0);
+                }
+            });
+        }
+        lum.add_controller(lum_reset);
 
         // Double-click anywhere on the wheel resets all three components.
         let reset = gtk::GestureClick::new();
