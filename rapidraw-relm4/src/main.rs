@@ -2,28 +2,81 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
+use gtk::glib;
 use gtk::prelude::*;
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
 
+mod controls;
 mod editor;
 mod library;
 mod state;
 mod thumb;
+use controls::AdjustPanel;
 use editor::EditorCanvas;
 use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
 
 /// Longest-edge size (px) used for library thumbnails.
 const THUMB_DIM: u32 = 300;
+/// Longest-edge size (px) for the live editor preview render.
+const PREVIEW_DIM: u32 = 2048;
+/// Debounce window (ms) for coalescing rapid slider drags into one render.
+const RENDER_DEBOUNCE_MS: u64 = 80;
+
+/// Identifies a single exposed `GlobalAdjustments` f32 field. The slider panel
+/// in `controls.rs` builds one row per variant; `with` packages a new value
+/// into the `Adjust` message the model applies.
+#[derive(Debug, Clone, Copy)]
+pub enum AdjustField {
+    Exposure,
+    Contrast,
+    Highlights,
+    Shadows,
+    Whites,
+    Blacks,
+    Temperature,
+    Tint,
+    Vibrance,
+    Saturation,
+    Clarity,
+    Dehaze,
+    Structure,
+    Sharpness,
+    LumaNoiseReduction,
+    ColorNoiseReduction,
+    Vignette,
+    Grain,
+}
+
+impl AdjustField {
+    /// Pair this field with a new value for delivery via `AppMsg::Adjust`.
+    pub fn with(self, value: f32) -> Adjust {
+        Adjust { field: self, value }
+    }
+}
+
+/// A field/value pair written into `session.adjustments.global` on apply.
+#[derive(Debug, Clone, Copy)]
+pub struct Adjust {
+    field: AdjustField,
+    value: f32,
+}
 
 #[derive(Debug)]
 enum AppMsg {
     OpenFolderDialog,
     FolderChosen(PathBuf),
     OpenInEditor(PathBuf),
+    /// A slider moved: write the value into the adjustment stack.
+    Adjust(Adjust),
+    /// Ask for a (debounced) preview re-render.
+    RequestRender,
+    /// Debounce timer fired: actually launch the background render.
+    DoRender,
 }
 
 #[derive(Debug)]
@@ -33,6 +86,9 @@ enum CmdMsg {
     ThumbReady(usize, RgbaImage),
     /// A worker finished decoding the full base image for the editor.
     BaseReady(PathBuf, DynamicImage),
+    /// A worker finished a preview render. Carries the RGBA pixels (the gdk
+    /// texture is built on the main thread).
+    RenderReady(RgbaImage),
 }
 
 struct AppModel {
@@ -46,6 +102,11 @@ struct AppModel {
     /// Editor-page canvas (Picture + zoom/pan), owned by the model. Its root
     /// widget is appended to the Stack's "editor" page in `init`.
     canvas: EditorCanvas,
+    /// Right-side adjustment slider panel, appended next to the canvas in `init`.
+    panel: AdjustPanel,
+    /// Pending debounce timer for the next render; replaced (restarting the
+    /// timer) on each `RequestRender` so rapid drags coalesce into one render.
+    render_timer: Option<glib::SourceId>,
 }
 
 #[relm4::component]
@@ -99,7 +160,8 @@ impl Component for AppModel {
 
                     #[name = "editor_page"]
                     add_named[Some("editor")] = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
+                        // Canvas on the left, adjustment panel on the right.
+                        set_orientation: gtk::Orientation::Horizontal,
                     },
                 },
             },
@@ -122,13 +184,17 @@ impl Component for AppModel {
             images_shared: Rc::new(RefCell::new(Vec::new())),
             thumbs,
             canvas: EditorCanvas::new(),
+            panel: AdjustPanel::new(&sender),
+            render_timer: None,
         };
 
         let flow_box = model.thumbs.widget();
         let images = model.images_shared.clone();
         let widgets = view_output!();
-        // Attach the editor canvas into the (otherwise empty) editor page.
+        // Attach the editor canvas (left) and adjustment panel (right) into the
+        // (otherwise empty) editor page.
         widgets.editor_page.append(model.canvas.root());
+        widgets.editor_page.append(model.panel.root());
         ComponentParts { model, widgets }
     }
 
@@ -208,6 +274,64 @@ impl Component for AppModel {
                     }
                 });
             }
+            AppMsg::Adjust(Adjust { field, value }) => {
+                let g = &mut self.session.adjustments.global;
+                match field {
+                    AdjustField::Exposure => g.exposure = value,
+                    AdjustField::Contrast => g.contrast = value,
+                    AdjustField::Highlights => g.highlights = value,
+                    AdjustField::Shadows => g.shadows = value,
+                    AdjustField::Whites => g.whites = value,
+                    AdjustField::Blacks => g.blacks = value,
+                    AdjustField::Temperature => g.temperature = value,
+                    AdjustField::Tint => g.tint = value,
+                    AdjustField::Vibrance => g.vibrance = value,
+                    AdjustField::Saturation => g.saturation = value,
+                    AdjustField::Clarity => g.clarity = value,
+                    AdjustField::Dehaze => g.dehaze = value,
+                    AdjustField::Structure => g.structure = value,
+                    AdjustField::Sharpness => g.sharpness = value,
+                    AdjustField::LumaNoiseReduction => g.luma_noise_reduction = value,
+                    AdjustField::ColorNoiseReduction => g.color_noise_reduction = value,
+                    AdjustField::Vignette => g.vignette_amount = value,
+                    AdjustField::Grain => g.grain_amount = value,
+                }
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::RequestRender => {
+                // Debounce: drop any pending timer and start a fresh one. Rapid
+                // slider drags thus collapse into a single DoRender.
+                if let Some(id) = self.render_timer.take() {
+                    id.remove();
+                }
+                let sender = sender.clone();
+                self.render_timer = Some(glib::timeout_add_local_once(
+                    Duration::from_millis(RENDER_DEBOUNCE_MS),
+                    move || sender.input(AppMsg::DoRender),
+                ));
+            }
+            AppMsg::DoRender => {
+                self.render_timer = None;
+                // Guard: nothing to render until a base image is loaded.
+                let Some(base) = self.session.base_image.clone() else {
+                    return;
+                };
+                let ctx = self.engine.ctx.clone();
+                let adj = self.session.adjustments.clone();
+                // ponytail: build a new GpuProcessor per render call; cache one
+                // keyed by max dimensions if slider latency is too high.
+                sender.oneshot_command(async move {
+                    match rapidraw_core::render(&ctx, &base, &adj, Some(PREVIEW_DIM)) {
+                        Ok(out) => CmdMsg::RenderReady(out.to_rgba8()),
+                        Err(e) => {
+                            log::warn!("preview render failed: {e}");
+                            // Reuse RenderReady with an empty image as a no-op
+                            // signal; update_cmd ignores 1x1 results.
+                            CmdMsg::RenderReady(RgbaImage::new(1, 1))
+                        }
+                    }
+                });
+            }
         }
         self.update_view(widgets, sender);
     }
@@ -215,7 +339,7 @@ impl Component for AppModel {
     fn update_cmd(
         &mut self,
         msg: Self::CommandOutput,
-        _sender: ComponentSender<Self>,
+        sender: ComponentSender<Self>,
         _root: &Self::Root,
     ) {
         match msg {
@@ -233,6 +357,18 @@ impl Component for AppModel {
                 let tex = library::texture_from_rgba(&rgba);
                 self.canvas.set_texture(&tex);
                 self.session.base_image = Some(Arc::new(img));
+                // Kick an initial engine render so the preview reflects the
+                // current adjustment stack (Phase 9).
+                sender.input(AppMsg::RequestRender);
+            }
+            CmdMsg::RenderReady(rgba) => {
+                // A 1x1 image signals a failed/empty render: ignore it so the
+                // previous preview stays on screen.
+                if rgba.width() <= 1 && rgba.height() <= 1 {
+                    return;
+                }
+                let tex = library::texture_from_rgba(&rgba);
+                self.canvas.set_texture(&tex);
             }
         }
     }
