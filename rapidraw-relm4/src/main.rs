@@ -14,11 +14,13 @@ mod colorwheel;
 mod controls;
 mod curves;
 mod editor;
+mod histogram;
 mod library;
 mod settings;
 mod state;
 mod thumb;
 use controls::AdjustPanel;
+use histogram::Histogram;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
@@ -28,7 +30,9 @@ use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
 
 /// Debounce window (ms) for coalescing rapid slider drags into one render.
-const RENDER_DEBOUNCE_MS: u64 = 80;
+/// Small: the render thread also coalesces, and the cached GpuProcessor makes
+/// each render cheap, so a short debounce keeps the preview responsive.
+const RENDER_DEBOUNCE_MS: u64 = 15;
 
 /// Output options for export.
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +150,8 @@ struct AppModel {
     canvas: EditorCanvas,
     /// Right-side adjustment slider panel, appended next to the canvas in `init`.
     panel: AdjustPanel,
+    /// RGB histogram of the current preview, above the panel.
+    hist: Histogram,
     /// Pending debounce timer for the next render; replaced (restarting the
     /// timer) on each `RequestRender` so rapid drags coalesce into one render.
     render_timer: Option<glib::SourceId>,
@@ -165,30 +171,41 @@ fn spawn_render_worker(
     let (tx, rx) = std::sync::mpsc::channel::<RenderJob>();
     let cmd = sender.command_sender().clone();
     std::thread::spawn(move || {
-        while let Ok(job) = rx.recv() {
-            match job {
-                RenderJob::Preview {
-                    base,
-                    adj,
-                    lut,
-                    dim,
-                } => match rapidraw_core::render(&ctx, &base, &adj, lut, Some(dim)) {
+        while let Ok(first) = rx.recv() {
+            // Drain everything pending so a burst of slider updates collapses to
+            // the latest preview (older previews are stale); exports always run.
+            let mut latest_preview = None;
+            let mut jobs = vec![first];
+            jobs.extend(rx.try_iter());
+            for job in jobs {
+                match job {
+                    RenderJob::Preview { .. } => latest_preview = Some(job),
+                    RenderJob::Export {
+                        base,
+                        adj,
+                        lut,
+                        path,
+                        opts,
+                    } => {
+                        let res = rapidraw_core::render(&ctx, &base, &adj, lut, None)
+                            .and_then(|out| encode_image(&out, &path, opts))
+                            .map(|()| path);
+                        let _ = cmd.send(CmdMsg::ExportDone(res));
+                    }
+                }
+            }
+            if let Some(RenderJob::Preview {
+                base,
+                adj,
+                lut,
+                dim,
+            }) = latest_preview
+            {
+                match rapidraw_core::render(&ctx, &base, &adj, lut, Some(dim)) {
                     Ok(out) => {
                         let _ = cmd.send(CmdMsg::RenderReady(out.to_rgba8()));
                     }
                     Err(e) => log::warn!("preview render failed: {e}"),
-                },
-                RenderJob::Export {
-                    base,
-                    adj,
-                    lut,
-                    path,
-                    opts,
-                } => {
-                    let res = rapidraw_core::render(&ctx, &base, &adj, lut, None)
-                        .and_then(|out| encode_image(&out, &path, opts))
-                        .map(|()| path);
-                    let _ = cmd.send(CmdMsg::ExportDone(res));
                 }
             }
         }
@@ -296,6 +313,7 @@ impl Component for AppModel {
             thumbs,
             canvas: EditorCanvas::new(),
             panel: AdjustPanel::new(&sender),
+            hist: Histogram::new(),
             render_timer: None,
             settings: Settings::default(),
             render_tx,
@@ -304,10 +322,13 @@ impl Component for AppModel {
         let flow_box = model.thumbs.widget();
         let images = model.images_shared.clone();
         let widgets = view_output!();
-        // Attach the editor canvas (left) and adjustment panel (right) into the
-        // (otherwise empty) editor page.
+        // Editor page: canvas on the left; right column = histogram on top of
+        // the adjustment panel.
         widgets.editor_page.append(model.canvas.root());
-        widgets.editor_page.append(model.panel.root());
+        let right = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        right.append(model.hist.root());
+        right.append(model.panel.root());
+        widgets.editor_page.append(&right);
         ComponentParts { model, widgets }
     }
 
@@ -599,6 +620,7 @@ impl Component for AppModel {
                 if rgba.width() <= 1 && rgba.height() <= 1 {
                     return;
                 }
+                self.hist.set_data(&rgba);
                 let tex = library::texture_from_rgba(&rgba);
                 self.canvas.set_texture(&tex);
             }

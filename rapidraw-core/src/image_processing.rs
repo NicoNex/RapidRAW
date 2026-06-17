@@ -1215,9 +1215,9 @@ impl Point {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
 #[repr(C)]
 pub struct HslColor {
-    hue: f32,
-    saturation: f32,
-    luminance: f32,
+    pub hue: f32,
+    pub saturation: f32,
+    pub luminance: f32,
     _pad: f32,
 }
 
