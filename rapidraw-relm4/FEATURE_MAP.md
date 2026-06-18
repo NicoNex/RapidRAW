@@ -20,7 +20,7 @@ the adjustments panel, always.
 | Masks | ❌ | AI/radial/linear/brush masks; big |
 | AI (inpaint/generative) | ❌ | needs model backend; likely ➖ for now |
 | Presets | ❌ | save/apply adjustment presets |
-| Export | ✅ | dialog with all formats (JPEG/PNG/TIFF/WebP/JPEG XL/AVIF/CUBE LUT) + per-format settings; ⚠️ no watermark/filename-template/keep-metadata/preset list |
+| Export | ✅ | all formats + per-format quality + resize modes (long-edge/width/height) + don't-enlarge; ⚠️ no watermark/filename-template/keep-metadata/batch/preset list |
 | Metadata (EXIF) | ❌ | read + show EXIF |
 
 **TODO:** add a panel switcher (right-aligned icon rail like the original) so
@@ -39,7 +39,7 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 | Feature | Status | Notes |
 |--------|--------|-------|
 | Point curve editor (Luma/R/G/B) | ✅ | `curves.rs` |
-| **Parametric curve** (highlights/lights/darks/shadows + black/white level) | ✅ | `curves.rs` Point/Parametric mode toggle; splits fixed at 25/50/75 ⚠️ |
+| **Parametric curve** (highlights/lights/darks/shadows + black/white level + adjustable splits) | ✅ | `curves.rs` Point/Parametric toggle, Split 1/2/3 sliders |
 | Copy/paste curve | ✅ | `curves.rs` per-channel clipboard (points + parametric) |
 
 ### Color (`adjustments/Color.tsx`)
@@ -51,6 +51,7 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 | Color Grading: Blending, Balance | ✅ | |
 | HSL 8 bands (Hue/Sat/Lum) | ✅ | Hue + Sat + Lum gradient tracks ✅ (sat/lum follow live band hue/sat) |
 | Calibration (shadow tint, R/G/B hue+sat) | ✅ | |
+| White-balance eyedropper/picker | ❌ | needs canvas pixel-pick + WB inversion |
 
 ### Details (`adjustments/Details.tsx`)
 | Control | Status |
@@ -102,9 +103,9 @@ toggles don't visually reset.
 | **Undo / Redo** (Ctrl+Z / Ctrl+Shift+Z, Ctrl+Y) | ✅ | `main.rs` history stack; ⚠️ colour-wheel/curve UI widgets don't re-sync on undo (render is correct) |
 | Adjustments history dropdown | ❌ | |
 | **Show original** (before/after toggle) | ✅ | toolbar toggle, preview-size original |
-| Fullscreen | ❌ | |
+| Fullscreen | ✅ | toolbar button |
 | EXIF readout (shutter/aperture/iso/focal/date) | ✅ | `meta.rs` (kamadak-exif), shown right in toolbar |
-| Copy / paste settings between photos | ❌ | |
+| Copy / paste settings between photos | ✅ | toolbar buttons (adjustments + geometry + LUT) |
 
 ---
 
@@ -115,10 +116,9 @@ toggles don't visually reset.
 | **Continue session** (reopen last folder) | ✅ | last folder persisted to `$XDG_CONFIG_HOME/rapidraw-relm4/last_folder`; button on welcome |
 | **Splash / default photo** on home | ✅ | embedded `splash-grey.jpg` welcome screen (`.osd` card, brand, Open/Continue) |
 | **Raw filter**: All / Raw only / Non-raw only / Prefer raw | ✅ | `library.rs arrange`; toolbar DropDown |
-| Sort (name/date) | ✅ | name + date newest/oldest; toolbar DropDown |
-| Sort by rating/EXIF | ❌ | needs ratings/EXIF index |
-| Star ratings | ❌ | needs a persisted store |
-| Search | ❌ | |
+| Sort (name/date/rating) | ✅ | name + date + rating; toolbar DropDown |
+| Star ratings | ✅ | grid display; set via 1–5/0 keys in editor; persisted (`ratings.json`); ⚠️ no grid-click set, no rating filter |
+| Search | ✅ | filename substring (`SearchEntry`) |
 | Folder tree sidebar | ❌ | |
 
 ---
