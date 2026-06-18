@@ -870,7 +870,10 @@ impl Component for AppModel {
             .content_stack
             .add_named(model.crop.root(), Some("crop"));
         model.content_stack.set_visible_child_name("adjust");
-        model.right_col.set_hexpand(true);
+        // Fixed, comfortable panel width. The Paned sizes the end child to this
+        // natural width at any window size (the canvas absorbs the rest), so the
+        // panel never grabs half a maximized window. The user can still drag.
+        model.right_col.set_width_request(370);
 
         // Top tabs (Edit / Crop), a centred linked toggle group, above the panel.
         let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -918,8 +921,8 @@ impl Component for AppModel {
         paned.set_shrink_start_child(true);
         paned.set_resize_end_child(false);
         paned.set_shrink_end_child(false);
-        // Comfortable default panel width (~380px); window opens at 1440.
-        paned.set_position(1060);
+        // No absolute position: the divider follows the end child's natural width
+        // (370) regardless of window size, and the user can drag to override.
         ComponentParts { model, widgets }
     }
 
