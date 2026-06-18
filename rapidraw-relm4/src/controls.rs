@@ -338,74 +338,169 @@ fn build_grading(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> 
 /// same order as `HSL_BANDS`.
 const HSL_CENTERS: [f64; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 340.0];
 
+/// HSL mixer: a row of clickable colour swatches (one per band) selecting which
+/// band the Hue/Sat/Lum sliders below edit — mirroring the original UI. The
+/// slider set is rebuilt on band switch (so its gradients/setters track the
+/// active band); per-band values are kept in a small store.
 fn build_hsl(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Box {
     use crate::slider::slider_ex;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    let wrap = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    for (i, &(band, hue_set, sat_set, lum_set)) in HSL_BANDS.iter().enumerate() {
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        body.set_margin_all(4);
-        let center = HSL_CENTERS[i];
-        // Shared live raw values so the sat/lum gradients follow the band's hue
-        // and saturation (matches the original's CSS-var tracks).
-        let hue_cell = Rc::new(Cell::new(0.0_f64));
-        let sat_cell = Rc::new(Cell::new(0.0_f64));
+    install_hsl_css();
+    let wrap = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    wrap.set_margin_all(4);
 
-        let adjust = |set: Setter, scale: f64, sender: ComponentSender<AppModel>| {
-            move |v: f64| {
-                sender.input(AppMsg::Adjust(crate::Adjust {
-                    set,
-                    value: (v / scale) as f32,
-                }))
+    // Per-band [hue, sat, lum] UI values (all start at 0).
+    let store = Rc::new(RefCell::new([[0.0_f64; 3]; 8]));
+    let active = Rc::new(Cell::new(0usize));
+
+    let swatches = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    swatches.set_halign(gtk::Align::Center);
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 2);
+
+    // Rebuild the 3 sliders for `band`, seeded from the store.
+    let rebuild: Rc<dyn Fn(usize)> = {
+        let container = container.clone();
+        let store = store.clone();
+        let sender = sender.clone();
+        let vadj = vadj.clone();
+        Rc::new(move |band: usize| {
+            while let Some(c) = container.first_child() {
+                container.remove(&c);
             }
-        };
+            let center = HSL_CENTERS[band];
+            let (_, hue_set, sat_set, lum_set) = HSL_BANDS[band];
+            let cur = store.borrow()[band];
+            let hue_cell = Rc::new(Cell::new(cur[0]));
+            let sat_cell = Rc::new(Cell::new(cur[1]));
 
-        // Build luminance and saturation first so the hue/sat callbacks can
-        // redraw them when their dependent gradients change.
-        let (lum_box, lum_area, _) = slider_ex(
-            "Luminance", -100.0, 100.0, 1.0, 0.0,
-            Track::HslLum { base: center, hue: hue_cell.clone(), sat: sat_cell.clone() },
-            vadj, adjust(lum_set, 100.0, sender.clone()),
-        );
-        let (sat_box, sat_area, _) = {
-            let lum_area = lum_area.clone();
-            let sat_cell = sat_cell.clone();
-            let emit = adjust(sat_set, 100.0, sender.clone());
-            slider_ex(
-                "Saturation", -100.0, 100.0, 1.0, 0.0,
-                Track::HslSat { base: center, hue: hue_cell.clone() },
-                vadj,
-                move |v| {
-                    sat_cell.set(v);
-                    lum_area.queue_draw();
-                    emit(v);
-                },
-            )
-        };
-        let (hue_box, _, _) = {
-            let sat_area = sat_area.clone();
-            let lum_area = lum_area.clone();
-            let hue_cell = hue_cell.clone();
-            let emit = adjust(hue_set, HSL_HUE_SCALE, sender.clone());
-            slider_ex(
-                "Hue", -100.0, 100.0, 1.0, 0.0, Track::HslHue(center), vadj,
-                move |v| {
-                    hue_cell.set(v);
-                    sat_area.queue_draw();
-                    lum_area.queue_draw();
-                    emit(v);
-                },
-            )
-        };
+            let emit = |set: Setter, scale: f64, s: ComponentSender<AppModel>| {
+                move |v: f64| {
+                    s.input(AppMsg::Adjust(crate::Adjust { set, value: (v / scale) as f32 }))
+                }
+            };
 
-        body.append(&hue_box);
-        body.append(&sat_box);
-        body.append(&lum_box);
-        wrap.append(&expander(band, &body, false));
+            // Build lum, then sat, then hue, so each can redraw later siblings.
+            let (lum_box, lum_area, lum_h) = {
+                let store = store.clone();
+                let e = emit(lum_set, 100.0, sender.clone());
+                slider_ex(
+                    "Luminance", -100.0, 100.0, 1.0, 0.0,
+                    Track::HslLum { base: center, hue: hue_cell.clone(), sat: sat_cell.clone() },
+                    &vadj,
+                    move |v| { store.borrow_mut()[band][2] = v; e(v); },
+                )
+            };
+            let (sat_box, sat_area, sat_h) = {
+                let store = store.clone();
+                let sat_cell = sat_cell.clone();
+                let lum_area = lum_area.clone();
+                let e = emit(sat_set, 100.0, sender.clone());
+                slider_ex(
+                    "Saturation", -100.0, 100.0, 1.0, 0.0,
+                    Track::HslSat { base: center, hue: hue_cell.clone() },
+                    &vadj,
+                    move |v| { store.borrow_mut()[band][1] = v; sat_cell.set(v); lum_area.queue_draw(); e(v); },
+                )
+            };
+            let (hue_box, _, hue_h) = {
+                let store = store.clone();
+                let hue_cell = hue_cell.clone();
+                let sat_area = sat_area.clone();
+                let lum_area = lum_area.clone();
+                let e = emit(hue_set, HSL_HUE_SCALE, sender.clone());
+                slider_ex(
+                    "Hue", -100.0, 100.0, 1.0, 0.0, Track::HslHue(center), &vadj,
+                    move |v| { store.borrow_mut()[band][0] = v; hue_cell.set(v); sat_area.queue_draw(); lum_area.queue_draw(); e(v); },
+                )
+            };
+            // Show stored values without firing change callbacks.
+            hue_h.set_ui(cur[0]);
+            sat_h.set_ui(cur[1]);
+            lum_h.set_ui(cur[2]);
+
+            container.append(&hue_box);
+            container.append(&sat_box);
+            container.append(&lum_box);
+        })
+    };
+
+    let mut group: Option<gtk::ToggleButton> = None;
+    for (i, &(band, _, _, _)) in HSL_BANDS.iter().enumerate() {
+        let b = gtk::ToggleButton::new();
+        b.add_css_class("circular");
+        b.add_css_class(&format!("hsl-swatch-{i}"));
+        b.set_tooltip_text(Some(band));
+        match &group {
+            Some(g) => b.set_group(Some(g)),
+            None => group = Some(b.clone()),
+        }
+        if i == 0 {
+            b.set_active(true);
+        }
+        let active = active.clone();
+        let rebuild = rebuild.clone();
+        b.connect_toggled(move |b| {
+            if b.is_active() {
+                active.set(i);
+                rebuild(i);
+            }
+        });
+        swatches.append(&b);
     }
+
+    rebuild(0);
+    wrap.append(&swatches);
+    wrap.append(&container);
     wrap
+}
+
+/// One-time CSS for the 8 HSL band swatches (a coloured circle per band).
+fn install_hsl_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut css = String::new();
+        for (i, &center) in HSL_CENTERS.iter().enumerate() {
+            let (r, g, b) = hsl_to_rgb(center, 0.75, 0.5);
+            css.push_str(&format!(
+                ".hsl-swatch-{i} {{ background-image: none; background-color: rgb({r},{g},{b}); \
+                 min-width: 22px; min-height: 22px; padding: 0; }} \
+                 .hsl-swatch-{i}:checked {{ box-shadow: inset 0 0 0 2px white; }} "
+            ));
+        }
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(&css);
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
+}
+
+/// HSL (deg, 0..1, 0..1) -> sRGB u8 triple, for the swatch colours.
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    (
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
