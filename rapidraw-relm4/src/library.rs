@@ -46,8 +46,8 @@ fn stem(p: &Path) -> String {
         .to_lowercase()
 }
 
-/// Apply the raw filter then the sort order to a scanned image list.
-pub fn arrange(all: &[PathBuf], filter: RawFilter, sort: SortBy) -> Vec<PathBuf> {
+/// Apply the raw filter, name search, then sort order to a scanned image list.
+pub fn arrange(all: &[PathBuf], filter: RawFilter, sort: SortBy, search: &str) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match filter {
         RawFilter::All => all.to_vec(),
         RawFilter::RawOnly => all.iter().filter(|p| is_raw(p)).cloned().collect(),
@@ -61,6 +61,15 @@ pub fn arrange(all: &[PathBuf], filter: RawFilter, sort: SortBy) -> Vec<PathBuf>
                 .collect()
         }
     };
+    if !search.trim().is_empty() {
+        let needle = search.to_lowercase();
+        v.retain(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        });
+    }
     match sort {
         SortBy::Name => v.sort(),
         SortBy::DateNewest | SortBy::DateOldest => {

@@ -158,6 +158,8 @@ enum AppMsg {
     FilterChanged(library::RawFilter),
     /// Library sort order changed.
     SortChanged(library::SortBy),
+    /// Library name search changed.
+    SearchChanged(String),
     /// Crop / geometry controls.
     CropAspect(f32),
     RotateCw,
@@ -371,6 +373,7 @@ struct AppModel {
     all_images: Vec<PathBuf>,
     raw_filter: library::RawFilter,
     sort_by: library::SortBy,
+    search: String,
     /// Last folder from a previous session (for "Continue session").
     last_folder: Option<PathBuf>,
     /// Crop/geometry transforms applied before the GPU render.
@@ -449,7 +452,8 @@ impl AppModel {
 
     /// Re-filter/-sort `all_images` into `images` and rebuild the thumbnail grid.
     fn apply_library(&mut self, sender: &ComponentSender<AppModel>) {
-        self.images = library::arrange(&self.all_images, self.raw_filter, self.sort_by);
+        self.images =
+            library::arrange(&self.all_images, self.raw_filter, self.sort_by, &self.search);
         *self.images_shared.borrow_mut() = self.images.clone();
 
         let mut guard = self.thumbs.guard();
@@ -803,6 +807,7 @@ impl Component for AppModel {
             all_images: Vec::new(),
             raw_filter: library::RawFilter::All,
             sort_by: library::SortBy::Name,
+            search: String::new(),
             last_folder: load_last_folder(),
             geom: Geometry::default(),
             crop: crop::CropPanel::new(&sender),
@@ -862,6 +867,18 @@ impl Component for AppModel {
         widgets.lib_toolbar.append(&filter_dd);
         widgets.lib_toolbar.append(&sort_lbl);
         widgets.lib_toolbar.append(&sort_dd);
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("Search filename…"));
+        search.set_hexpand(true);
+        search.set_halign(gtk::Align::End);
+        search.set_width_request(220);
+        {
+            let sender = sender.clone();
+            search.connect_search_changed(move |e| {
+                sender.input(AppMsg::SearchChanged(e.text().to_string()));
+            });
+        }
+        widgets.lib_toolbar.append(&search);
 
         // Welcome screen: full-bleed splash, a soft scrim for contrast, brand +
         // pill buttons centred (no boxed card).
@@ -1038,6 +1055,10 @@ impl Component for AppModel {
             }
             AppMsg::SortChanged(s) => {
                 self.sort_by = s;
+                self.apply_library(&sender);
+            }
+            AppMsg::SearchChanged(q) => {
+                self.search = q;
                 self.apply_library(&sender);
             }
             AppMsg::CropAspect(a) => {
