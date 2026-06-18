@@ -113,6 +113,22 @@ enum AppMsg {
     SettingsChanged(Settings),
     /// A tone curve changed: channel + points (x,y in 0..255).
     CurveChanged(Channel, Vec<(f32, f32)>),
+    /// Debounced: commit the current adjustment state to the undo history.
+    CommitHistory,
+    /// Undo / redo the adjustment history (Ctrl+Z / Ctrl+Shift+Z).
+    Undo,
+    Redo,
+    /// Toggle the before/after view (show the unedited original).
+    ToggleOriginal,
+}
+
+/// One undo/redo step: the full engine state plus the slider UI values needed to
+/// restore the panel.
+#[derive(Clone)]
+struct HistEntry {
+    adj: rapidraw_core::image_processing::AllAdjustments,
+    lut: Option<Arc<Lut>>,
+    vals: Vec<f64>,
 }
 
 /// Work sent to the persistent render thread. Keeping a single long-lived
@@ -202,6 +218,51 @@ struct AppModel {
     /// Which thumbnails have decoded, so returning to the library only resumes
     /// the missing ones.
     thumb_loaded: Vec<bool>,
+    /// Undo/redo stack of adjustment states; `hist_idx` points at the current one.
+    history: Vec<HistEntry>,
+    hist_idx: usize,
+    /// Debounce timer so a burst of slider changes records one history step.
+    hist_timer: Option<glib::SourceId>,
+    /// While true (during undo/redo restore), changes don't record history.
+    suppress_history: bool,
+    /// Last processed preview texture (for toggling back from "show original").
+    last_tex: Option<gdk::MemoryTexture>,
+    /// The unedited image at preview size (for "show original").
+    original_tex: Option<gdk::MemoryTexture>,
+    /// Whether the before/after view is currently showing the original.
+    showing_original: bool,
+}
+
+impl AppModel {
+    /// Restart the history-commit debounce timer.
+    fn schedule_history(&mut self, sender: &ComponentSender<AppModel>) {
+        if self.suppress_history {
+            return;
+        }
+        if let Some(id) = self.hist_timer.take() {
+            id.remove();
+        }
+        let sender = sender.clone();
+        self.hist_timer = Some(glib::timeout_add_local_once(
+            Duration::from_millis(500),
+            move || sender.input(AppMsg::CommitHistory),
+        ));
+    }
+
+    /// Apply the history entry at `hist_idx`: set engine state, restore the
+    /// panel UI, and re-render. Does not record new history.
+    fn apply_history(&mut self, sender: &ComponentSender<AppModel>) {
+        let entry = self.history[self.hist_idx].clone();
+        self.session.adjustments = entry.adj;
+        self.session.lut = entry.lut;
+        self.suppress_history = true;
+        self.panel.restore(&entry.vals);
+        self.suppress_history = false;
+        if self.showing_original {
+            self.showing_original = false;
+        }
+        sender.input(AppMsg::RequestRender);
+    }
 }
 
 /// Spawn background decode jobs for thumbnails at `indices` under `gen`; each
@@ -361,11 +422,31 @@ impl Component for AppModel {
 
                         gtk::Box {
                             set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
                             set_margin_all: 4,
                             gtk::Button {
                                 set_icon_name: "go-previous-symbolic",
                                 set_label: "Library",
                                 connect_clicked => AppMsg::ShowLibrary,
+                            },
+                            gtk::Separator { set_orientation: gtk::Orientation::Vertical },
+                            gtk::Button {
+                                set_icon_name: "edit-undo-symbolic",
+                                set_tooltip_text: Some("Undo (Ctrl+Z)"),
+                                add_css_class: "flat",
+                                connect_clicked => AppMsg::Undo,
+                            },
+                            gtk::Button {
+                                set_icon_name: "edit-redo-symbolic",
+                                set_tooltip_text: Some("Redo (Ctrl+Shift+Z)"),
+                                add_css_class: "flat",
+                                connect_clicked => AppMsg::Redo,
+                            },
+                            gtk::ToggleButton {
+                                set_icon_name: "view-reveal-symbolic",
+                                set_tooltip_text: Some("Show original (before/after)"),
+                                add_css_class: "flat",
+                                connect_toggled => AppMsg::ToggleOriginal,
                             },
                         },
 
@@ -410,6 +491,13 @@ impl Component for AppModel {
             render_tx,
             thumb_gen: Arc::new(AtomicUsize::new(0)),
             thumb_loaded: Vec::new(),
+            history: Vec::new(),
+            hist_idx: 0,
+            hist_timer: None,
+            suppress_history: false,
+            last_tex: None,
+            original_tex: None,
+            showing_original: false,
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -420,6 +508,29 @@ impl Component for AppModel {
         let images = model.images_shared.clone();
         let widgets = view_output!();
         model.toasts = widgets.toast_overlay.clone();
+        // Undo/redo keyboard shortcuts (Ctrl+Z / Ctrl+Shift+Z, plus Ctrl+Y).
+        let key = gtk::EventControllerKey::new();
+        {
+            let sender = sender.clone();
+            key.connect_key_pressed(move |_, keyval, _, state| {
+                if !state.contains(gdk::ModifierType::CONTROL_MASK) {
+                    return glib::Propagation::Proceed;
+                }
+                let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+                match keyval.to_lower() {
+                    gdk::Key::z => {
+                        sender.input(if shift { AppMsg::Redo } else { AppMsg::Undo });
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::y => {
+                        sender.input(AppMsg::Redo);
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            });
+        }
+        root.add_controller(key);
         // Editor page: canvas on the left; right column = scopes on top of the
         // adjustment panel. A Paned divider keeps the panel at a fixed,
         // mouse-resizable width that the photo zoom never disturbs.
@@ -503,6 +614,7 @@ impl Component for AppModel {
             }
             AppMsg::Adjust(Adjust { set, value }) => {
                 set(&mut self.session.adjustments.global, value);
+                self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
             }
             AppMsg::RequestRender => {
@@ -658,12 +770,14 @@ impl Component for AppModel {
                     if self.session.adjustments.global.lut_intensity <= 0.0 {
                         self.session.adjustments.global.lut_intensity = 1.0;
                     }
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
                 Err(e) => log::warn!("LUT parse failed for {}: {e}", path.display()),
             },
             AppMsg::ClearLut => {
                 self.session.lut = None;
+                self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
             }
             AppMsg::ExportLutDialog => {
@@ -733,7 +847,57 @@ impl Component for AppModel {
                 }
                 // count < 2 means "identity" in the shader, so a 2-point line is a no-op.
                 *count = pts.len().min(16) as u32;
+                self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::CommitHistory => {
+                self.hist_timer = None;
+                if self.suppress_history {
+                    return;
+                }
+                let cur = self.session.adjustments;
+                let lut = self.session.lut.clone();
+                let same = self
+                    .history
+                    .get(self.hist_idx)
+                    .map(|e| {
+                        bytemuck::bytes_of(&e.adj.global) == bytemuck::bytes_of(&cur.global)
+                            && lut_eq(&e.lut, &lut)
+                    })
+                    .unwrap_or(false);
+                if same {
+                    return;
+                }
+                self.history.truncate(self.hist_idx + 1);
+                self.history.push(HistEntry {
+                    adj: cur,
+                    lut,
+                    vals: self.panel.snapshot(),
+                });
+                self.hist_idx = self.history.len() - 1;
+            }
+            AppMsg::Undo => {
+                if self.hist_idx > 0 {
+                    self.hist_idx -= 1;
+                    self.apply_history(&sender);
+                }
+            }
+            AppMsg::Redo => {
+                if self.hist_idx + 1 < self.history.len() {
+                    self.hist_idx += 1;
+                    self.apply_history(&sender);
+                }
+            }
+            AppMsg::ToggleOriginal => {
+                self.showing_original = !self.showing_original;
+                let tex = if self.showing_original {
+                    self.original_tex.as_ref()
+                } else {
+                    self.last_tex.as_ref()
+                };
+                if let Some(tex) = tex {
+                    self.canvas.update_texture(tex);
+                }
             }
         }
         self.update_view(widgets, sender);
@@ -778,7 +942,24 @@ impl Component for AppModel {
                 let rgba = img.to_rgba8();
                 let tex = library::texture_from_rgba(&rgba);
                 self.canvas.set_texture(&tex);
+                // The unedited image at preview size, for the before/after toggle.
+                let preview = self.settings.preview_dim;
+                let orig = if w.max(h) > preview {
+                    img.resize(preview, preview, image::imageops::FilterType::Lanczos3)
+                } else {
+                    img.clone()
+                };
+                self.original_tex = Some(library::texture_from_rgba(&orig.to_rgba8()));
+                self.last_tex = Some(tex);
+                self.showing_original = false;
                 self.session.base_image = Some(Arc::new(img));
+                // Seed the undo history with this image's starting state.
+                self.history = vec![HistEntry {
+                    adj: self.session.adjustments,
+                    lut: self.session.lut.clone(),
+                    vals: self.panel.snapshot(),
+                }];
+                self.hist_idx = 0;
                 // Kick an initial engine render so the preview reflects the
                 // current adjustment stack (Phase 9).
                 sender.input(AppMsg::RequestRender);
@@ -791,8 +972,12 @@ impl Component for AppModel {
                 }
                 self.scopes.set_data(&rgba);
                 let tex = library::texture_from_rgba(&rgba);
-                // Preserve the user's zoom/pan across preview updates.
-                self.canvas.update_texture(&tex);
+                self.last_tex = Some(tex.clone());
+                // Preserve the user's zoom/pan across preview updates. Don't
+                // clobber the canvas while the user is viewing the original.
+                if !self.showing_original {
+                    self.canvas.update_texture(&tex);
+                }
             }
             CmdMsg::ExportDone(Ok(path)) => {
                 log::info!("export saved: {}", path.display());
@@ -812,6 +997,15 @@ impl Component for AppModel {
 }
 
 /// Encode a rendered image to `path` per `opts` (format, JPEG quality, resize).
+/// Identity comparison for the active LUT (shared `Arc`, or both absent).
+fn lut_eq(a: &Option<Arc<Lut>>, b: &Option<Arc<Lut>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
 fn encode_image(img: &DynamicImage, path: &std::path::Path, opts: ExportOpts) -> Result<(), String> {
     use image::{GenericImageView, ImageEncoder};
     let img = match opts.resize {

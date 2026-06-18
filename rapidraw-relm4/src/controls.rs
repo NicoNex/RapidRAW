@@ -150,6 +150,8 @@ pub fn init_defaults(g: &mut GlobalAdjustments) {
 
 pub struct AdjustPanel {
     root: gtk::ScrolledWindow,
+    /// All slider handles, in build order, for undo/redo snapshot/restore.
+    handles: Vec<crate::slider::SliderHandle>,
 }
 
 impl AdjustPanel {
@@ -166,6 +168,7 @@ impl AdjustPanel {
 
         let vadj = root.vadjustment();
 
+        crate::slider::reg_begin();
         let curves = CurveEditor::new(sender);
         list.append(&card(&expander("Curves", curves.root(), true)));
         list.append(&card(&section("Basic", BASIC, sender, &vadj)));
@@ -173,8 +176,22 @@ impl AdjustPanel {
         list.append(&card(&section("Details", DETAILS, sender, &vadj)));
         list.append(&card(&section("Effects", EFFECTS, sender, &vadj)));
         list.append(&card(&build_lut_section(sender, &vadj)));
+        let handles = crate::slider::reg_take();
 
-        Self { root }
+        Self { root, handles }
+    }
+
+    /// Snapshot every slider's current UI value (build order).
+    pub fn snapshot(&self) -> Vec<f64> {
+        self.handles.iter().map(|h| h.get()).collect()
+    }
+
+    /// Restore slider UI values from a [`snapshot`](Self::snapshot) (no change
+    /// callbacks fire; the caller sets the engine state + renders).
+    pub fn restore(&self, vals: &[f64]) {
+        for (h, &v) in self.handles.iter().zip(vals) {
+            h.set_ui(v);
+        }
     }
 
     pub fn root(&self) -> &gtk::ScrolledWindow {
@@ -322,20 +339,70 @@ fn build_grading(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> 
 const HSL_CENTERS: [f64; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 340.0];
 
 fn build_hsl(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Box {
+    use crate::slider::slider_ex;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     let wrap = gtk::Box::new(gtk::Orientation::Vertical, 2);
     for (i, &(band, hue_set, sat_set, lum_set)) in HSL_BANDS.iter().enumerate() {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
         body.set_margin_all(4);
-        body.append(&build_row(
-            "Hue", -100.0, 100.0, 1.0, HSL_HUE_SCALE, 0.0, hue_set,
-            Track::HslHue(HSL_CENTERS[i]), sender, vadj,
-        ));
-        body.append(&build_row(
-            "Saturation", -100.0, 100.0, 1.0, 100.0, 0.0, sat_set, Track::Plain, sender, vadj,
-        ));
-        body.append(&build_row(
-            "Luminance", -100.0, 100.0, 1.0, 100.0, 0.0, lum_set, Track::Plain, sender, vadj,
-        ));
+        let center = HSL_CENTERS[i];
+        // Shared live raw values so the sat/lum gradients follow the band's hue
+        // and saturation (matches the original's CSS-var tracks).
+        let hue_cell = Rc::new(Cell::new(0.0_f64));
+        let sat_cell = Rc::new(Cell::new(0.0_f64));
+
+        let adjust = |set: Setter, scale: f64, sender: ComponentSender<AppModel>| {
+            move |v: f64| {
+                sender.input(AppMsg::Adjust(crate::Adjust {
+                    set,
+                    value: (v / scale) as f32,
+                }))
+            }
+        };
+
+        // Build luminance and saturation first so the hue/sat callbacks can
+        // redraw them when their dependent gradients change.
+        let (lum_box, lum_area) = slider_ex(
+            "Luminance", -100.0, 100.0, 1.0, 0.0,
+            Track::HslLum { base: center, hue: hue_cell.clone(), sat: sat_cell.clone() },
+            vadj, adjust(lum_set, 100.0, sender.clone()),
+        );
+        let (sat_box, sat_area) = {
+            let lum_area = lum_area.clone();
+            let sat_cell = sat_cell.clone();
+            let emit = adjust(sat_set, 100.0, sender.clone());
+            slider_ex(
+                "Saturation", -100.0, 100.0, 1.0, 0.0,
+                Track::HslSat { base: center, hue: hue_cell.clone() },
+                vadj,
+                move |v| {
+                    sat_cell.set(v);
+                    lum_area.queue_draw();
+                    emit(v);
+                },
+            )
+        };
+        let (hue_box, _) = {
+            let sat_area = sat_area.clone();
+            let lum_area = lum_area.clone();
+            let hue_cell = hue_cell.clone();
+            let emit = adjust(hue_set, HSL_HUE_SCALE, sender.clone());
+            slider_ex(
+                "Hue", -100.0, 100.0, 1.0, 0.0, Track::HslHue(center), vadj,
+                move |v| {
+                    hue_cell.set(v);
+                    sat_area.queue_draw();
+                    lum_area.queue_draw();
+                    emit(v);
+                },
+            )
+        };
+
+        body.append(&hue_box);
+        body.append(&sat_box);
+        body.append(&lum_box);
         wrap.append(&expander(band, &body, false));
     }
     wrap

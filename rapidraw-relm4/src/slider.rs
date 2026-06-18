@@ -1,37 +1,79 @@
 //! Custom adjustment slider, mirroring the original UI's `Slider.tsx`.
 //!
-//! Why not `gtk::Scale`? Two reasons the original relies on and `Scale` can't do:
-//!   1. The fill (highlight) runs from the slider's *default* position to the
-//!      current value — so a bipolar control (default 0, range ±100) lights up
-//!      *from the centre* as you move away, with no misleading half-fill at
-//!      rest. `Scale` only fills from `lower`.
-//!   2. Gradient tracks (temperature, tint, hue, HSL hue) that show the user
-//!      what the control does. Colours copied verbatim from `src/styles.css`.
+//! Why not `gtk::Scale`? The original relies on behaviour `Scale` can't do:
+//!   1. Fill (highlight) runs from the slider's *default* position to the value,
+//!      so a bipolar control (default 0, range ±100) lights up *from the centre*.
+//!   2. Gradient tracks (temperature, tint, hue, HSL hue/sat/lum) — colours
+//!      copied verbatim from `src/styles.css`.
 //!
-//! Built from a `DrawingArea` (track + fill + thumb) plus a header (label +
-//! value). Drag to set, double-click or label-click to reset to default.
+//! Built from a `DrawingArea` (track + fill + thumb) plus a header (label,
+//! reset button, value). Drag to set (Shift = fine), click the value to type an
+//! exact number, click the reset button / label / double-click track to reset.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::f64::consts::TAU;
 use std::rc::Rc;
 
 use gtk::cairo;
+use gtk::gdk;
 use gtk::prelude::*;
 
-#[derive(Clone, Copy)]
+/// A registered slider: read its current UI value, or set it without firing the
+/// change callback (used by undo/redo to restore the UI from a history state).
+#[derive(Clone)]
+pub struct SliderHandle {
+    value: Rc<Cell<f64>>,
+    set_ui: Rc<dyn Fn(f64)>,
+}
+
+impl SliderHandle {
+    pub fn get(&self) -> f64 {
+        self.value.get()
+    }
+    pub fn set_ui(&self, v: f64) {
+        (self.set_ui)(v)
+    }
+}
+
+thread_local! {
+    /// Sliders built between `reg_begin` and `reg_take` register here, so the
+    /// panel can snapshot/restore all of them by registration order.
+    static REG: RefCell<Option<Vec<SliderHandle>>> = const { RefCell::new(None) };
+}
+
+/// Start collecting slider handles (call before building a panel).
+pub fn reg_begin() {
+    REG.with(|r| *r.borrow_mut() = Some(Vec::new()));
+}
+
+/// Take the collected slider handles (call after building a panel).
+pub fn reg_take() -> Vec<SliderHandle> {
+    REG.with(|r| r.borrow_mut().take().unwrap_or_default())
+}
+
+#[derive(Clone)]
 pub enum Track {
     Plain,
     Temperature,
     Tint,
     /// Full-spectrum hue ramp (`hue-range-track`).
     Hue,
-    /// HSL band hue: 3-stop ramp centred on `deg` (band centre hue).
+    /// HSL band hue: 3-stop ramp centred on `base` (band centre hue, deg).
     HslHue(f64),
+    /// HSL band saturation: grey→saturated at the live effective hue.
+    HslSat { base: f64, hue: Rc<Cell<f64>> },
+    /// HSL band luminance: black→white tinted by live hue + saturation.
+    HslLum {
+        base: f64,
+        hue: Rc<Cell<f64>>,
+        sat: Rc<Cell<f64>>,
+    },
 }
 
 const AREA_H: i32 = 20;
 const TRACK_H: f64 = 6.0;
 const THUMB_R: f64 = 6.5;
+const FINE: f64 = 0.2;
 /// Fill overlay colour (semi-transparent accent), drawn over the track.
 const ACCENT: (f64, f64, f64, f64) = (0.40, 0.62, 1.0, 0.55);
 
@@ -47,21 +89,55 @@ pub fn slider(
     vadj: &gtk::Adjustment,
     on_change: impl Fn(f64) + 'static,
 ) -> gtk::Box {
+    slider_ex(label, min, max, step, default, track, vadj, on_change).0
+}
+
+/// Like [`slider`], but also returns the track `DrawingArea` so callers can
+/// `queue_draw()` it when a *sibling* slider changes a value its gradient
+/// depends on (HSL sat/lum tracks follow the band's hue/sat).
+#[allow(clippy::too_many_arguments)]
+pub fn slider_ex(
+    label: &str,
+    min: f64,
+    max: f64,
+    step: f64,
+    default: f64,
+    track: Track,
+    vadj: &gtk::Adjustment,
+    on_change: impl Fn(f64) + 'static,
+) -> (gtk::Box, gtk::DrawingArea) {
     let decimals = if step < 1.0 { 2 } else { 0 };
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
+    // --- header: label | reset | value ---
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+
     let lbl = gtk::Label::new(Some(label));
     lbl.set_halign(gtk::Align::Start);
     lbl.set_hexpand(true);
     lbl.add_css_class("caption");
-    lbl.set_tooltip_text(Some("Click to reset"));
+
+    let reset_btn = gtk::Button::from_icon_name("edit-undo-symbolic");
+    reset_btn.add_css_class("flat");
+    reset_btn.add_css_class("circular");
+    reset_btn.add_css_class("dim-label");
+    reset_btn.set_valign(gtk::Align::Center);
+    reset_btn.set_tooltip_text(Some("Reset to default"));
+
     let val_lbl = gtk::Label::new(Some(&fmt(default, decimals)));
     val_lbl.set_halign(gtk::Align::End);
     val_lbl.set_width_chars(5);
     val_lbl.add_css_class("caption");
+    let val_entry = gtk::Entry::new();
+    val_entry.set_max_width_chars(6);
+    val_entry.set_width_chars(6);
+    val_entry.add_css_class("caption");
+    val_entry.set_visible(false);
+
     header.append(&lbl);
+    header.append(&reset_btn);
     header.append(&val_lbl);
+    header.append(&val_entry);
 
     let area = gtk::DrawingArea::new();
     area.set_content_height(AREA_H);
@@ -70,8 +146,9 @@ pub fn slider(
     let value = Rc::new(Cell::new(default));
     {
         let value = value.clone();
+        let track = track.clone();
         area.set_draw_func(move |_, cr, w, h| {
-            draw(cr, w, h, min, max, default, value.get(), track);
+            draw(cr, w, h, min, max, default, value.get(), &track);
         });
     }
 
@@ -91,36 +168,44 @@ pub fn slider(
         })
     };
 
-    let from_x = {
-        let area = area.clone();
-        let apply = apply.clone();
-        move |x: f64| {
-            let frac = (x / (area.width().max(1) as f64)).clamp(0.0, 1.0);
-            apply(snap(min + frac * (max - min), min, max, step));
-        }
-    };
-
-    // Drag (and initial press) to set the value.
+    // --- drag to set (Shift = fine), with an initial jump to the press point ---
     let drag = gtk::GestureDrag::new();
     {
-        let startx = Rc::new(Cell::new(0.0));
-        let from_x = from_x.clone();
+        let start = Rc::new(Cell::new(0.0)); // value at press
+        let apply = apply.clone();
+        let area = area.clone();
         {
-            let startx = startx.clone();
-            let from_x = from_x.clone();
+            let start = start.clone();
+            let apply = apply.clone();
+            let area = area.clone();
             drag.connect_drag_begin(move |_, x, _| {
-                startx.set(x);
-                from_x(x);
+                let frac = (x / (area.width().max(1) as f64)).clamp(0.0, 1.0);
+                let v = snap(min + frac * (max - min), min, max, step);
+                start.set(v);
+                apply(v);
             });
         }
         {
-            let startx = startx.clone();
-            drag.connect_drag_update(move |_, dx, _| from_x(startx.get() + dx));
+            let start = start.clone();
+            let apply = apply.clone();
+            let area = area.clone();
+            drag.connect_drag_update(move |g, dx, _| {
+                let mult = if g
+                    .current_event_state()
+                    .contains(gdk::ModifierType::SHIFT_MASK)
+                {
+                    FINE
+                } else {
+                    1.0
+                };
+                let delta = (dx / (area.width().max(1) as f64)) * (max - min) * mult;
+                apply(snap(start.get() + delta, min, max, step));
+            });
         }
     }
     area.add_controller(drag);
 
-    // Double-click the track resets to default.
+    // Double-click the track resets.
     let dbl = gtk::GestureClick::new();
     {
         let apply = apply.clone();
@@ -132,19 +217,82 @@ pub fn slider(
     }
     area.add_controller(dbl);
 
-    // Click the label resets to default (reliable; matches the original).
-    let lbl_click = gtk::GestureClick::new();
+    // Reset button + label-click reset.
     {
         let apply = apply.clone();
-        lbl_click.connect_released(move |_, _, _, _| apply(default));
+        reset_btn.connect_clicked(move |_| apply(default));
     }
-    lbl.add_controller(lbl_click);
+    {
+        let apply = apply.clone();
+        let lbl_click = gtk::GestureClick::new();
+        lbl_click.connect_released(move |_, _, _, _| apply(default));
+        lbl.add_controller(lbl_click);
+    }
+
+    // --- click value to type an exact number ---
+    {
+        let val_lbl_g = val_lbl.clone();
+        let val_entry = val_entry.clone();
+        let value = value.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_released(move |_, _, _, _| {
+            val_entry.set_text(&fmt(value.get(), decimals));
+            val_lbl_g.set_visible(false);
+            val_entry.set_visible(true);
+            val_entry.grab_focus();
+            val_entry.select_region(0, -1);
+        });
+        val_lbl.add_controller(click);
+    }
+    let commit = {
+        let val_lbl = val_lbl.clone();
+        let val_entry = val_entry.clone();
+        let apply = apply.clone();
+        Rc::new(move || {
+            let txt = val_entry.text().replace(',', ".");
+            if let Ok(v) = txt.trim().parse::<f64>() {
+                apply(snap(v, min, max, step));
+            }
+            val_entry.set_visible(false);
+            val_lbl.set_visible(true);
+        })
+    };
+    {
+        let commit = commit.clone();
+        val_entry.connect_activate(move |_| commit());
+    }
+    {
+        let commit = commit.clone();
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit());
+        val_entry.add_controller(focus);
+    }
 
     crate::controls::forward_wheel(&area, vadj);
 
+    // Register for undo/redo: set_ui updates the UI only (no change callback).
+    let set_ui: Rc<dyn Fn(f64)> = {
+        let value = value.clone();
+        let area = area.clone();
+        let val_lbl = val_lbl.clone();
+        Rc::new(move |v: f64| {
+            value.set(v);
+            val_lbl.set_text(&fmt(v, decimals));
+            area.queue_draw();
+        })
+    };
+    REG.with(|r| {
+        if let Some(list) = r.borrow_mut().as_mut() {
+            list.push(SliderHandle {
+                value: value.clone(),
+                set_ui,
+            });
+        }
+    });
+
     root.append(&header);
     root.append(&area);
-    root
+    (root, area)
 }
 
 fn fmt(v: f64, decimals: usize) -> String {
@@ -156,7 +304,7 @@ fn snap(v: f64, min: f64, max: f64, step: f64) -> f64 {
     snapped.clamp(min, max)
 }
 
-fn draw(cr: &cairo::Context, w: i32, h: i32, min: f64, max: f64, default: f64, value: f64, track: Track) {
+fn draw(cr: &cairo::Context, w: i32, h: i32, min: f64, max: f64, default: f64, value: f64, track: &Track) {
     if w <= 0 || h <= 0 || max <= min {
         return;
     }
@@ -205,19 +353,19 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, min: f64, max: f64, default: f64, v
 }
 
 fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    use std::f64::consts::{FRAC_PI_2, PI};
     cr.new_sub_path();
-    cr.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
-    cr.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
-    cr.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
-    cr.arc(x + r, y + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+    cr.arc(x + w - r, y + r, r, -FRAC_PI_2, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, FRAC_PI_2);
+    cr.arc(x + r, y + h - r, r, FRAC_PI_2, PI);
+    cr.arc(x + r, y + r, r, PI, 1.5 * PI);
     cr.close_path();
 }
 
-fn paint_gradient(cr: &cairo::Context, wf: f64, track: Track) {
+fn paint_gradient(cr: &cairo::Context, wf: f64, track: &Track) {
     let grad = cairo::LinearGradient::new(0.0, 0.0, wf, 0.0);
     match track {
         Track::Temperature => {
-            // styles.css .temperature-gradient-track (dark variant).
             for (o, c) in [
                 (0.0, (0x2d, 0x4a, 0x74)),
                 (0.25, (0x49, 0x93, 0xb1)),
@@ -240,7 +388,6 @@ fn paint_gradient(cr: &cairo::Context, wf: f64, track: Track) {
             }
         }
         Track::Hue => {
-            // Full spectrum (Slider.tsx hue-range-track).
             let stops = [
                 0xff0000u32, 0xff8000, 0xffff00, 0x80ff00, 0x00ff00, 0x00ff80, 0x00ffff, 0x0080ff,
                 0x0000ff, 0x8000ff, 0xff00ff, 0xff0080, 0xff0000,
@@ -251,11 +398,22 @@ fn paint_gradient(cr: &cairo::Context, wf: f64, track: Track) {
                 add_rgb(&grad, i as f64 / n, c);
             }
         }
-        Track::HslHue(center) => {
-            // 3-stop ramp centred on the band hue (styles.css hsl hue sliders).
-            add_rgb(&grad, 0.0, hsl_to_rgb((center - 100.0).rem_euclid(360.0), 0.5, 0.5));
-            add_rgb(&grad, 0.5, hsl_to_rgb(center.rem_euclid(360.0), 0.5, 0.5));
-            add_rgb(&grad, 1.0, hsl_to_rgb((center + 100.0).rem_euclid(360.0), 0.5, 0.5));
+        Track::HslHue(base) => {
+            add_rgb(&grad, 0.0, hsl_to_rgb((base - 100.0).rem_euclid(360.0), 0.5, 0.5));
+            add_rgb(&grad, 0.5, hsl_to_rgb(base.rem_euclid(360.0), 0.5, 0.5));
+            add_rgb(&grad, 1.0, hsl_to_rgb((base + 100.0).rem_euclid(360.0), 0.5, 0.5));
+        }
+        Track::HslSat { base, hue } => {
+            let eff = (base + hue.get()).rem_euclid(360.0);
+            add_rgb(&grad, 0.0, hsl_to_rgb(eff, 0.0, 0.5));
+            add_rgb(&grad, 1.0, hsl_to_rgb(eff, 1.0, 0.5));
+        }
+        Track::HslLum { base, hue, sat } => {
+            let eff = (base + hue.get()).rem_euclid(360.0);
+            let es = ((sat.get() + 100.0) / 200.0).clamp(0.0, 1.0);
+            add_rgb(&grad, 0.0, hsl_to_rgb(eff, es, 0.0));
+            add_rgb(&grad, 0.5, hsl_to_rgb(eff, es, 0.5));
+            add_rgb(&grad, 1.0, hsl_to_rgb(eff, es, 1.0));
         }
         Track::Plain => {}
     }
@@ -264,12 +422,7 @@ fn paint_gradient(cr: &cairo::Context, wf: f64, track: Track) {
 }
 
 fn add_rgb(grad: &cairo::LinearGradient, offset: f64, c: (u8, u8, u8)) {
-    grad.add_color_stop_rgb(
-        offset,
-        c.0 as f64 / 255.0,
-        c.1 as f64 / 255.0,
-        c.2 as f64 / 255.0,
-    );
+    grad.add_color_stop_rgb(offset, c.0 as f64 / 255.0, c.1 as f64 / 255.0, c.2 as f64 / 255.0);
 }
 
 fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
