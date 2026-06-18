@@ -1,8 +1,7 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use half::f16;
-use image::{DynamicImage, GenericImageView, ImageBuffer, Luma, Rgba};
+use image::{DynamicImage, ImageBuffer, Luma};
 use std::num::NonZero;
 
 use wgpu::util::{DeviceExt, TextureDataOrder};
