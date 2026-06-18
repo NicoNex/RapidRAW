@@ -8,17 +8,25 @@ use relm4::prelude::*;
 pub struct Thumb {
     pub path: PathBuf,
     pub texture: Option<gdk::MemoryTexture>,
+    pub rating: u8,
 }
 
 #[derive(Debug)]
 pub enum ThumbMsg {
     /// Decoded texture arrived from a background worker (built on the main thread).
     SetTexture(gdk::MemoryTexture),
+    /// Star rating changed (0..5).
+    SetRating(u8),
+}
+
+/// "★★★☆☆" for a 0..5 rating.
+fn stars(r: u8) -> String {
+    (1..=5).map(|i| if i <= r { '★' } else { '☆' }).collect()
 }
 
 #[relm4::factory(pub)]
 impl FactoryComponent for Thumb {
-    type Init = PathBuf;
+    type Init = (PathBuf, u8);
     type Input = ThumbMsg;
     type Output = ();
     type CommandOutput = ();
@@ -49,13 +57,22 @@ impl FactoryComponent for Thumb {
                     .unwrap_or("")
                     .to_string(),
             },
+
+            gtk::Label {
+                add_css_class: "caption",
+                add_css_class: "dim-label",
+                #[watch]
+                set_label: &stars(self.rating),
+            },
         }
     }
 
-    fn init_model(path: Self::Init, _index: &DynamicIndex, _sender: FactorySender<Self>) -> Self {
+    fn init_model(init: Self::Init, _index: &DynamicIndex, _sender: FactorySender<Self>) -> Self {
+        let (path, rating) = init;
         Self {
             path,
             texture: None,
+            rating,
         }
     }
 
@@ -63,6 +80,9 @@ impl FactoryComponent for Thumb {
         match msg {
             ThumbMsg::SetTexture(tex) => {
                 self.texture = Some(tex);
+            }
+            ThumbMsg::SetRating(r) => {
+                self.rating = r;
             }
         }
     }

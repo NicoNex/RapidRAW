@@ -29,6 +29,7 @@ pub enum SortBy {
     Name,
     DateNewest,
     DateOldest,
+    RatingDesc,
 }
 
 /// True if `p` has a raw file extension.
@@ -47,7 +48,13 @@ fn stem(p: &Path) -> String {
 }
 
 /// Apply the raw filter, name search, then sort order to a scanned image list.
-pub fn arrange(all: &[PathBuf], filter: RawFilter, sort: SortBy, search: &str) -> Vec<PathBuf> {
+pub fn arrange(
+    all: &[PathBuf],
+    filter: RawFilter,
+    sort: SortBy,
+    search: &str,
+    ratings: &std::collections::HashMap<PathBuf, u8>,
+) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match filter {
         RawFilter::All => all.to_vec(),
         RawFilter::RawOnly => all.iter().filter(|p| is_raw(p)).cloned().collect(),
@@ -72,6 +79,10 @@ pub fn arrange(all: &[PathBuf], filter: RawFilter, sort: SortBy, search: &str) -
     }
     match sort {
         SortBy::Name => v.sort(),
+        SortBy::RatingDesc => {
+            let r = |p: &PathBuf| *ratings.get(p).unwrap_or(&0);
+            v.sort_by(|a, b| r(b).cmp(&r(a)).then(a.cmp(b)));
+        }
         SortBy::DateNewest | SortBy::DateOldest => {
             let mtime = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
             v.sort_by(|a, b| {

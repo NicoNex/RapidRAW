@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -177,6 +178,8 @@ enum AppMsg {
     PasteSettings,
     /// Toggle window fullscreen.
     ToggleFullscreen,
+    /// Set the active image's star rating (0..5).
+    RateActive(u8),
 }
 
 /// Copied edit settings (toolbar copy/paste between photos).
@@ -391,6 +394,8 @@ struct AppModel {
     lut_path: Option<PathBuf>,
     /// Copied edit settings (toolbar copy/paste).
     settings_clip: Option<SettingsClip>,
+    /// Star ratings per image (0..5), persisted to config.
+    ratings: HashMap<PathBuf, u8>,
 }
 
 impl AppModel {
@@ -452,14 +457,20 @@ impl AppModel {
 
     /// Re-filter/-sort `all_images` into `images` and rebuild the thumbnail grid.
     fn apply_library(&mut self, sender: &ComponentSender<AppModel>) {
-        self.images =
-            library::arrange(&self.all_images, self.raw_filter, self.sort_by, &self.search);
+        self.images = library::arrange(
+            &self.all_images,
+            self.raw_filter,
+            self.sort_by,
+            &self.search,
+            &self.ratings,
+        );
         *self.images_shared.borrow_mut() = self.images.clone();
 
         let mut guard = self.thumbs.guard();
         guard.clear();
         for p in &self.images {
-            guard.push_back(p.clone());
+            let r = self.ratings.get(p).copied().unwrap_or(0);
+            guard.push_back((p.clone(), r));
         }
         drop(guard);
 
@@ -816,6 +827,7 @@ impl Component for AppModel {
             crop_aspect: 0.0,
             lut_path: None,
             settings_clip: None,
+            ratings: load_ratings(),
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -852,13 +864,14 @@ impl Component for AppModel {
         }
         let sort_lbl = gtk::Label::new(Some("Sort"));
         sort_lbl.add_css_class("caption");
-        let sort_dd = gtk::DropDown::from_strings(&["Name", "Newest", "Oldest"]);
+        let sort_dd = gtk::DropDown::from_strings(&["Name", "Newest", "Oldest", "Rating"]);
         {
             let sender = sender.clone();
             sort_dd.connect_selected_notify(move |dd| {
                 let s = match dd.selected() {
                     1 => library::SortBy::DateNewest,
                     2 => library::SortBy::DateOldest,
+                    3 => library::SortBy::RatingDesc,
                     _ => library::SortBy::Name,
                 };
                 sender.input(AppMsg::SortChanged(s));
@@ -927,8 +940,19 @@ impl Component for AppModel {
         let key = gtk::EventControllerKey::new();
         {
             let sender = sender.clone();
+            let root_w = root.clone();
             key.connect_key_pressed(move |_, keyval, _, state| {
                 if !state.contains(gdk::ModifierType::CONTROL_MASK) {
+                    // 0..5 set the star rating — unless a text field has focus
+                    // (so typing a slider value isn't hijacked).
+                    let typing = gtk::prelude::GtkWindowExt::focus(&root_w)
+                        .map_or(false, |w| w.is::<gtk::Text>());
+                    if !typing {
+                        if let Some(d @ '0'..='5') = keyval.to_unicode() {
+                            sender.input(AppMsg::RateActive(d as u8 - b'0'));
+                            return glib::Propagation::Stop;
+                        }
+                    }
                     return glib::Propagation::Proceed;
                 }
                 let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
@@ -1163,6 +1187,25 @@ impl Component for AppModel {
                     root.unfullscreen();
                 } else {
                     root.fullscreen();
+                }
+            }
+            AppMsg::RateActive(r) => {
+                // Only rate while an image is open in the editor.
+                if widgets.stack.visible_child_name().as_deref() != Some("editor") {
+                    return;
+                }
+                let Some(path) = self.session.active_path.clone() else {
+                    return;
+                };
+                if r == 0 {
+                    self.ratings.remove(&path);
+                } else {
+                    self.ratings.insert(path.clone(), r);
+                }
+                save_ratings(&self.ratings);
+                // Reflect on the matching grid thumbnail.
+                if let Some(i) = self.images.iter().position(|p| *p == path) {
+                    self.thumbs.send(i, ThumbMsg::SetRating(r));
                 }
             }
             AppMsg::OpenInEditor(path) => {
@@ -1743,6 +1786,38 @@ fn load_last_folder() -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
+fn ratings_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rapidraw-relm4").join("ratings.json"))
+}
+
+fn load_ratings() -> HashMap<PathBuf, u8> {
+    let Some(f) = ratings_file() else {
+        return HashMap::new();
+    };
+    let Ok(bytes) = std::fs::read(f) else {
+        return HashMap::new();
+    };
+    let map: HashMap<String, u8> = serde_json::from_slice(&bytes).unwrap_or_default();
+    map.into_iter().map(|(k, v)| (PathBuf::from(k), v)).collect()
+}
+
+fn save_ratings(map: &HashMap<PathBuf, u8>) {
+    let Some(f) = ratings_file() else { return };
+    if let Some(dir) = f.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let strmap: HashMap<String, u8> = map
+        .iter()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), *v))
+        .collect();
+    if let Ok(json) = serde_json::to_vec(&strmap) {
+        let _ = std::fs::write(f, json);
+    }
+}
+
 /// The embedded splash image (welcome screen background), as a texture.
 fn splash_texture() -> Option<gdk::MemoryTexture> {
     let bytes = include_bytes!("../../public/splash-grey.jpg");
@@ -1764,7 +1839,6 @@ fn encode_image(
     path: &std::path::Path,
     opts: ExportOpts,
 ) -> Result<(), String> {
-    use image::GenericImageView;
     let img = match opts.resize {
         Some(r) => resize_for_export(img, r),
         None => img.clone(),
