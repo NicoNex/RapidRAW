@@ -16,7 +16,7 @@ the adjustments panel, always.
 | Panel | Status | Notes |
 |------|--------|-------|
 | Adjustments (sliders) | ✅ | `controls.rs` |
-| Crop | ❌ | aspect presets, rotation, flip, straighten — see Crop below |
+| Crop | ✅ | `crop.rs` + right-rail Edit/Crop switcher; ⚠️ no interactive crop rectangle yet (aspect = centred crop) |
 | Masks | ❌ | AI/radial/linear/brush masks; big |
 | AI (inpaint/generative) | ❌ | needs model backend; likely ➖ for now |
 | Presets | ❌ | save/apply adjustment presets |
@@ -78,16 +78,18 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 
 ---
 
-## Crop panel (`panel/right/CropPanel.tsx`) — ❌ all missing
-- Aspect presets: Free, Original, 1:1, 5:4, 4:3, 3:2, 16:9, 21:9, 65:24 (+ swap orientation)
-- Rotation (90° steps): RotateCw / RotateCcw
-- Flip Horizontal / Vertical
-- Straighten (angle slider, live rotation overlay)
-- Crop rectangle drag handles on canvas
-- Grid overlays (rule of thirds, etc.)
+## Crop panel (`panel/right/CropPanel.tsx`) — ⚠️ mostly done (`crop.rs`)
+- Aspect presets: Free, 1:1, 5:4, 4:3, 3:2, 16:9, 21:9, 65:24 — ✅ (centred crop). Original/swap-orientation ❌
+- Rotation (90° steps): RotateCw / RotateCcw — ✅
+- Flip Horizontal / Vertical — ✅
+- Straighten (angle slider) — ✅
+- Crop rectangle drag handles on canvas — ❌ (next crop iteration)
+- Grid overlays (rule of thirds, etc.) — ❌
 
-Engine: `rapidraw-core` adjustments already carry `aspectRatio, rotation,
-flipHorizontal, flipVertical, orientationSteps` — wire UI to them.
+Geometry applied to the base image (CPU) in the render worker before GPU render
+(`apply_geometry` in `main.rs`), via core `apply_coarse_rotation` /
+`apply_rotation` / `fliph` / `flipv` + centred aspect crop. ⚠️ geometry isn't in
+the undo history yet.
 
 ---
 
@@ -146,4 +148,4 @@ flipHorizontal, flipVertical, orientationSteps` — wire UI to them.
 15. ✅ Copy/paste curves.
 16. ✅ Library: splash welcome, continue session, raw filter, sort.
 17. ✅ Slider look tuned to Adwaita accent.
-18. ❌ Crop panel + right-rail switcher — **next**.
+18. ✅ Crop panel + right-rail Edit/Crop switcher (rotate/flip/straighten/aspect). ⚠️ interactive crop rectangle still to do.

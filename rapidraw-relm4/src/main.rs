@@ -13,6 +13,7 @@ use relm4::prelude::*;
 
 mod colorwheel;
 mod controls;
+mod crop;
 mod curves;
 mod editor;
 mod library;
@@ -127,6 +128,95 @@ enum AppMsg {
     FilterChanged(library::RawFilter),
     /// Library sort order changed.
     SortChanged(library::SortBy),
+    /// Crop / geometry controls.
+    CropAspect(f32),
+    RotateCw,
+    RotateCcw,
+    FlipH(bool),
+    FlipV(bool),
+    Straighten(f32),
+    CropReset,
+    /// Right-rail switcher: show the adjustments panel / the crop panel.
+    ShowAdjustPanel,
+    ShowCropPanel,
+}
+
+/// Crop / geometry transforms applied to the base image (CPU) before GPU render.
+#[derive(Clone, Copy)]
+struct Geometry {
+    /// 90° rotation steps (0..3).
+    orientation_steps: u8,
+    flip_h: bool,
+    flip_v: bool,
+    /// Free straighten angle, degrees.
+    straighten: f32,
+    /// Centred crop aspect ratio (w/h); 0 = none.
+    aspect: f32,
+}
+
+impl Default for Geometry {
+    fn default() -> Self {
+        Self {
+            orientation_steps: 0,
+            flip_h: false,
+            flip_v: false,
+            straighten: 0.0,
+            aspect: 0.0,
+        }
+    }
+}
+
+impl Geometry {
+    /// True if no transform is active (so the worker can skip all of it).
+    fn is_identity(&self) -> bool {
+        self.orientation_steps == 0
+            && !self.flip_h
+            && !self.flip_v
+            && self.straighten == 0.0
+            && self.aspect <= 0.0
+    }
+}
+
+/// Apply geometry to `base`. Cheap for rotate/flip/crop; only free straighten
+/// (arbitrary-angle resample) is costly, and only when set.
+fn apply_geometry(base: &DynamicImage, g: Geometry) -> DynamicImage {
+    use rapidraw_core::image_processing::{apply_coarse_rotation, apply_rotation};
+    if g.is_identity() {
+        return base.clone();
+    }
+    let mut img = apply_coarse_rotation(base, g.orientation_steps).into_owned();
+    if g.flip_h {
+        img = img.fliph();
+    }
+    if g.flip_v {
+        img = img.flipv();
+    }
+    if g.straighten != 0.0 {
+        img = apply_rotation(&img, g.straighten).into_owned();
+    }
+    if g.aspect > 0.0 {
+        img = center_crop_aspect(img, g.aspect);
+    }
+    img
+}
+
+/// Crop `img` to the largest centred rectangle of aspect `target` (w/h).
+fn center_crop_aspect(img: DynamicImage, target: f32) -> DynamicImage {
+    use image::GenericImageView;
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return img;
+    }
+    let cur = w as f32 / h as f32;
+    let (nw, nh) = if target > cur {
+        (w, (w as f32 / target).round() as u32)
+    } else {
+        ((h as f32 * target).round() as u32, h)
+    };
+    let (nw, nh) = (nw.max(1).min(w), nh.max(1).min(h));
+    let x = (w - nw) / 2;
+    let y = (h - nh) / 2;
+    img.crop_imm(x, y, nw, nh)
 }
 
 /// One undo/redo step: the full engine state plus the slider UI values needed to
@@ -147,6 +237,7 @@ enum RenderJob {
         adj: Box<rapidraw_core::image_processing::AllAdjustments>,
         lut: Option<Arc<Lut>>,
         dim: u32,
+        geom: Geometry,
     },
     Export {
         base: Arc<DynamicImage>,
@@ -154,6 +245,7 @@ enum RenderJob {
         lut: Option<Arc<Lut>>,
         path: PathBuf,
         opts: ExportOpts,
+        geom: Geometry,
     },
     /// Bake the current look into a .cube LUT file.
     ExportLut {
@@ -246,6 +338,12 @@ struct AppModel {
     sort_by: library::SortBy,
     /// Last folder from a previous session (for "Continue session").
     last_folder: Option<PathBuf>,
+    /// Crop/geometry transforms applied before the GPU render.
+    geom: Geometry,
+    /// Crop panel (right-rail "Crop" section).
+    crop: crop::CropPanel,
+    /// Switches the right column between the adjustments panel and crop panel.
+    content_stack: gtk::Stack,
 }
 
 impl AppModel {
@@ -365,7 +463,9 @@ fn spawn_render_worker(
                         lut,
                         path,
                         opts,
+                        geom,
                     } => {
+                        let base = apply_geometry(&base, geom);
                         let res = rapidraw_core::render(&ctx, &base, &adj, lut, None)
                             .and_then(|out| encode_image(&out, &path, opts))
                             .map(|()| path);
@@ -382,8 +482,10 @@ fn spawn_render_worker(
                 adj,
                 lut,
                 dim,
+                geom,
             }) = latest_preview
             {
+                let base = apply_geometry(&base, geom);
                 match rapidraw_core::render(&ctx, &base, &adj, lut, Some(dim)) {
                     Ok(out) => {
                         let _ = cmd.send(CmdMsg::RenderReady(out.to_rgba8()));
@@ -571,6 +673,9 @@ impl Component for AppModel {
             raw_filter: library::RawFilter::All,
             sort_by: library::SortBy::Name,
             last_folder: load_last_folder(),
+            geom: Geometry::default(),
+            crop: crop::CropPanel::new(&sender),
+            content_stack: gtk::Stack::new(),
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -686,11 +791,52 @@ impl Component for AppModel {
         // Editor page: canvas on the left; right column = scopes on top of the
         // adjustment panel. A Paned divider keeps the panel at a fixed,
         // mouse-resizable width that the photo zoom never disturbs.
+        // Right column = scopes on top of a Stack switching adjustments <-> crop.
+        model.content_stack.set_vexpand(true);
+        model.content_stack.add_named(model.panel.root(), Some("adjust"));
+        model.content_stack.add_named(model.crop.root(), Some("crop"));
+        model.content_stack.set_visible_child_name("adjust");
+        model.right_col.set_hexpand(true);
         model.right_col.append(model.scopes.root());
-        model.right_col.append(model.panel.root());
+        model.right_col.append(&model.content_stack);
+
+        // Far-right switcher rail (Edit / Crop), like the original right rail.
+        let rail = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        rail.add_css_class("linked");
+        rail.set_valign(gtk::Align::Start);
+        rail.set_margin_all(4);
+        let adj_btn = gtk::ToggleButton::with_label("Edit");
+        adj_btn.set_active(true);
+        adj_btn.set_tooltip_text(Some("Adjustments"));
+        let crop_btn = gtk::ToggleButton::with_label("Crop");
+        crop_btn.set_group(Some(&adj_btn));
+        crop_btn.set_tooltip_text(Some("Crop & geometry"));
+        {
+            let sender = sender.clone();
+            adj_btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::ShowAdjustPanel);
+                }
+            });
+        }
+        {
+            let sender = sender.clone();
+            crop_btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::ShowCropPanel);
+                }
+            });
+        }
+        rail.append(&adj_btn);
+        rail.append(&crop_btn);
+
+        let end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        end.append(&model.right_col);
+        end.append(&rail);
+
         let paned = &widgets.editor_page;
         paned.set_start_child(Some(model.canvas.root()));
-        paned.set_end_child(Some(&model.right_col));
+        paned.set_end_child(Some(&end));
         // Start (canvas) absorbs window resizes and may shrink below its child's
         // size (clipped); the panel keeps its width unless the user drags.
         paned.set_resize_start_child(true);
@@ -745,6 +891,40 @@ impl Component for AppModel {
                 self.sort_by = s;
                 self.apply_library(&sender);
             }
+            AppMsg::CropAspect(a) => {
+                self.geom.aspect = a;
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::RotateCw => {
+                self.geom.orientation_steps = (self.geom.orientation_steps + 1) % 4;
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::RotateCcw => {
+                self.geom.orientation_steps = (self.geom.orientation_steps + 3) % 4;
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::FlipH(b) => {
+                self.geom.flip_h = b;
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::FlipV(b) => {
+                self.geom.flip_v = b;
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::Straighten(v) => {
+                self.geom.straighten = v;
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::CropReset => {
+                self.geom = Geometry::default();
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::ShowAdjustPanel => {
+                self.content_stack.set_visible_child_name("adjust");
+            }
+            AppMsg::ShowCropPanel => {
+                self.content_stack.set_visible_child_name("crop");
+            }
             AppMsg::OpenInEditor(path) => {
                 log::info!("Open in editor: {}", path.display());
                 // Pause thumbnail decoding while editing (frees the CPU).
@@ -790,6 +970,7 @@ impl Component for AppModel {
                     adj: Box::new(self.session.adjustments),
                     lut: self.session.lut.clone(),
                     dim: self.settings.preview_dim,
+                    geom: self.geom,
                 });
             }
             AppMsg::ExportDialog => {
@@ -886,6 +1067,7 @@ impl Component for AppModel {
                     lut: self.session.lut.clone(),
                     path,
                     opts,
+                    geom: self.geom,
                 });
             }
             AppMsg::LoadLut => {
@@ -1085,13 +1267,15 @@ impl Component for AppModel {
                     .set_text(&meta::read_summary(&path).unwrap_or_default());
                 // Start each image from defaults (unless disabled in settings),
                 // rebuilding the panel so the controls reflect the reset.
+                self.geom = Geometry::default();
                 if self.settings.reset_on_open {
                     self.session.adjustments = Default::default();
                     controls::init_defaults(&mut self.session.adjustments.global);
                     self.session.lut = None;
                     let fresh = AdjustPanel::new(&sender);
-                    self.right_col.remove(self.panel.root());
-                    self.right_col.append(fresh.root());
+                    self.content_stack.remove(self.panel.root());
+                    self.content_stack.add_named(fresh.root(), Some("adjust"));
+                    self.content_stack.set_visible_child_name("adjust");
                     self.panel = fresh;
                 }
                 // Show the un-adjusted base immediately. We're on the GTK main
