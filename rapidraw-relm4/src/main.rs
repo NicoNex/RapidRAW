@@ -370,8 +370,8 @@ struct AppModel {
     original_tex: Option<gdk::MemoryTexture>,
     /// Whether the before/after view is currently showing the original.
     showing_original: bool,
-    /// EXIF readout shown in the editor toolbar.
-    exif_label: gtk::Label,
+    /// Header bar title widget (filename as title, EXIF as subtitle).
+    win_title: adw::WindowTitle,
     /// All images scanned from the current folder (before filter/sort).
     all_images: Vec<PathBuf>,
     raw_filter: library::RawFilter,
@@ -639,18 +639,80 @@ impl Component for AppModel {
 
             adw::ToolbarView {
                 add_top_bar = &adw::HeaderBar {
+                    #[wrap(Some)]
+                    #[name = "win_title"]
+                    set_title_widget = &adw::WindowTitle {
+                        set_title: "RapidRAW",
+                    },
+
+                    // Library: open a folder.
+                    #[name = "open_btn"]
                     pack_start = &gtk::Button {
                         set_label: "Open Folder",
                         connect_clicked => AppMsg::OpenFolderDialog,
                     },
+                    // Editor: back + undo/redo.
+                    #[name = "editor_left"]
+                    pack_start = &gtk::Box {
+                        set_spacing: 6,
+                        gtk::Button {
+                            set_icon_name: "go-previous-symbolic",
+                            set_tooltip_text: Some("Back to library"),
+                            connect_clicked => AppMsg::ShowLibrary,
+                        },
+                        gtk::Box {
+                            add_css_class: "linked",
+                            gtk::Button {
+                                set_icon_name: "edit-undo-symbolic",
+                                set_tooltip_text: Some("Undo (Ctrl+Z)"),
+                                connect_clicked => AppMsg::Undo,
+                            },
+                            gtk::Button {
+                                set_icon_name: "edit-redo-symbolic",
+                                set_tooltip_text: Some("Redo (Ctrl+Shift+Z)"),
+                                connect_clicked => AppMsg::Redo,
+                            },
+                        },
+                    },
+
                     pack_end = &gtk::Button {
                         set_icon_name: "emblem-system-symbolic",
                         set_tooltip_text: Some("Settings"),
                         connect_clicked => AppMsg::OpenSettings,
                     },
-                    pack_end = &gtk::Button {
-                        set_label: "Export",
-                        connect_clicked => AppMsg::ExportDialog,
+                    // Editor: export + view actions.
+                    #[name = "editor_right"]
+                    pack_end = &gtk::Box {
+                        set_spacing: 6,
+                        gtk::Box {
+                            add_css_class: "linked",
+                            #[name = "orig_btn"]
+                            gtk::ToggleButton {
+                                set_icon_name: "view-reveal-symbolic",
+                                set_tooltip_text: Some("Show original"),
+                                connect_toggled => AppMsg::ToggleOriginal,
+                            },
+                            gtk::Button {
+                                set_icon_name: "edit-copy-symbolic",
+                                set_tooltip_text: Some("Copy settings"),
+                                connect_clicked => AppMsg::CopySettings,
+                            },
+                            gtk::Button {
+                                set_icon_name: "edit-paste-symbolic",
+                                set_tooltip_text: Some("Paste settings"),
+                                connect_clicked => AppMsg::PasteSettings,
+                            },
+                            gtk::Button {
+                                set_icon_name: "view-fullscreen-symbolic",
+                                set_tooltip_text: Some("Fullscreen"),
+                                connect_clicked => AppMsg::ToggleFullscreen,
+                            },
+                        },
+                        gtk::Button {
+                            set_label: "Export",
+                            add_css_class: "suggested-action",
+                            connect_clicked => AppMsg::ExportDialog,
+                        },
                     },
                 },
 
@@ -712,68 +774,13 @@ impl Component for AppModel {
                         },
                     },
 
-                    add_named[Some("editor")] = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-
-                        #[name = "editor_toolbar"]
-                        gtk::Box {
-                            set_orientation: gtk::Orientation::Horizontal,
-                            set_spacing: 4,
-                            set_margin_all: 4,
-                            gtk::Button {
-                                set_icon_name: "go-previous-symbolic",
-                                set_label: "Library",
-                                connect_clicked => AppMsg::ShowLibrary,
-                            },
-                            gtk::Separator { set_orientation: gtk::Orientation::Vertical },
-                            gtk::Button {
-                                set_icon_name: "edit-undo-symbolic",
-                                set_tooltip_text: Some("Undo (Ctrl+Z)"),
-                                add_css_class: "flat",
-                                connect_clicked => AppMsg::Undo,
-                            },
-                            gtk::Button {
-                                set_icon_name: "edit-redo-symbolic",
-                                set_tooltip_text: Some("Redo (Ctrl+Shift+Z)"),
-                                add_css_class: "flat",
-                                connect_clicked => AppMsg::Redo,
-                            },
-                            #[name = "orig_btn"]
-                            gtk::ToggleButton {
-                                set_icon_name: "view-reveal-symbolic",
-                                set_tooltip_text: Some("Show original (before/after)"),
-                                add_css_class: "flat",
-                                connect_toggled => AppMsg::ToggleOriginal,
-                            },
-                            gtk::Separator { set_orientation: gtk::Orientation::Vertical },
-                            gtk::Button {
-                                set_icon_name: "edit-copy-symbolic",
-                                set_tooltip_text: Some("Copy settings"),
-                                add_css_class: "flat",
-                                connect_clicked => AppMsg::CopySettings,
-                            },
-                            gtk::Button {
-                                set_icon_name: "edit-paste-symbolic",
-                                set_tooltip_text: Some("Paste settings"),
-                                add_css_class: "flat",
-                                connect_clicked => AppMsg::PasteSettings,
-                            },
-                            gtk::Button {
-                                set_icon_name: "view-fullscreen-symbolic",
-                                set_tooltip_text: Some("Fullscreen"),
-                                add_css_class: "flat",
-                                connect_clicked => AppMsg::ToggleFullscreen,
-                            },
-                        },
-
-                        #[name = "editor_page"]
-                        gtk::Paned {
-                            set_vexpand: true,
-                            // Canvas on the left, adjustment panel on the right,
-                            // with a draggable, mouse-resizable divider.
-                            set_orientation: gtk::Orientation::Horizontal,
-                            set_wide_handle: true,
-                        },
+                    #[name = "editor_page"]
+                    add_named[Some("editor")] = &gtk::Paned {
+                        set_vexpand: true,
+                        // Canvas on the left, adjustment panel on the right,
+                        // with a draggable, mouse-resizable divider.
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_wide_handle: true,
                     },
                     },
                 },
@@ -814,7 +821,7 @@ impl Component for AppModel {
             last_tex: None,
             original_tex: None,
             showing_original: false,
-            exif_label: gtk::Label::new(None),
+            win_title: adw::WindowTitle::new("RapidRAW", ""),
             all_images: Vec::new(),
             raw_filter: library::RawFilter::All,
             sort_by: library::SortBy::Name,
@@ -839,13 +846,10 @@ impl Component for AppModel {
         let widgets = view_output!();
         install_app_css();
         model.toasts = widgets.toast_overlay.clone();
-        // EXIF readout, right-aligned in the editor toolbar.
-        model.exif_label.add_css_class("caption");
-        model.exif_label.add_css_class("dim-label");
-        model.exif_label.set_halign(gtk::Align::End);
-        model.exif_label.set_hexpand(true);
-        model.exif_label.set_margin_end(8);
-        widgets.editor_toolbar.append(&model.exif_label);
+        model.win_title = widgets.win_title.clone();
+        // Header bar starts in library context (editor actions hidden).
+        widgets.editor_left.set_visible(false);
+        widgets.editor_right.set_visible(false);
 
         // Library toolbar: raw filter + sort DropDowns.
         let filter_dd =
@@ -1216,6 +1220,10 @@ impl Component for AppModel {
                 self.thumb_gen.fetch_add(1, Ordering::Relaxed);
                 self.session.active_path = Some(path.clone());
                 widgets.stack.set_visible_child_name("editor");
+                // Header bar -> editor context.
+                widgets.open_btn.set_visible(false);
+                widgets.editor_left.set_visible(true);
+                widgets.editor_right.set_visible(true);
                 let p = path.clone();
                 spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {
                     Ok(img) => CmdMsg::BaseReady(p, img),
@@ -1490,6 +1498,12 @@ impl Component for AppModel {
             AppMsg::ShowLibrary => {
                 self.save_edits();
                 widgets.stack.set_visible_child_name("library");
+                // Header bar -> library context.
+                widgets.open_btn.set_visible(true);
+                widgets.editor_left.set_visible(false);
+                widgets.editor_right.set_visible(false);
+                self.win_title.set_title("RapidRAW");
+                self.win_title.set_subtitle("");
                 // Resume decoding any thumbnails that never finished.
                 let missing: Vec<usize> = self
                     .thumb_loaded
@@ -1619,8 +1633,13 @@ impl Component for AppModel {
             CmdMsg::BaseReady(path, img) => {
                 let (w, h) = img.dimensions();
                 log::info!("base image ready: {} ({w}x{h})", path.display());
-                self.exif_label
-                    .set_text(&meta::read_summary(&path).unwrap_or_default());
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("RapidRAW");
+                self.win_title.set_title(name);
+                self.win_title
+                    .set_subtitle(&meta::read_summary(&path).unwrap_or_default());
                 // Start from defaults with a fresh panel, then restore this
                 // image's saved edits (unless the user forced reset-on-open).
                 self.geom = Geometry::default();
