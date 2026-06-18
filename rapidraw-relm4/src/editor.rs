@@ -241,6 +241,21 @@ impl EditorCanvas {
         }
         overlay.add_controller(crop_drag);
 
+        // In crop mode the overlay is mapped and resizes with the window; re-fit
+        // the image so it stays centred in its area (only fires while visible).
+        {
+            let picture = picture.clone();
+            let fixed = fixed.clone();
+            let view = view.clone();
+            let overlay_w = overlay.clone();
+            overlay.connect_resize(move |_, _, _| {
+                if overlay_w.is_visible() {
+                    view.fit.set(true);
+                    fit_now(&picture, &fixed, &overlay_w, &view);
+                }
+            });
+        }
+
         // Outer overlay: scrolled image + crop layer (the layer fills the canvas).
         let root = gtk::Overlay::new();
         root.set_hexpand(true);
