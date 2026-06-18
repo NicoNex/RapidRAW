@@ -44,6 +44,11 @@ pub enum ExportFormat {
     Jpeg,
     Png,
     Tiff,
+    Webp,
+    Jxl,
+    Avif,
+    /// Bake the current look into a .cube LUT (routed to the LUT export path).
+    CubeLut,
 }
 
 impl ExportFormat {
@@ -52,7 +57,16 @@ impl ExportFormat {
             ExportFormat::Jpeg => "jpg",
             ExportFormat::Png => "png",
             ExportFormat::Tiff => "tiff",
+            ExportFormat::Webp => "webp",
+            ExportFormat::Jxl => "jxl",
+            ExportFormat::Avif => "avif",
+            ExportFormat::CubeLut => "cube",
         }
+    }
+
+    /// Formats with a meaningful quality slider.
+    fn has_quality(self) -> bool {
+        matches!(self, ExportFormat::Jpeg | ExportFormat::Webp | ExportFormat::Jxl)
     }
 }
 
@@ -837,11 +851,11 @@ impl Component for AppModel {
         tabs.set_margin_top(6);
         tabs.set_margin_bottom(2);
         let adj_btn = gtk::ToggleButton::new();
-        adj_btn.set_icon_name("document-edit-symbolic");
+        adj_btn.set_icon_name("adjustlevels-symbolic");
         adj_btn.set_tooltip_text(Some("Edit"));
         adj_btn.set_active(true);
         let crop_btn = gtk::ToggleButton::new();
-        crop_btn.set_icon_name("object-select-symbolic");
+        crop_btn.set_icon_name("image-crop-symbolic");
         crop_btn.set_tooltip_text(Some("Crop & geometry"));
         crop_btn.set_group(Some(&adj_btn));
         {
@@ -1056,16 +1070,25 @@ impl Component for AppModel {
                 let vb = gtk::Box::new(gtk::Orientation::Vertical, 8);
                 vb.set_margin_all(12);
 
-                let fmt = gtk::DropDown::from_strings(&["JPEG", "PNG", "TIFF"]);
+                let fmt = gtk::DropDown::from_strings(&[
+                    "JPEG", "PNG", "TIFF", "WebP", "JPEG XL", "AVIF", "CUBE LUT",
+                ]);
+                let idx_to_format = |i: u32| match i {
+                    1 => ExportFormat::Png,
+                    2 => ExportFormat::Tiff,
+                    3 => ExportFormat::Webp,
+                    4 => ExportFormat::Jxl,
+                    5 => ExportFormat::Avif,
+                    6 => ExportFormat::CubeLut,
+                    _ => ExportFormat::Jpeg,
+                };
+
                 let q = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
                 q.set_value(90.0);
                 let qrow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                qrow.append(&gtk::Label::new(Some("JPEG quality")));
+                let qlabel = gtk::Label::new(Some("Quality"));
+                qrow.append(&qlabel);
                 qrow.append(&q);
-                {
-                    let q = q.clone();
-                    fmt.connect_selected_notify(move |d| q.set_sensitive(d.selected() == 0));
-                }
 
                 // Resize: 0 = full resolution.
                 let resize = gtk::SpinButton::with_range(0.0, 20000.0, 100.0);
@@ -1073,6 +1096,27 @@ impl Component for AppModel {
                 let rrow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 rrow.append(&gtk::Label::new(Some("Resize long edge (0=full)")));
                 rrow.append(&resize);
+
+                // Reactively show settings relevant to the selected format.
+                {
+                    let qrow = qrow.clone();
+                    let rrow = rrow.clone();
+                    let qlabel = qlabel.clone();
+                    let q = q.clone();
+                    let update = move |d: &gtk::DropDown| {
+                        let f = idx_to_format(d.selected());
+                        qrow.set_visible(f.has_quality());
+                        rrow.set_visible(!matches!(f, ExportFormat::CubeLut));
+                        // JXL at 100 = lossless.
+                        qlabel.set_text(if matches!(f, ExportFormat::Jxl) && q.value() >= 100.0 {
+                            "Quality (lossless)"
+                        } else {
+                            "Quality"
+                        });
+                    };
+                    update(&fmt);
+                    fmt.connect_selected_notify(update);
+                }
 
                 let go = gtk::Button::with_label("Export…");
                 go.add_css_class("suggested-action");
@@ -1085,19 +1129,18 @@ impl Component for AppModel {
                 let sender = sender.clone();
                 let win_c = win.clone();
                 go.connect_clicked(move |_| {
-                    let format = match fmt.selected() {
-                        1 => ExportFormat::Png,
-                        2 => ExportFormat::Tiff,
-                        _ => ExportFormat::Jpeg,
-                    };
+                    let format = idx_to_format(fmt.selected());
+                    win_c.close();
+                    if matches!(format, ExportFormat::CubeLut) {
+                        sender.input(AppMsg::ExportLutDialog);
+                        return;
+                    }
                     let r = resize.value() as u32;
-                    let opts = ExportOpts {
+                    sender.input(AppMsg::ExportConfigured(ExportOpts {
                         format,
                         quality: q.value() as u8,
                         resize: (r > 0).then_some(r),
-                    };
-                    win_c.close();
-                    sender.input(AppMsg::ExportConfigured(opts));
+                    }));
                 });
                 win.present();
             }
@@ -1523,38 +1566,69 @@ fn encode_image(
     path: &std::path::Path,
     opts: ExportOpts,
 ) -> Result<(), String> {
-    use image::{GenericImageView, ImageEncoder};
+    use image::GenericImageView;
     let img = match opts.resize {
         Some(m) if img.dimensions().0.max(img.dimensions().1) > m => {
             img.resize(m, m, image::imageops::FilterType::Lanczos3)
         }
         _ => img.clone(),
     };
-    match opts.format {
-        ExportFormat::Png => img
-            .to_rgb8()
-            .save_with_format(path, image::ImageFormat::Png)
-            .map_err(|e| e.to_string()),
-        ExportFormat::Tiff => img
-            .to_rgb8()
-            .save_with_format(path, image::ImageFormat::Tiff)
-            .map_err(|e| e.to_string()),
+    let bytes = encode_image_to_bytes(&img, opts.format, opts.quality)?;
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+/// Encode `img` to bytes for `format` (mirrors the original `export_processing`).
+fn encode_image_to_bytes(
+    img: &DynamicImage,
+    format: ExportFormat,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    use image::GenericImageView;
+    let mut buf = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut buf);
+    match format {
         ExportFormat::Jpeg => {
             let rgb = img.to_rgb8();
-            let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                std::io::BufWriter::new(file),
-                opts.quality,
-            );
-            enc.write_image(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                image::ExtendedColorType::Rgb8,
-            )
-            .map_err(|e| e.to_string())
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+            rgb.write_with_encoder(enc).map_err(|e| e.to_string())?;
         }
+        // 16-bit PNG/TIFF, like the original.
+        ExportFormat::Png => DynamicImage::ImageRgb16(img.to_rgb16())
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?,
+        ExportFormat::Tiff => DynamicImage::ImageRgb16(img.to_rgb16())
+            .write_to(&mut cursor, image::ImageFormat::Tiff)
+            .map_err(|e| e.to_string())?,
+        ExportFormat::Avif => img
+            .write_to(&mut cursor, image::ImageFormat::Avif)
+            .map_err(|e| e.to_string())?,
+        ExportFormat::Webp => {
+            let enc = webp::Encoder::from_image(img).map_err(|e| e.to_string())?;
+            return Ok(enc.encode(quality as f32).to_vec());
+        }
+        ExportFormat::Jxl => {
+            use jxl_encoder::{LosslessConfig, LossyConfig, PixelLayout};
+            let (w, h) = img.dimensions();
+            let alpha = img.color().has_alpha();
+            let data = if quality >= 100 {
+                if alpha {
+                    LosslessConfig::new().encode(img.to_rgba8().as_raw(), w, h, PixelLayout::Rgba8)
+                } else {
+                    LosslessConfig::new().encode(img.to_rgb8().as_raw(), w, h, PixelLayout::Rgb8)
+                }
+            } else {
+                let distance = ((100.0 - quality as f32) / 10.0).max(0.01);
+                if alpha {
+                    LossyConfig::new(distance).encode(img.to_rgba8().as_raw(), w, h, PixelLayout::Rgba8)
+                } else {
+                    LossyConfig::new(distance).encode(img.to_rgb8().as_raw(), w, h, PixelLayout::Rgb8)
+                }
+            };
+            return data.map_err(|e| e.to_string());
+        }
+        ExportFormat::CubeLut => return Err("CUBE LUT uses the LUT export path".into()),
     }
+    Ok(buf)
 }
 
 /// Bake the current look into a 33-point .cube LUT: process the identity HALD

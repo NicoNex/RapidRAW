@@ -9,7 +9,9 @@ relm4 = { version = "0.9", features = ["libadwaita"] }
 adw = { version = "0.7", package = "libadwaita", features = ["v1_4"] }
 gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 gdk = { version = "0.9", package = "gdk4" }
-image = "0.25.10"
+image = { version = "0.25.10", features = ["avif-native"] }
+webp = "0.3"
+jxl-encoder = "0.3.1"
 bytemuck = "1"
 kamadak-exif = "0.6"
 serde = { version = "1", features = ["derive"] }

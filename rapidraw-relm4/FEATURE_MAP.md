@@ -20,7 +20,7 @@ the adjustments panel, always.
 | Masks | ❌ | AI/radial/linear/brush masks; big |
 | AI (inpaint/generative) | ❌ | needs model backend; likely ➖ for now |
 | Presets | ❌ | save/apply adjustment presets |
-| Export | ⚠️ | export works (dialog); not a panel, no preset list |
+| Export | ✅ | dialog with all formats (JPEG/PNG/TIFF/WebP/JPEG XL/AVIF/CUBE LUT) + per-format settings; ⚠️ no watermark/filename-template/keep-metadata/preset list |
 | Metadata (EXIF) | ❌ | read + show EXIF |
 
 **TODO:** add a panel switcher (right-aligned icon rail like the original) so
