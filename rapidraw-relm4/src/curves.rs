@@ -128,6 +128,12 @@ fn active_curve(s: &State, ch: Channel, parametric: bool) -> Vec<(f64, f64)> {
     }
 }
 
+thread_local! {
+    /// Clipboard for copy/paste of a channel's curve (manual points + parametric
+    /// settings), shared across channels and images.
+    static CLIP: RefCell<Option<(Vec<(f64, f64)>, ParamSettings)>> = const { RefCell::new(None) };
+}
+
 pub struct CurveEditor {
     root: gtk::Box,
 }
@@ -289,6 +295,54 @@ impl CurveEditor {
             });
         }
         param_box.set_visible(false);
+
+        // Copy/paste the active channel's curve (points + parametric settings).
+        let tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        tools.set_halign(gtk::Align::Center);
+        let copy_btn = gtk::Button::from_icon_name("edit-copy-symbolic");
+        copy_btn.add_css_class("flat");
+        copy_btn.set_tooltip_text(Some("Copy curve"));
+        let paste_btn = gtk::Button::from_icon_name("edit-paste-symbolic");
+        paste_btn.add_css_class("flat");
+        paste_btn.set_tooltip_text(Some("Paste curve"));
+        tools.append(&copy_btn);
+        tools.append(&paste_btn);
+        root.append(&tools);
+        {
+            let state = state.clone();
+            let active = active.clone();
+            copy_btn.connect_clicked(move |_| {
+                let s = state.borrow();
+                let ch = active.get();
+                CLIP.with(|c| {
+                    *c.borrow_mut() = Some((s.points(ch).clone(), s.param[ch_idx(ch)]));
+                });
+            });
+        }
+        {
+            let state = state.clone();
+            let active = active.clone();
+            let parametric = parametric.clone();
+            let area = area.clone();
+            let reload = reload.clone();
+            let sender = sender.clone();
+            paste_btn.connect_clicked(move |_| {
+                let ch = active.get();
+                let pasted = CLIP.with(|c| c.borrow().clone());
+                if let Some((pts, param)) = pasted {
+                    {
+                        let mut s = state.borrow_mut();
+                        *s.points_mut(ch) = pts;
+                        s.param[ch_idx(ch)] = param;
+                    }
+                    if parametric.get() {
+                        reload();
+                    }
+                    emit_active(&sender, &state, ch, parametric.get());
+                    area.queue_draw();
+                }
+            });
+        }
 
         // Drag: grab the nearest dot on begin, move it on update.
         let drag = gtk::GestureDrag::new();

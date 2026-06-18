@@ -446,6 +446,7 @@ impl Component for AppModel {
                                 add_css_class: "flat",
                                 connect_clicked => AppMsg::Redo,
                             },
+                            #[name = "orig_btn"]
                             gtk::ToggleButton {
                                 set_icon_name: "view-reveal-symbolic",
                                 set_tooltip_text: Some("Show original (before/after)"),
@@ -512,6 +513,7 @@ impl Component for AppModel {
         let flow_box = model.thumbs.widget();
         let images = model.images_shared.clone();
         let widgets = view_output!();
+        install_app_css();
         model.toasts = widgets.toast_overlay.clone();
         // EXIF readout, right-aligned in the editor toolbar.
         model.exif_label.add_css_class("caption");
@@ -902,6 +904,13 @@ impl Component for AppModel {
             }
             AppMsg::ToggleOriginal => {
                 self.showing_original = !self.showing_original;
+                // Swap to the "concealed" eye icon while showing the original so
+                // the active state reads clearly (the toggle highlight aside).
+                widgets.orig_btn.set_icon_name(if self.showing_original {
+                    "view-conceal-symbolic"
+                } else {
+                    "view-reveal-symbolic"
+                });
                 let tex = if self.showing_original {
                     self.original_tex.as_ref()
                 } else {
@@ -1011,6 +1020,36 @@ impl Component for AppModel {
 }
 
 /// Encode a rendered image to `path` per `opts` (format, JPEG quality, resize).
+/// Install app-wide CSS once: a nicer Paned resize handle (a thin, rounded,
+/// vertically-inset grip that highlights on hover instead of a hard full-height
+/// line).
+fn install_app_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(
+            "paned > separator {
+                 min-width: 5px;
+                 margin: 12px 6px;
+                 border-radius: 4px;
+                 background-color: alpha(@borders, 0.7);
+                 transition: background-color 150ms ease;
+             }
+             paned > separator:hover {
+                 background-color: @accent_bg_color;
+             }",
+        );
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
+}
+
 /// Identity comparison for the active LUT (shared `Arc`, or both absent).
 fn lut_eq(a: &Option<Arc<Lut>>, b: &Option<Arc<Lut>>) -> bool {
     match (a, b) {
