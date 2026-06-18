@@ -180,6 +180,8 @@ enum AppMsg {
     ToggleFullscreen,
     /// Set the active image's star rating (0..5).
     RateActive(u8),
+    /// Open the About window.
+    ShowAbout,
 }
 
 /// Copied edit settings (toolbar copy/paste between photos).
@@ -637,143 +639,75 @@ impl Component for AppModel {
             set_title: Some("RapidRAW"),
             set_default_size: (1440, 900),
 
-            adw::ToolbarView {
-                add_top_bar = &adw::HeaderBar {
-                    #[wrap(Some)]
-                    #[name = "win_title"]
-                    set_title_widget = &adw::WindowTitle {
-                        set_title: "RapidRAW",
-                    },
-
-                    // Library: open a folder.
-                    #[name = "open_btn"]
-                    pack_start = &gtk::Button {
-                        set_label: "Open Folder",
-                        connect_clicked => AppMsg::OpenFolderDialog,
-                    },
-                    // Editor: back + undo/redo.
-                    #[name = "editor_left"]
-                    pack_start = &gtk::Box {
-                        set_spacing: 6,
-                        gtk::Button {
-                            set_icon_name: "go-previous-symbolic",
-                            set_tooltip_text: Some("Back to library"),
-                            connect_clicked => AppMsg::ShowLibrary,
-                        },
-                        gtk::Box {
-                            add_css_class: "linked",
-                            gtk::Button {
-                                set_icon_name: "edit-undo-symbolic",
-                                set_tooltip_text: Some("Undo (Ctrl+Z)"),
-                                connect_clicked => AppMsg::Undo,
-                            },
-                            gtk::Button {
-                                set_icon_name: "edit-redo-symbolic",
-                                set_tooltip_text: Some("Redo (Ctrl+Shift+Z)"),
-                                connect_clicked => AppMsg::Redo,
-                            },
-                        },
-                    },
-
-                    pack_end = &gtk::Button {
-                        set_icon_name: "emblem-system-symbolic",
-                        set_tooltip_text: Some("Settings"),
-                        connect_clicked => AppMsg::OpenSettings,
-                    },
-                    // Library: search toggle + filter/sort menu (Nautilus-style).
-                    #[name = "library_right"]
-                    pack_end = &gtk::Box {
-                        set_spacing: 6,
-                        #[name = "filter_menu"]
-                        gtk::MenuButton {
-                            set_icon_name: "view-more-symbolic",
-                            set_tooltip_text: Some("Filter & sort"),
-                        },
-                        #[name = "search_btn"]
-                        gtk::ToggleButton {
-                            set_icon_name: "system-search-symbolic",
-                            set_tooltip_text: Some("Search"),
-                        },
-                    },
-                    // Editor: export + view actions.
-                    #[name = "editor_right"]
-                    pack_end = &gtk::Box {
-                        set_spacing: 6,
-                        gtk::Box {
-                            add_css_class: "linked",
-                            #[name = "orig_btn"]
-                            gtk::ToggleButton {
-                                set_icon_name: "view-reveal-symbolic",
-                                set_tooltip_text: Some("Show original"),
-                                connect_toggled => AppMsg::ToggleOriginal,
-                            },
-                            gtk::Button {
-                                set_icon_name: "edit-copy-symbolic",
-                                set_tooltip_text: Some("Copy settings"),
-                                connect_clicked => AppMsg::CopySettings,
-                            },
-                            gtk::Button {
-                                set_icon_name: "edit-paste-symbolic",
-                                set_tooltip_text: Some("Paste settings"),
-                                connect_clicked => AppMsg::PasteSettings,
-                            },
-                            gtk::Button {
-                                set_icon_name: "view-fullscreen-symbolic",
-                                set_tooltip_text: Some("Fullscreen"),
-                                connect_clicked => AppMsg::ToggleFullscreen,
-                            },
-                        },
-                        gtk::Button {
-                            set_label: "Export",
-                            add_css_class: "suggested-action",
-                            connect_clicked => AppMsg::ExportDialog,
-                        },
-                    },
-                },
-
+            #[wrap(Some)]
+            #[name = "toast_overlay"]
+            set_content = &adw::ToastOverlay {
                 #[wrap(Some)]
-                #[name = "toast_overlay"]
-                set_content = &adw::ToastOverlay {
-                    #[wrap(Some)]
-                    #[name = "stack"]
-                    set_child = &gtk::Stack {
-                    set_vexpand: true,
-                    set_hexpand: true,
-
-                    add_named[Some("library")] = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-
-                        #[name = "lib_stack"]
-                        gtk::Stack {
-                            set_vexpand: true,
-                            set_hexpand: true,
-
-                            add_named[Some("grid")] = &gtk::Box {
+                #[name = "nav"]
+                set_child = &adw::NavigationView {
+                    // ----- Library page -----
+                    add = &adw::NavigationPage {
+                        set_tag: Some("library"),
+                        set_title: "RapidRAW",
+                        #[wrap(Some)]
+                        set_child = &adw::ToolbarView {
+                            add_top_bar = &adw::HeaderBar {
+                                pack_start = &gtk::Button {
+                                    set_label: "Open Folder",
+                                    connect_clicked => AppMsg::OpenFolderDialog,
+                                },
+                                #[name = "menu_lib"]
+                                pack_end = &gtk::MenuButton {
+                                    set_icon_name: "open-menu-symbolic",
+                                    set_tooltip_text: Some("Main menu"),
+                                    set_primary: true,
+                                },
+                                #[name = "library_right"]
+                                pack_end = &gtk::Box {
+                                    set_spacing: 6,
+                                    #[name = "filter_menu"]
+                                    gtk::MenuButton {
+                                        set_icon_name: "view-more-symbolic",
+                                        set_tooltip_text: Some("Filter & sort"),
+                                    },
+                                    #[name = "search_btn"]
+                                    gtk::ToggleButton {
+                                        set_icon_name: "system-search-symbolic",
+                                        set_tooltip_text: Some("Search"),
+                                    },
+                                },
+                            },
+                            #[wrap(Some)]
+                            set_content = &gtk::Box {
                                 set_orientation: gtk::Orientation::Vertical,
-
-                                // Drops down when the header search toggle is on.
-                                #[name = "search_bar"]
-                                gtk::SearchBar {},
-
-                                gtk::ScrolledWindow {
+                                #[name = "lib_stack"]
+                                gtk::Stack {
                                     set_vexpand: true,
-                                    set_hscrollbar_policy: gtk::PolicyType::Never,
-
-                                    #[local_ref]
-                                    flow_box -> gtk::FlowBox {
-                                        set_valign: gtk::Align::Start,
-                                        set_selection_mode: gtk::SelectionMode::Single,
-                                        set_homogeneous: true,
-                                        set_column_spacing: 8,
-                                        set_row_spacing: 8,
-                                        set_margin_all: 8,
-                                        connect_child_activated[sender, images] => move |_, child| {
-                                            let idx = child.index();
-                                            if idx >= 0 {
-                                                if let Some(path) = images.borrow().get(idx as usize) {
-                                                    sender.input(AppMsg::OpenInEditor(path.clone()));
-                                                }
-                                            }
+                                    set_hexpand: true,
+                                    add_named[Some("grid")] = &gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        #[name = "search_bar"]
+                                        gtk::SearchBar {},
+                                        gtk::ScrolledWindow {
+                                            set_vexpand: true,
+                                            set_hscrollbar_policy: gtk::PolicyType::Never,
+                                            #[local_ref]
+                                            flow_box -> gtk::FlowBox {
+                                                set_valign: gtk::Align::Start,
+                                                set_selection_mode: gtk::SelectionMode::Single,
+                                                set_homogeneous: true,
+                                                set_column_spacing: 8,
+                                                set_row_spacing: 8,
+                                                set_margin_all: 8,
+                                                connect_child_activated[sender, images] => move |_, child| {
+                                                    let idx = child.index();
+                                                    if idx >= 0 {
+                                                        if let Some(path) = images.borrow().get(idx as usize) {
+                                                            sender.input(AppMsg::OpenInEditor(path.clone()));
+                                                        }
+                                                    }
+                                                },
+                                            },
                                         },
                                     },
                                 },
@@ -781,14 +715,75 @@ impl Component for AppModel {
                         },
                     },
 
-                    #[name = "editor_page"]
-                    add_named[Some("editor")] = &gtk::Paned {
-                        set_vexpand: true,
-                        // Canvas on the left, adjustment panel on the right,
-                        // with a draggable, mouse-resizable divider.
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_wide_handle: true,
-                    },
+                    // ----- Editor page (pushed on open; back button is automatic) -----
+                    add = &adw::NavigationPage {
+                        set_tag: Some("editor"),
+                        set_title: "Editor",
+                        #[wrap(Some)]
+                        set_child = &adw::ToolbarView {
+                            add_top_bar = &adw::HeaderBar {
+                                #[wrap(Some)]
+                                #[name = "win_title"]
+                                set_title_widget = &adw::WindowTitle {
+                                    set_title: "RapidRAW",
+                                },
+                                pack_start = &gtk::Box {
+                                    add_css_class: "linked",
+                                    gtk::Button {
+                                        set_icon_name: "edit-undo-symbolic",
+                                        set_tooltip_text: Some("Undo (Ctrl+Z)"),
+                                        connect_clicked => AppMsg::Undo,
+                                    },
+                                    gtk::Button {
+                                        set_icon_name: "edit-redo-symbolic",
+                                        set_tooltip_text: Some("Redo (Ctrl+Shift+Z)"),
+                                        connect_clicked => AppMsg::Redo,
+                                    },
+                                },
+                                #[name = "menu_ed"]
+                                pack_end = &gtk::MenuButton {
+                                    set_icon_name: "open-menu-symbolic",
+                                    set_tooltip_text: Some("Main menu"),
+                                    set_primary: true,
+                                },
+                                pack_end = &gtk::Button {
+                                    set_label: "Export",
+                                    add_css_class: "suggested-action",
+                                    connect_clicked => AppMsg::ExportDialog,
+                                },
+                                pack_end = &gtk::Box {
+                                    add_css_class: "linked",
+                                    #[name = "orig_btn"]
+                                    gtk::ToggleButton {
+                                        set_icon_name: "view-reveal-symbolic",
+                                        set_tooltip_text: Some("Show original"),
+                                        connect_toggled => AppMsg::ToggleOriginal,
+                                    },
+                                    gtk::Button {
+                                        set_icon_name: "edit-copy-symbolic",
+                                        set_tooltip_text: Some("Copy settings"),
+                                        connect_clicked => AppMsg::CopySettings,
+                                    },
+                                    gtk::Button {
+                                        set_icon_name: "edit-paste-symbolic",
+                                        set_tooltip_text: Some("Paste settings"),
+                                        connect_clicked => AppMsg::PasteSettings,
+                                    },
+                                    gtk::Button {
+                                        set_icon_name: "view-fullscreen-symbolic",
+                                        set_tooltip_text: Some("Fullscreen"),
+                                        connect_clicked => AppMsg::ToggleFullscreen,
+                                    },
+                                },
+                            },
+                            #[wrap(Some)]
+                            #[name = "editor_page"]
+                            set_content = &gtk::Paned {
+                                set_vexpand: true,
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_wide_handle: true,
+                            },
+                        },
                     },
                 },
             },
@@ -854,9 +849,34 @@ impl Component for AppModel {
         install_app_css();
         model.toasts = widgets.toast_overlay.clone();
         model.win_title = widgets.win_title.clone();
-        // Header bar starts in library context (editor actions hidden).
-        widgets.editor_left.set_visible(false);
-        widgets.editor_right.set_visible(false);
+
+        // Primary menu (Preferences / About) as a proper GMenu on both pages.
+        let app_actions = gtk::gio::SimpleActionGroup::new();
+        let act_prefs = gtk::gio::SimpleAction::new("preferences", None);
+        {
+            let sender = sender.clone();
+            act_prefs.connect_activate(move |_, _| sender.input(AppMsg::OpenSettings));
+        }
+        let act_about = gtk::gio::SimpleAction::new("about", None);
+        {
+            let sender = sender.clone();
+            act_about.connect_activate(move |_, _| sender.input(AppMsg::ShowAbout));
+        }
+        app_actions.add_action(&act_prefs);
+        app_actions.add_action(&act_about);
+        root.insert_action_group("app", Some(&app_actions));
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("Preferences"), Some("app.preferences"));
+        menu.append(Some("About RapidRAW"), Some("app.about"));
+        widgets.menu_lib.set_menu_model(Some(&menu));
+        widgets.menu_ed.set_menu_model(Some(&menu));
+
+        // Start on the library page; the editor page is pushed on open.
+        widgets.nav.replace_with_tags(&["library"]);
+        {
+            let sender = sender.clone();
+            widgets.nav.connect_popped(move |_, _| sender.input(AppMsg::ShowLibrary));
+        }
 
         // Filter & sort: a popover off the header MenuButton (Nautilus-style).
         let filter_dd =
@@ -1212,6 +1232,17 @@ impl Component for AppModel {
                     self.toasts.add_toast(adw::Toast::new("Settings pasted"));
                 }
             }
+            AppMsg::ShowAbout => {
+                let about = adw::AboutWindow::builder()
+                    .application_name("RapidRAW")
+                    .application_icon("image-x-generic")
+                    .developer_name("RapidRAW")
+                    .version(env!("CARGO_PKG_VERSION"))
+                    .comments("GPU-accelerated RAW editor — native GTK4/libadwaita frontend.")
+                    .build();
+                about.set_transient_for(Some(root));
+                about.present();
+            }
             AppMsg::ToggleFullscreen => {
                 if root.is_fullscreen() {
                     root.unfullscreen();
@@ -1221,7 +1252,12 @@ impl Component for AppModel {
             }
             AppMsg::RateActive(r) => {
                 // Only rate while an image is open in the editor.
-                if widgets.stack.visible_child_name().as_deref() != Some("editor") {
+                let in_editor = widgets
+                    .nav
+                    .visible_page()
+                    .and_then(|p| p.tag())
+                    .map_or(false, |t| t == "editor");
+                if !in_editor {
                     return;
                 }
                 let Some(path) = self.session.active_path.clone() else {
@@ -1245,12 +1281,7 @@ impl Component for AppModel {
                 // Pause thumbnail decoding while editing (frees the CPU).
                 self.thumb_gen.fetch_add(1, Ordering::Relaxed);
                 self.session.active_path = Some(path.clone());
-                widgets.stack.set_visible_child_name("editor");
-                // Header bar -> editor context.
-                widgets.open_btn.set_visible(false);
-                widgets.library_right.set_visible(false);
-                widgets.editor_left.set_visible(true);
-                widgets.editor_right.set_visible(true);
+                widgets.nav.push_by_tag("editor");
                 let p = path.clone();
                 spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {
                     Ok(img) => CmdMsg::BaseReady(p, img),
@@ -1523,15 +1554,8 @@ impl Component for AppModel {
                 });
             }
             AppMsg::ShowLibrary => {
+                // Fired when the editor page is popped (auto back button/gesture).
                 self.save_edits();
-                widgets.stack.set_visible_child_name("library");
-                // Header bar -> library context.
-                widgets.open_btn.set_visible(true);
-                widgets.library_right.set_visible(true);
-                widgets.editor_left.set_visible(false);
-                widgets.editor_right.set_visible(false);
-                self.win_title.set_title("RapidRAW");
-                self.win_title.set_subtitle("");
                 // Resume decoding any thumbnails that never finished.
                 let missing: Vec<usize> = self
                     .thumb_loaded
