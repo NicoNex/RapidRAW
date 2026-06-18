@@ -1313,6 +1313,11 @@ impl Component for AppModel {
                 // Pause thumbnail decoding while editing (frees the CPU).
                 self.thumb_gen.fetch_add(1, Ordering::Relaxed);
                 self.session.active_path = Some(path.clone());
+                // Blank the canvas so the previous photo isn't shown while the
+                // new selection decodes.
+                self.canvas.clear();
+                self.last_tex = None;
+                self.original_tex = None;
                 widgets.nav.push_by_tag("editor");
                 let p = path.clone();
                 spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {

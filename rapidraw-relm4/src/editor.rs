@@ -306,6 +306,13 @@ impl EditorCanvas {
         apply(&self.picture, &self.fixed, &self.overlay, &self.view);
     }
 
+    /// Drop the current image (blank canvas) — e.g. while the next one decodes,
+    /// so the previous photo isn't shown under the new selection.
+    pub fn clear(&self) {
+        self.picture.set_paintable(None::<&gdk::Paintable>);
+        self.view.natural.set((0, 0));
+    }
+
     /// Show an image, fit + centered in the viewport.
     pub fn set_texture(&self, texture: &gdk::MemoryTexture) {
         self.view.natural.set((texture.width(), texture.height()));
