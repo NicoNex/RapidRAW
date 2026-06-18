@@ -170,6 +170,21 @@ enum AppMsg {
     /// Right-rail switcher: show the adjustments panel / the crop panel.
     ShowAdjustPanel,
     ShowCropPanel,
+    /// Editor toolbar: copy the current edit settings, paste onto this image.
+    CopySettings,
+    PasteSettings,
+    /// Toggle window fullscreen.
+    ToggleFullscreen,
+}
+
+/// Copied edit settings (toolbar copy/paste between photos).
+#[derive(Clone)]
+struct SettingsClip {
+    global: GlobalAdjustments,
+    geom: Geometry,
+    lut: Option<Arc<Lut>>,
+    lut_path: Option<PathBuf>,
+    vals: Vec<f64>,
 }
 
 /// Crop / geometry transforms applied to the base image (CPU) before GPU render.
@@ -371,6 +386,8 @@ struct AppModel {
     crop_aspect: f32,
     /// Path of the active .cube LUT (for persisting per-image edits).
     lut_path: Option<PathBuf>,
+    /// Copied edit settings (toolbar copy/paste).
+    settings_clip: Option<SettingsClip>,
 }
 
 impl AppModel {
@@ -713,6 +730,25 @@ impl Component for AppModel {
                                 add_css_class: "flat",
                                 connect_toggled => AppMsg::ToggleOriginal,
                             },
+                            gtk::Separator { set_orientation: gtk::Orientation::Vertical },
+                            gtk::Button {
+                                set_icon_name: "edit-copy-symbolic",
+                                set_tooltip_text: Some("Copy settings"),
+                                add_css_class: "flat",
+                                connect_clicked => AppMsg::CopySettings,
+                            },
+                            gtk::Button {
+                                set_icon_name: "edit-paste-symbolic",
+                                set_tooltip_text: Some("Paste settings"),
+                                add_css_class: "flat",
+                                connect_clicked => AppMsg::PasteSettings,
+                            },
+                            gtk::Button {
+                                set_icon_name: "view-fullscreen-symbolic",
+                                set_tooltip_text: Some("Fullscreen"),
+                                add_css_class: "flat",
+                                connect_clicked => AppMsg::ToggleFullscreen,
+                            },
                         },
 
                         #[name = "editor_page"]
@@ -774,6 +810,7 @@ impl Component for AppModel {
             crop_active: false,
             crop_aspect: 0.0,
             lut_path: None,
+            settings_clip: None,
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -1073,6 +1110,39 @@ impl Component for AppModel {
                 // Show the full (uncropped) image with the crop overlay.
                 self.canvas.enter_crop(self.crop_aspect as f64);
                 sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::CopySettings => {
+                self.settings_clip = Some(SettingsClip {
+                    global: self.session.adjustments.global,
+                    geom: self.geom,
+                    lut: self.session.lut.clone(),
+                    lut_path: self.lut_path.clone(),
+                    vals: self.panel.snapshot(),
+                });
+                self.toasts.add_toast(adw::Toast::new("Settings copied"));
+            }
+            AppMsg::PasteSettings => {
+                if let Some(c) = self.settings_clip.clone() {
+                    self.session.adjustments.global = c.global;
+                    self.geom = c.geom;
+                    self.session.lut = c.lut;
+                    self.lut_path = c.lut_path;
+                    self.canvas.set_crop_rect(match c.geom.crop {
+                        Some([x, y, w, h]) => (x as f64, y as f64, w as f64, h as f64),
+                        None => (0.0, 0.0, 1.0, 1.0),
+                    });
+                    self.panel.restore(&c.vals);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                    self.toasts.add_toast(adw::Toast::new("Settings pasted"));
+                }
+            }
+            AppMsg::ToggleFullscreen => {
+                if root.is_fullscreen() {
+                    root.unfullscreen();
+                } else {
+                    root.fullscreen();
+                }
             }
             AppMsg::OpenInEditor(path) => {
                 log::info!("Open in editor: {}", path.display());
