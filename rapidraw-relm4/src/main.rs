@@ -680,6 +680,21 @@ impl Component for AppModel {
                         set_tooltip_text: Some("Settings"),
                         connect_clicked => AppMsg::OpenSettings,
                     },
+                    // Library: search toggle + filter/sort menu (Nautilus-style).
+                    #[name = "library_right"]
+                    pack_end = &gtk::Box {
+                        set_spacing: 6,
+                        #[name = "filter_menu"]
+                        gtk::MenuButton {
+                            set_icon_name: "view-more-symbolic",
+                            set_tooltip_text: Some("Filter & sort"),
+                        },
+                        #[name = "search_btn"]
+                        gtk::ToggleButton {
+                            set_icon_name: "system-search-symbolic",
+                            set_tooltip_text: Some("Search"),
+                        },
+                    },
                     // Editor: export + view actions.
                     #[name = "editor_right"]
                     pack_end = &gtk::Box {
@@ -736,17 +751,9 @@ impl Component for AppModel {
                             add_named[Some("grid")] = &gtk::Box {
                                 set_orientation: gtk::Orientation::Vertical,
 
-                                #[name = "lib_toolbar"]
-                                gtk::Box {
-                                    set_orientation: gtk::Orientation::Horizontal,
-                                    set_spacing: 8,
-                                    set_margin_all: 8,
-                                    gtk::Label {
-                                        set_label: "Filter",
-                                        add_css_class: "caption",
-                                    },
-                                    // raw filter + sort DropDowns appended in init.
-                                },
+                                // Drops down when the header search toggle is on.
+                                #[name = "search_bar"]
+                                gtk::SearchBar {},
 
                                 gtk::ScrolledWindow {
                                     set_vexpand: true,
@@ -851,7 +858,7 @@ impl Component for AppModel {
         widgets.editor_left.set_visible(false);
         widgets.editor_right.set_visible(false);
 
-        // Library toolbar: raw filter + sort DropDowns.
+        // Filter & sort: a popover off the header MenuButton (Nautilus-style).
         let filter_dd =
             gtk::DropDown::from_strings(&["All", "Raw only", "Non-raw only", "Prefer raw"]);
         {
@@ -866,8 +873,6 @@ impl Component for AppModel {
                 sender.input(AppMsg::FilterChanged(f));
             });
         }
-        let sort_lbl = gtk::Label::new(Some("Sort"));
-        sort_lbl.add_css_class("caption");
         let sort_dd = gtk::DropDown::from_strings(&["Name", "Newest", "Oldest", "Rating"]);
         {
             let sender = sender.clone();
@@ -881,21 +886,42 @@ impl Component for AppModel {
                 sender.input(AppMsg::SortChanged(s));
             });
         }
-        widgets.lib_toolbar.append(&filter_dd);
-        widgets.lib_toolbar.append(&sort_lbl);
-        widgets.lib_toolbar.append(&sort_dd);
+        let pop_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        pop_box.set_margin_all(10);
+        let flbl = gtk::Label::new(Some("Filter"));
+        flbl.set_halign(gtk::Align::Start);
+        flbl.add_css_class("caption");
+        let slbl = gtk::Label::new(Some("Sort"));
+        slbl.set_halign(gtk::Align::Start);
+        slbl.add_css_class("caption");
+        pop_box.append(&flbl);
+        pop_box.append(&filter_dd);
+        pop_box.append(&slbl);
+        pop_box.append(&sort_dd);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&pop_box));
+        widgets.filter_menu.set_popover(Some(&popover));
+
+        // Search: a SearchEntry in the drop-down SearchBar, toggled by the header
+        // search button (GNOME/Nautilus pattern). Entry is wide/centred.
         let search = gtk::SearchEntry::new();
         search.set_placeholder_text(Some("Search filename…"));
         search.set_hexpand(true);
-        search.set_halign(gtk::Align::End);
-        search.set_width_request(220);
+        search.set_max_width_chars(60);
         {
             let sender = sender.clone();
             search.connect_search_changed(move |e| {
                 sender.input(AppMsg::SearchChanged(e.text().to_string()));
             });
         }
-        widgets.lib_toolbar.append(&search);
+        widgets.search_bar.set_child(Some(&search));
+        widgets.search_bar.connect_entry(&search);
+        widgets
+            .search_btn
+            .bind_property("active", &widgets.search_bar, "search-mode-enabled")
+            .bidirectional()
+            .sync_create()
+            .build();
 
         // Welcome screen: full-bleed splash, a soft scrim for contrast, brand +
         // pill buttons centred (no boxed card).
@@ -1222,6 +1248,7 @@ impl Component for AppModel {
                 widgets.stack.set_visible_child_name("editor");
                 // Header bar -> editor context.
                 widgets.open_btn.set_visible(false);
+                widgets.library_right.set_visible(false);
                 widgets.editor_left.set_visible(true);
                 widgets.editor_right.set_visible(true);
                 let p = path.clone();
@@ -1500,6 +1527,7 @@ impl Component for AppModel {
                 widgets.stack.set_visible_child_name("library");
                 // Header bar -> library context.
                 widgets.open_btn.set_visible(true);
+                widgets.library_right.set_visible(true);
                 widgets.editor_left.set_visible(false);
                 widgets.editor_right.set_visible(false);
                 self.win_title.set_title("RapidRAW");
