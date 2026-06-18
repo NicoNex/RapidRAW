@@ -24,6 +24,7 @@ mod sidecar;
 mod slider;
 mod state;
 mod thumb;
+mod thumb_cache;
 use controls::AdjustPanel;
 use curves::Channel;
 use editor::EditorCanvas;
@@ -452,6 +453,10 @@ fn dispatch_thumbs(
             if tok.load(Ordering::Relaxed) != gen {
                 return CmdMsg::ThumbReady(gen, i, RgbaImage::new(1, 1)); // skipped
             }
+            // Fast path: a cached thumbnail avoids the (expensive) RAW decode.
+            if let Some(rgba) = thumb_cache::load(&p, thumb_dim) {
+                return CmdMsg::ThumbReady(gen, i, rgba);
+            }
             match rapidraw_core::load_base_image(&p) {
                 Ok(img) => {
                     let (w, h) = img.dimensions();
@@ -460,7 +465,9 @@ fn dispatch_thumbs(
                     } else {
                         img
                     };
-                    CmdMsg::ThumbReady(gen, i, scaled.to_rgba8())
+                    let rgba = scaled.to_rgba8();
+                    thumb_cache::save(&p, thumb_dim, &rgba);
+                    CmdMsg::ThumbReady(gen, i, rgba)
                 }
                 Err(e) => {
                     log::warn!("thumb decode failed for {}: {e}", p.display());
