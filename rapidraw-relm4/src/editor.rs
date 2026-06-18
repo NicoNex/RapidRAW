@@ -67,7 +67,10 @@ struct View {
 }
 
 pub struct EditorCanvas {
-    root: gtk::ScrolledWindow,
+    /// Outer overlay: the scrolled canvas plus the crop layer on top.
+    root: gtk::Overlay,
+    /// The scrolled window holding the Fixed+Picture (the actual image view).
+    sw: gtk::ScrolledWindow,
     fixed: gtk::Fixed,
     picture: gtk::Picture,
     overlay: gtk::DrawingArea,
@@ -93,14 +96,14 @@ impl EditorCanvas {
         // its scrollbars and, unlike `Never`, does NOT request the child's full
         // size — so a zoomed (huge) picture is clipped, not grown into. We never
         // actually scroll it (adjustments stay 0; we pan via the Fixed).
-        let root = gtk::ScrolledWindow::new();
-        root.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
-        root.set_min_content_width(0);
-        root.set_min_content_height(0);
-        root.set_has_frame(false);
-        root.set_hexpand(true);
-        root.set_vexpand(true);
-        root.set_child(Some(&fixed));
+        let sw = gtk::ScrolledWindow::new();
+        sw.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
+        sw.set_min_content_width(0);
+        sw.set_min_content_height(0);
+        sw.set_has_frame(false);
+        sw.set_hexpand(true);
+        sw.set_vexpand(true);
+        sw.set_child(Some(&fixed));
         install_bg_css();
 
         let view = View {
@@ -111,10 +114,10 @@ impl EditorCanvas {
             fit: Rc::new(Cell::new(true)),
         };
 
-        // Crop overlay (above the picture), shown only in crop mode.
+        // Crop overlay: a DrawingArea layered over the canvas (auto-fills, so it
+        // tracks window resizes), shown only in crop mode.
         let overlay = gtk::DrawingArea::new();
         overlay.set_visible(false);
-        fixed.put(&overlay, 0.0, 0.0);
         let crop_rect = Rc::new(Cell::new((0.0, 0.0, 1.0, 1.0)));
         let crop_aspect = Rc::new(Cell::new(0.0_f64));
 
@@ -238,8 +241,16 @@ impl EditorCanvas {
         }
         overlay.add_controller(crop_drag);
 
+        // Outer overlay: scrolled image + crop layer (the layer fills the canvas).
+        let root = gtk::Overlay::new();
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+        root.set_child(Some(&sw));
+        root.add_overlay(&overlay);
+
         Self {
             root,
+            sw,
             fixed,
             picture,
             overlay,
@@ -249,17 +260,17 @@ impl EditorCanvas {
         }
     }
 
-    pub fn root(&self) -> &gtk::ScrolledWindow {
+    pub fn root(&self) -> &gtk::Overlay {
         &self.root
     }
 
     /// Set the canvas background: themed default, or a solid white/black.
     pub fn set_background(&self, bg: Background) {
-        self.root.remove_css_class("editor-bg-white");
-        self.root.remove_css_class("editor-bg-black");
+        self.sw.remove_css_class("editor-bg-white");
+        self.sw.remove_css_class("editor-bg-black");
         match bg {
-            Background::White => self.root.add_css_class("editor-bg-white"),
-            Background::Black => self.root.add_css_class("editor-bg-black"),
+            Background::White => self.sw.add_css_class("editor-bg-white"),
+            Background::Black => self.sw.add_css_class("editor-bg-black"),
             Background::Default => {}
         }
     }
@@ -314,6 +325,9 @@ impl EditorCanvas {
         if aspect > 0.0 {
             self.crop_rect.set(fit_aspect(self.crop_rect.get(), aspect, &self.view));
         }
+        // Fit the whole image so the crop rectangle is fully reachable.
+        self.view.fit.set(true);
+        fit_now(&self.picture, &self.fixed, &self.overlay, &self.view);
         self.overlay.set_visible(true);
         self.overlay.queue_draw();
     }
@@ -421,9 +435,7 @@ fn apply(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingArea,
     picture.set_size_request(w.max(1), h.max(1));
     let (ox, oy) = view.offset.get();
     fixed.move_(picture, ox, oy);
-    // Crop overlay covers the whole viewport (it reads the view to draw).
-    overlay.set_size_request(vw as i32, vh as i32);
-    fixed.move_(overlay, 0.0, 0.0);
+    // The crop overlay is a separate layer that auto-fills; just repaint it.
     overlay.queue_draw();
 }
 
