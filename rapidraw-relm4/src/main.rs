@@ -446,34 +446,55 @@ fn dispatch_thumbs(
     images: &[PathBuf],
     indices: impl IntoIterator<Item = usize>,
 ) {
-    for i in indices {
-        let p = images[i].clone();
+    // Build the work list, then chew through it on a pool of OS threads sized to
+    // the CPU. A shared atomic cursor work-steals; each thread bails the moment
+    // the generation token moves (left the library / changed filter), so no
+    // wasted RAW decodes. Real threads (not the async runtime) because decoding
+    // is heavy and CPU-bound.
+    let jobs: Arc<Vec<(usize, PathBuf)>> =
+        Arc::new(indices.into_iter().map(|i| (i, images[i].clone())).collect());
+    if jobs.is_empty() {
+        return;
+    }
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(jobs.len());
+
+    for _ in 0..n {
+        let jobs = jobs.clone();
+        let cursor = cursor.clone();
         let tok = gen_tok.clone();
-        sender.oneshot_command(async move {
+        let cmd = sender.command_sender().clone();
+        std::thread::spawn(move || loop {
             if tok.load(Ordering::Relaxed) != gen {
-                return CmdMsg::ThumbReady(gen, i, RgbaImage::new(1, 1)); // skipped
+                break; // cancelled
             }
-            // Fast path: a cached thumbnail avoids the (expensive) RAW decode.
-            if let Some(rgba) = thumb_cache::load(&p, thumb_dim) {
-                return CmdMsg::ThumbReady(gen, i, rgba);
-            }
-            match rapidraw_core::load_base_image(&p) {
-                Ok(img) => {
-                    let (w, h) = img.dimensions();
-                    let scaled = if w.max(h) > thumb_dim {
-                        img.resize(thumb_dim, thumb_dim, image::imageops::FilterType::Triangle)
-                    } else {
-                        img
-                    };
-                    let rgba = scaled.to_rgba8();
-                    thumb_cache::save(&p, thumb_dim, &rgba);
-                    CmdMsg::ThumbReady(gen, i, rgba)
+            let idx = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some((i, p)) = jobs.get(idx) else {
+                break; // queue drained
+            };
+            let rgba = thumb_cache::load(p, thumb_dim).unwrap_or_else(|| {
+                match rapidraw_core::load_base_image(p) {
+                    Ok(img) => {
+                        let (w, h) = img.dimensions();
+                        let scaled = if w.max(h) > thumb_dim {
+                            img.resize(thumb_dim, thumb_dim, image::imageops::FilterType::Triangle)
+                        } else {
+                            img
+                        };
+                        let rgba = scaled.to_rgba8();
+                        thumb_cache::save(p, thumb_dim, &rgba);
+                        rgba
+                    }
+                    Err(e) => {
+                        log::warn!("thumb decode failed for {}: {e}", p.display());
+                        RgbaImage::new(1, 1)
+                    }
                 }
-                Err(e) => {
-                    log::warn!("thumb decode failed for {}: {e}", p.display());
-                    CmdMsg::ThumbReady(gen, i, RgbaImage::new(1, 1))
-                }
-            }
+            });
+            let _ = cmd.send(CmdMsg::ThumbReady(gen, *i, rgba));
         });
     }
 }
