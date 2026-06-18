@@ -878,49 +878,65 @@ impl Component for AppModel {
             widgets.nav.connect_popped(move |_, _| sender.input(AppMsg::ShowLibrary));
         }
 
-        // Filter & sort: a popover off the header MenuButton (Nautilus-style).
-        let filter_dd =
-            gtk::DropDown::from_strings(&["All", "Raw only", "Non-raw only", "Prefer raw"]);
+        // Filter & sort: a proper popover MENU with stateful radio actions.
+        // (DropDowns nested in a popover fight the grab and won't dismiss.)
+        let act_filter = gtk::gio::SimpleAction::new_stateful(
+            "filter",
+            Some(gtk::glib::VariantTy::STRING),
+            &gtk::glib::Variant::from("all"),
+        );
         {
             let sender = sender.clone();
-            filter_dd.connect_selected_notify(move |dd| {
-                let f = match dd.selected() {
-                    1 => library::RawFilter::RawOnly,
-                    2 => library::RawFilter::NonRawOnly,
-                    3 => library::RawFilter::PreferRaw,
-                    _ => library::RawFilter::All,
-                };
-                sender.input(AppMsg::FilterChanged(f));
+            act_filter.connect_activate(move |a, p| {
+                if let Some(p) = p {
+                    a.set_state(p);
+                    let f = match p.str().unwrap_or("all") {
+                        "raw" => library::RawFilter::RawOnly,
+                        "nonraw" => library::RawFilter::NonRawOnly,
+                        "prefer" => library::RawFilter::PreferRaw,
+                        _ => library::RawFilter::All,
+                    };
+                    sender.input(AppMsg::FilterChanged(f));
+                }
             });
         }
-        let sort_dd = gtk::DropDown::from_strings(&["Name", "Newest", "Oldest", "Rating"]);
+        let act_sort = gtk::gio::SimpleAction::new_stateful(
+            "sort",
+            Some(gtk::glib::VariantTy::STRING),
+            &gtk::glib::Variant::from("name"),
+        );
         {
             let sender = sender.clone();
-            sort_dd.connect_selected_notify(move |dd| {
-                let s = match dd.selected() {
-                    1 => library::SortBy::DateNewest,
-                    2 => library::SortBy::DateOldest,
-                    3 => library::SortBy::RatingDesc,
-                    _ => library::SortBy::Name,
-                };
-                sender.input(AppMsg::SortChanged(s));
+            act_sort.connect_activate(move |a, p| {
+                if let Some(p) = p {
+                    a.set_state(p);
+                    let s = match p.str().unwrap_or("name") {
+                        "new" => library::SortBy::DateNewest,
+                        "old" => library::SortBy::DateOldest,
+                        "rating" => library::SortBy::RatingDesc,
+                        _ => library::SortBy::Name,
+                    };
+                    sender.input(AppMsg::SortChanged(s));
+                }
             });
         }
-        let pop_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        pop_box.set_margin_all(10);
-        let flbl = gtk::Label::new(Some("Filter"));
-        flbl.set_halign(gtk::Align::Start);
-        flbl.add_css_class("caption");
-        let slbl = gtk::Label::new(Some("Sort"));
-        slbl.set_halign(gtk::Align::Start);
-        slbl.add_css_class("caption");
-        pop_box.append(&flbl);
-        pop_box.append(&filter_dd);
-        pop_box.append(&slbl);
-        pop_box.append(&sort_dd);
-        let popover = gtk::Popover::new();
-        popover.set_child(Some(&pop_box));
-        widgets.filter_menu.set_popover(Some(&popover));
+        app_actions.add_action(&act_filter);
+        app_actions.add_action(&act_sort);
+
+        let fs_menu = gtk::gio::Menu::new();
+        let f_sec = gtk::gio::Menu::new();
+        f_sec.append(Some("All"), Some("app.filter::all"));
+        f_sec.append(Some("Raw only"), Some("app.filter::raw"));
+        f_sec.append(Some("Non-raw only"), Some("app.filter::nonraw"));
+        f_sec.append(Some("Prefer raw"), Some("app.filter::prefer"));
+        fs_menu.append_section(Some("Filter"), &f_sec);
+        let s_sec = gtk::gio::Menu::new();
+        s_sec.append(Some("Name"), Some("app.sort::name"));
+        s_sec.append(Some("Newest"), Some("app.sort::new"));
+        s_sec.append(Some("Oldest"), Some("app.sort::old"));
+        s_sec.append(Some("Rating"), Some("app.sort::rating"));
+        fs_menu.append_section(Some("Sort"), &s_sec);
+        widgets.filter_menu.set_menu_model(Some(&fs_menu));
 
         // Search: a SearchEntry in the drop-down SearchBar, toggled by the header
         // search button (GNOME/Nautilus pattern). Entry is wide/centred.
