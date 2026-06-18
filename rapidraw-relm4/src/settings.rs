@@ -31,7 +31,9 @@ impl Default for Settings {
             preview_dim: 1600,
             thumb_dim: 300,
             background: Background::Default,
-            reset_on_open: true,
+            // Remember each image's edits (like the original). Toggle on to
+            // always start a freshly-opened image from defaults instead.
+            reset_on_open: false,
         }
     }
 }

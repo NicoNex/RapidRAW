@@ -250,6 +250,7 @@ pub fn slider_ex(
         let val_lbl = val_lbl.clone();
         let val_entry = val_entry.clone();
         let apply = apply.clone();
+        let vadj = vadj.clone();
         Rc::new(move || {
             let txt = val_entry.text().replace(',', ".");
             if let Ok(v) = txt.trim().parse::<f64>() {
@@ -257,6 +258,11 @@ pub fn slider_ex(
             }
             val_entry.set_visible(false);
             val_lbl.set_visible(true);
+            // Hiding the entry moves focus, which makes the ScrolledWindow jump
+            // to the newly-focused widget. Pin the scroll position back.
+            let vadj = vadj.clone();
+            let pos = vadj.value();
+            gtk::glib::idle_add_local_once(move || vadj.set_value(pos));
         })
     };
     {
@@ -329,21 +335,23 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, min: f64, max: f64, default: f64, v
     }
     cr.restore().ok();
 
-    // Fill overlay: from the default position to the current value. Solid accent
-    // on a plain track; translucent over a gradient so the gradient still reads.
-    let o = ((default - min) / (max - min)).clamp(0.0, 1.0);
+    // Fill overlay (plain tracks only): from the default position to the value.
+    // Gradient tracks show position via the thumb alone, so the accent fill
+    // doesn't muddy the gradient.
     let v = ((value - min) / (max - min)).clamp(0.0, 1.0);
-    let (x0, x1) = (o.min(v) * wf, o.max(v) * wf);
-    if x1 - x0 > 0.5 {
-        rounded_rect(cr, 0.0, ty, wf, TRACK_H, r);
-        cr.save().ok();
-        cr.clip();
-        cr.rectangle(x0, ty, x1 - x0, TRACK_H);
-        let (rr, gg, bb) = ACCENT;
-        let aa = if matches!(track, Track::Plain) { 1.0 } else { 0.45 };
-        cr.set_source_rgba(rr, gg, bb, aa);
-        cr.fill().ok();
-        cr.restore().ok();
+    if matches!(track, Track::Plain) {
+        let o = ((default - min) / (max - min)).clamp(0.0, 1.0);
+        let (x0, x1) = (o.min(v) * wf, o.max(v) * wf);
+        if x1 - x0 > 0.5 {
+            rounded_rect(cr, 0.0, ty, wf, TRACK_H, r);
+            cr.save().ok();
+            cr.clip();
+            cr.rectangle(x0, ty, x1 - x0, TRACK_H);
+            let (rr, gg, bb) = ACCENT;
+            cr.set_source_rgba(rr, gg, bb, 1.0);
+            cr.fill().ok();
+            cr.restore().ok();
+        }
     }
 
     // Thumb: soft drop shadow, white knob, subtle border (libadwaita-like).

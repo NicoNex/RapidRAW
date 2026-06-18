@@ -20,15 +20,16 @@ mod library;
 mod meta;
 mod scopes;
 mod settings;
+mod sidecar;
 mod slider;
 mod state;
 mod thumb;
 use controls::AdjustPanel;
-use scopes::Scopes;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
 use rapidraw_core::lut_processing::{parse_lut_file, Lut};
+use scopes::Scopes;
 use settings::Settings;
 use state::{Engine, Session};
 use thumb::{Thumb, ThumbMsg};
@@ -150,8 +151,8 @@ struct Geometry {
     flip_v: bool,
     /// Free straighten angle, degrees.
     straighten: f32,
-    /// Centred crop aspect ratio (w/h); 0 = none.
-    aspect: f32,
+    /// Crop rectangle, normalized (x, y, w, h) in image space; None = full.
+    crop: Option<[f32; 4]>,
 }
 
 impl Default for Geometry {
@@ -161,7 +162,7 @@ impl Default for Geometry {
             flip_h: false,
             flip_v: false,
             straighten: 0.0,
-            aspect: 0.0,
+            crop: None,
         }
     }
 }
@@ -173,7 +174,7 @@ impl Geometry {
             && !self.flip_h
             && !self.flip_v
             && self.straighten == 0.0
-            && self.aspect <= 0.0
+            && self.crop.is_none()
     }
 }
 
@@ -194,29 +195,18 @@ fn apply_geometry(base: &DynamicImage, g: Geometry) -> DynamicImage {
     if g.straighten != 0.0 {
         img = apply_rotation(&img, g.straighten).into_owned();
     }
-    if g.aspect > 0.0 {
-        img = center_crop_aspect(img, g.aspect);
+    if let Some([rx, ry, rw, rh]) = g.crop {
+        use image::GenericImageView;
+        let (w, h) = img.dimensions();
+        let x = (rx.clamp(0.0, 1.0) * w as f32) as u32;
+        let y = (ry.clamp(0.0, 1.0) * h as f32) as u32;
+        let cw = (rw.clamp(0.0, 1.0) * w as f32).round().max(1.0) as u32;
+        let ch = (rh.clamp(0.0, 1.0) * h as f32).round().max(1.0) as u32;
+        let cw = cw.min(w.saturating_sub(x)).max(1);
+        let ch = ch.min(h.saturating_sub(y)).max(1);
+        img = img.crop_imm(x, y, cw, ch);
     }
     img
-}
-
-/// Crop `img` to the largest centred rectangle of aspect `target` (w/h).
-fn center_crop_aspect(img: DynamicImage, target: f32) -> DynamicImage {
-    use image::GenericImageView;
-    let (w, h) = img.dimensions();
-    if w == 0 || h == 0 {
-        return img;
-    }
-    let cur = w as f32 / h as f32;
-    let (nw, nh) = if target > cur {
-        (w, (w as f32 / target).round() as u32)
-    } else {
-        ((h as f32 * target).round() as u32, h)
-    };
-    let (nw, nh) = (nw.max(1).min(w), nh.max(1).min(h));
-    let x = (w - nw) / 2;
-    let y = (h - nh) / 2;
-    img.crop_imm(x, y, nw, nh)
 }
 
 /// One undo/redo step: the full engine state plus the slider UI values needed to
@@ -344,6 +334,13 @@ struct AppModel {
     crop: crop::CropPanel,
     /// Switches the right column between the adjustments panel and crop panel.
     content_stack: gtk::Stack,
+    /// True while the crop panel is active (canvas shows the crop overlay; the
+    /// preview is rendered uncropped so the overlay can be adjusted).
+    crop_active: bool,
+    /// Desired crop aspect (output w/h); 0 = free.
+    crop_aspect: f32,
+    /// Path of the active .cube LUT (for persisting per-image edits).
+    lut_path: Option<PathBuf>,
 }
 
 impl AppModel {
@@ -360,6 +357,28 @@ impl AppModel {
             Duration::from_millis(500),
             move || sender.input(AppMsg::CommitHistory),
         ));
+    }
+
+    /// Persist the active image's edits (adjustments + geometry + LUT) so
+    /// reopening it restores them.
+    fn save_edits(&self) {
+        let Some(path) = self.session.active_path.clone() else {
+            return;
+        };
+        let e = sidecar::Edits {
+            global: bytemuck::bytes_of(&self.session.adjustments.global).to_vec(),
+            vals: self.panel.snapshot(),
+            orientation_steps: self.geom.orientation_steps,
+            flip_h: self.geom.flip_h,
+            flip_v: self.geom.flip_v,
+            straighten: self.geom.straighten,
+            crop: self.geom.crop,
+            lut: self
+                .lut_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        };
+        sidecar::save(&path, &e);
     }
 
     /// Re-filter/-sort `all_images` into `images` and rebuild the thumbnail grid.
@@ -676,6 +695,9 @@ impl Component for AppModel {
             geom: Geometry::default(),
             crop: crop::CropPanel::new(&sender),
             content_stack: gtk::Stack::new(),
+            crop_active: false,
+            crop_aspect: 0.0,
+            lut_path: None,
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -696,9 +718,8 @@ impl Component for AppModel {
         widgets.editor_toolbar.append(&model.exif_label);
 
         // Library toolbar: raw filter + sort DropDowns.
-        let filter_dd = gtk::DropDown::from_strings(&[
-            "All", "Raw only", "Non-raw only", "Prefer raw",
-        ]);
+        let filter_dd =
+            gtk::DropDown::from_strings(&["All", "Raw only", "Non-raw only", "Prefer raw"]);
         {
             let sender = sender.clone();
             filter_dd.connect_selected_notify(move |dd| {
@@ -729,21 +750,27 @@ impl Component for AppModel {
         widgets.lib_toolbar.append(&sort_lbl);
         widgets.lib_toolbar.append(&sort_dd);
 
-        // Welcome screen: splash background + brand + Open / Continue buttons.
+        // Welcome screen: full-bleed splash, a soft scrim for contrast, brand +
+        // pill buttons centred (no boxed card).
         let welcome = gtk::Overlay::new();
         if let Some(tex) = splash_texture() {
             let pic = gtk::Picture::for_paintable(&tex);
             pic.set_content_fit(gtk::ContentFit::Cover);
             welcome.set_child(Some(&pic));
         }
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        card.add_css_class("osd");
-        card.set_halign(gtk::Align::Center);
-        card.set_valign(gtk::Align::Center);
-        card.set_margin_all(24);
-        card.set_size_request(280, -1);
+        let scrim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        scrim.add_css_class("welcome-scrim");
+        scrim.set_hexpand(true);
+        scrim.set_vexpand(true);
+        welcome.add_overlay(&scrim);
+
+        let center = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        center.set_halign(gtk::Align::Center);
+        center.set_valign(gtk::Align::Center);
         let brand = gtk::Label::new(Some("RapidRAW"));
-        brand.add_css_class("title-1");
+        brand.add_css_class("welcome-title");
+        let btns = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        btns.set_halign(gtk::Align::Center);
         let open_btn = gtk::Button::with_label("Open Folder");
         open_btn.add_css_class("pill");
         open_btn.add_css_class("suggested-action");
@@ -758,10 +785,11 @@ impl Component for AppModel {
             let sender = sender.clone();
             cont_btn.connect_clicked(move |_| sender.input(AppMsg::ContinueSession));
         }
-        card.append(&brand);
-        card.append(&open_btn);
-        card.append(&cont_btn);
-        welcome.add_overlay(&card);
+        btns.append(&open_btn);
+        btns.append(&cont_btn);
+        center.append(&brand);
+        center.append(&btns);
+        welcome.add_overlay(&center);
         widgets.lib_stack.add_named(&welcome, Some("welcome"));
         widgets.lib_stack.set_visible_child_name("welcome");
 
@@ -793,24 +821,29 @@ impl Component for AppModel {
         // mouse-resizable width that the photo zoom never disturbs.
         // Right column = scopes on top of a Stack switching adjustments <-> crop.
         model.content_stack.set_vexpand(true);
-        model.content_stack.add_named(model.panel.root(), Some("adjust"));
-        model.content_stack.add_named(model.crop.root(), Some("crop"));
+        model
+            .content_stack
+            .add_named(model.panel.root(), Some("adjust"));
+        model
+            .content_stack
+            .add_named(model.crop.root(), Some("crop"));
         model.content_stack.set_visible_child_name("adjust");
         model.right_col.set_hexpand(true);
-        model.right_col.append(model.scopes.root());
-        model.right_col.append(&model.content_stack);
 
-        // Far-right switcher rail (Edit / Crop), like the original right rail.
-        let rail = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        rail.add_css_class("linked");
-        rail.set_valign(gtk::Align::Start);
-        rail.set_margin_all(4);
-        let adj_btn = gtk::ToggleButton::with_label("Edit");
+        // Top tabs (Edit / Crop), a centred linked toggle group, above the panel.
+        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tabs.add_css_class("linked");
+        tabs.set_halign(gtk::Align::Center);
+        tabs.set_margin_top(6);
+        tabs.set_margin_bottom(2);
+        let adj_btn = gtk::ToggleButton::new();
+        adj_btn.set_icon_name("document-edit-symbolic");
+        adj_btn.set_tooltip_text(Some("Edit"));
         adj_btn.set_active(true);
-        adj_btn.set_tooltip_text(Some("Adjustments"));
-        let crop_btn = gtk::ToggleButton::with_label("Crop");
-        crop_btn.set_group(Some(&adj_btn));
+        let crop_btn = gtk::ToggleButton::new();
+        crop_btn.set_icon_name("object-select-symbolic");
         crop_btn.set_tooltip_text(Some("Crop & geometry"));
+        crop_btn.set_group(Some(&adj_btn));
         {
             let sender = sender.clone();
             adj_btn.connect_toggled(move |b| {
@@ -827,16 +860,16 @@ impl Component for AppModel {
                 }
             });
         }
-        rail.append(&adj_btn);
-        rail.append(&crop_btn);
+        tabs.append(&adj_btn);
+        tabs.append(&crop_btn);
 
-        let end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        end.append(&model.right_col);
-        end.append(&rail);
+        model.right_col.append(&tabs);
+        model.right_col.append(model.scopes.root());
+        model.right_col.append(&model.content_stack);
 
         let paned = &widgets.editor_page;
         paned.set_start_child(Some(model.canvas.root()));
-        paned.set_end_child(Some(&end));
+        paned.set_end_child(Some(&model.right_col));
         // Start (canvas) absorbs window resizes and may shrink below its child's
         // size (clipped); the panel keeps its width unless the user drags.
         paned.set_resize_start_child(true);
@@ -892,8 +925,10 @@ impl Component for AppModel {
                 self.apply_library(&sender);
             }
             AppMsg::CropAspect(a) => {
-                self.geom.aspect = a;
-                sender.input(AppMsg::RequestRender);
+                self.crop_aspect = a;
+                if self.crop_active {
+                    self.canvas.set_crop_aspect(a as f64);
+                }
             }
             AppMsg::RotateCw => {
                 self.geom.orientation_steps = (self.geom.orientation_steps + 1) % 4;
@@ -917,16 +952,43 @@ impl Component for AppModel {
             }
             AppMsg::CropReset => {
                 self.geom = Geometry::default();
+                self.crop_aspect = 0.0;
+                self.canvas.reset_crop();
+                // Rebuild the crop panel so its toggles/sliders reflect the reset.
+                let fresh = crop::CropPanel::new(&sender);
+                self.content_stack.remove(self.crop.root());
+                self.content_stack.add_named(fresh.root(), Some("crop"));
+                self.crop = fresh;
+                if self.crop_active {
+                    self.content_stack.set_visible_child_name("crop");
+                }
                 sender.input(AppMsg::RequestRender);
             }
             AppMsg::ShowAdjustPanel => {
                 self.content_stack.set_visible_child_name("adjust");
+                // Commit the interactive crop on leaving crop mode.
+                if self.crop_active {
+                    self.crop_active = false;
+                    let (x, y, w, h) = self.canvas.exit_crop();
+                    self.geom.crop = if w >= 0.999 && h >= 0.999 && x <= 0.001 && y <= 0.001 {
+                        None
+                    } else {
+                        Some([x as f32, y as f32, w as f32, h as f32])
+                    };
+                    sender.input(AppMsg::RequestRender);
+                }
             }
             AppMsg::ShowCropPanel => {
                 self.content_stack.set_visible_child_name("crop");
+                self.crop_active = true;
+                // Show the full (uncropped) image with the crop overlay.
+                self.canvas.enter_crop(self.crop_aspect as f64);
+                sender.input(AppMsg::RequestRender);
             }
             AppMsg::OpenInEditor(path) => {
                 log::info!("Open in editor: {}", path.display());
+                // Persist the previously-open image's edits before switching.
+                self.save_edits();
                 // Pause thumbnail decoding while editing (frees the CPU).
                 self.thumb_gen.fetch_add(1, Ordering::Relaxed);
                 self.session.active_path = Some(path.clone());
@@ -965,12 +1027,18 @@ impl Component for AppModel {
                 };
                 // Hand off to the persistent render thread (reuses the cached
                 // GpuProcessor, so slider drags stay smooth).
+                // While editing the crop, show the full image so the overlay can
+                // be adjusted against it.
+                let mut geom = self.geom;
+                if self.crop_active {
+                    geom.crop = None;
+                }
                 let _ = self.render_tx.send(RenderJob::Preview {
                     base,
                     adj: Box::new(self.session.adjustments),
                     lut: self.session.lut.clone(),
                     dim: self.settings.preview_dim,
-                    geom: self.geom,
+                    geom,
                 });
             }
             AppMsg::ExportDialog => {
@@ -1095,6 +1163,7 @@ impl Component for AppModel {
                 Ok(lut) => {
                     log::info!("LUT loaded: {}", path.display());
                     self.session.lut = Some(Arc::new(lut));
+                    self.lut_path = Some(path.clone());
                     // Default to full strength so the effect is visible at once;
                     // the LUT intensity slider (0..100) overrides this.
                     if self.session.adjustments.global.lut_intensity <= 0.0 {
@@ -1107,6 +1176,7 @@ impl Component for AppModel {
             },
             AppMsg::ClearLut => {
                 self.session.lut = None;
+                self.lut_path = None;
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
             }
@@ -1134,6 +1204,7 @@ impl Component for AppModel {
                 });
             }
             AppMsg::ShowLibrary => {
+                self.save_edits();
                 widgets.stack.set_visible_child_name("library");
                 // Resume decoding any thumbnails that never finished.
                 let missing: Vec<usize> = self
@@ -1205,6 +1276,7 @@ impl Component for AppModel {
                     vals: self.panel.snapshot(),
                 });
                 self.hist_idx = self.history.len() - 1;
+                self.save_edits();
             }
             AppMsg::Undo => {
                 if self.hist_idx > 0 {
@@ -1265,18 +1337,46 @@ impl Component for AppModel {
                 log::info!("base image ready: {} ({w}x{h})", path.display());
                 self.exif_label
                     .set_text(&meta::read_summary(&path).unwrap_or_default());
-                // Start each image from defaults (unless disabled in settings),
-                // rebuilding the panel so the controls reflect the reset.
+                // Start from defaults with a fresh panel, then restore this
+                // image's saved edits (unless the user forced reset-on-open).
                 self.geom = Geometry::default();
-                if self.settings.reset_on_open {
-                    self.session.adjustments = Default::default();
-                    controls::init_defaults(&mut self.session.adjustments.global);
-                    self.session.lut = None;
-                    let fresh = AdjustPanel::new(&sender);
-                    self.content_stack.remove(self.panel.root());
-                    self.content_stack.add_named(fresh.root(), Some("adjust"));
-                    self.content_stack.set_visible_child_name("adjust");
-                    self.panel = fresh;
+                self.crop_aspect = 0.0;
+                self.crop_active = false;
+                self.canvas.reset_crop();
+                self.session.adjustments = Default::default();
+                controls::init_defaults(&mut self.session.adjustments.global);
+                self.session.lut = None;
+                self.lut_path = None;
+                let fresh = AdjustPanel::new(&sender);
+                self.content_stack.remove(self.panel.root());
+                self.content_stack.add_named(fresh.root(), Some("adjust"));
+                self.content_stack.set_visible_child_name("adjust");
+                self.panel = fresh;
+                if !self.settings.reset_on_open {
+                    if let Some(e) = sidecar::load(&path) {
+                        if e.global.len() == std::mem::size_of::<GlobalAdjustments>() {
+                            // pod_read_unaligned: the JSON-decoded Vec<u8> has no
+                            // alignment guarantee, unlike `from_bytes`.
+                            self.session.adjustments.global =
+                                bytemuck::pod_read_unaligned::<GlobalAdjustments>(&e.global);
+                        }
+                        self.geom.orientation_steps = e.orientation_steps;
+                        self.geom.flip_h = e.flip_h;
+                        self.geom.flip_v = e.flip_v;
+                        self.geom.straighten = e.straighten;
+                        self.geom.crop = e.crop;
+                        self.canvas.set_crop_rect(match e.crop {
+                            Some([x, y, w, h]) => (x as f64, y as f64, w as f64, h as f64),
+                            None => (0.0, 0.0, 1.0, 1.0),
+                        });
+                        if let Some(lp) = &e.lut {
+                            if let Ok(l) = parse_lut_file(lp) {
+                                self.session.lut = Some(Arc::new(l));
+                                self.lut_path = Some(PathBuf::from(lp));
+                            }
+                        }
+                        self.panel.restore(&e.vals);
+                    }
                 }
                 // Show the un-adjusted base immediately. We're on the GTK main
                 // thread here, so building the gdk texture is safe.
@@ -1326,7 +1426,8 @@ impl Component for AppModel {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.toasts.add_toast(adw::Toast::new(&format!("Saved {name}")));
+                self.toasts
+                    .add_toast(adw::Toast::new(&format!("Saved {name}")));
             }
             CmdMsg::ExportDone(Err(e)) => {
                 log::warn!("export failed: {e}");
@@ -1356,6 +1457,16 @@ fn install_app_css() {
              }
              paned > separator:hover {
                  background-color: @accent_bg_color;
+             }
+             .welcome-scrim {
+                 background: linear-gradient(to bottom,
+                     alpha(black, 0.15), alpha(black, 0.55));
+             }
+             .welcome-title {
+                 color: white;
+                 font-size: 30px;
+                 font-weight: 800;
+                 text-shadow: 0 2px 8px alpha(black, 0.6);
              }",
         );
         if let Some(display) = gdk::Display::default() {
@@ -1407,7 +1518,11 @@ fn lut_eq(a: &Option<Arc<Lut>>, b: &Option<Arc<Lut>>) -> bool {
     }
 }
 
-fn encode_image(img: &DynamicImage, path: &std::path::Path, opts: ExportOpts) -> Result<(), String> {
+fn encode_image(
+    img: &DynamicImage,
+    path: &std::path::Path,
+    opts: ExportOpts,
+) -> Result<(), String> {
     use image::{GenericImageView, ImageEncoder};
     let img = match opts.resize {
         Some(m) if img.dimensions().0.max(img.dimensions().1) > m => {

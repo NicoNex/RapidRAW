@@ -16,7 +16,7 @@ the adjustments panel, always.
 | Panel | Status | Notes |
 |------|--------|-------|
 | Adjustments (sliders) | ✅ | `controls.rs` |
-| Crop | ✅ | `crop.rs` + right-rail Edit/Crop switcher; ⚠️ no interactive crop rectangle yet (aspect = centred crop) |
+| Crop | ✅ | `crop.rs` + right-rail Edit/Crop switcher + interactive crop rectangle on canvas |
 | Masks | ❌ | AI/radial/linear/brush masks; big |
 | AI (inpaint/generative) | ❌ | needs model backend; likely ➖ for now |
 | Presets | ❌ | save/apply adjustment presets |
@@ -78,18 +78,20 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 
 ---
 
-## Crop panel (`panel/right/CropPanel.tsx`) — ⚠️ mostly done (`crop.rs`)
-- Aspect presets: Free, 1:1, 5:4, 4:3, 3:2, 16:9, 21:9, 65:24 — ✅ (centred crop). Original/swap-orientation ❌
+## Crop panel (`panel/right/CropPanel.tsx`) — ✅ (`crop.rs`, overlay in `editor.rs`)
+- Aspect presets: Free, 1:1, 5:4, 4:3, 3:2, 16:9, 21:9, 65:24 — ✅ (constrains the rectangle). Original/swap-orientation ❌
 - Rotation (90° steps): RotateCw / RotateCcw — ✅
 - Flip Horizontal / Vertical — ✅
 - Straighten (angle slider) — ✅
-- Crop rectangle drag handles on canvas — ❌ (next crop iteration)
-- Grid overlays (rule of thirds, etc.) — ❌
+- Crop rectangle drag handles on canvas — ✅ (move + 4 corners + 4 edges, aspect-locked corners)
+- Rule-of-thirds grid + dimmed exterior — ✅
 
-Geometry applied to the base image (CPU) in the render worker before GPU render
-(`apply_geometry` in `main.rs`), via core `apply_coarse_rotation` /
-`apply_rotation` / `fliph` / `flipv` + centred aspect crop. ⚠️ geometry isn't in
-the undo history yet.
+Crop is interactive: entering the Crop panel shows the full image with an overlay
+(`EditorCanvas::enter_crop`); the rect is committed to `Geometry.crop` on leaving.
+Geometry applied to the base (CPU) in the render worker before GPU render
+(`apply_geometry`). ⚠️ Remaining: aspect lock on edge (not corner) drags;
+geometry not in undo history; "Reset crop" also clears rotate/flip and the panel
+toggles don't visually reset.
 
 ---
 
@@ -148,4 +150,11 @@ the undo history yet.
 15. ✅ Copy/paste curves.
 16. ✅ Library: splash welcome, continue session, raw filter, sort.
 17. ✅ Slider look tuned to Adwaita accent.
-18. ✅ Crop panel + right-rail Edit/Crop switcher (rotate/flip/straighten/aspect). ⚠️ interactive crop rectangle still to do.
+18. ✅ Crop panel + Edit/Crop switcher + interactive crop rectangle (move/corners/edges, thirds grid, dimmed exterior).
+19. ✅ Per-image edit memory (`sidecar.rs`): adjustments + geometry + LUT persisted per image, restored on reopen. Setting "Reset adjustments on open" (default off) forces a fresh start.
+20. ✅ Slider gradient tracks no longer overlaid by the accent fill.
+21. ✅ Crop drag no longer pans the preview; "Reset crop" resets the panel controls too.
+22. ✅ Welcome screen redesigned (full-bleed splash + scrim + pill buttons, no boxed card).
+23. ✅ Manual value entry (Enter) no longer scrolls the panel.
+24. ✅ Edit/Crop moved to top tabs (icons) instead of a side rail.
+25. ✓ Vignette verified identical to the original (scales + shader match); no change needed.
