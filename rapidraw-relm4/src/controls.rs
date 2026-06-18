@@ -152,6 +152,10 @@ pub struct AdjustPanel {
     root: gtk::ScrolledWindow,
     /// All slider handles, in build order, for undo/redo snapshot/restore.
     handles: Vec<crate::slider::SliderHandle>,
+    /// Slider UI values at build time (defaults), for in-place reset on open.
+    defaults: Vec<f64>,
+    /// Reset closures for non-slider widgets (curve editor, colour wheels).
+    reset_hooks: Vec<std::rc::Rc<dyn Fn()>>,
 }
 
 impl AdjustPanel {
@@ -177,13 +181,29 @@ impl AdjustPanel {
         list.append(&card(&section("Effects", EFFECTS, sender, &vadj)));
         list.append(&card(&build_lut_section(sender, &vadj)));
         let handles = crate::slider::reg_take();
+        let reset_hooks = crate::slider::reset_take();
+        let defaults = handles.iter().map(|h| h.get()).collect();
 
-        Self { root, handles }
+        Self {
+            root,
+            handles,
+            defaults,
+            reset_hooks,
+        }
     }
 
     /// Snapshot every slider's current UI value (build order).
     pub fn snapshot(&self) -> Vec<f64> {
         self.handles.iter().map(|h| h.get()).collect()
+    }
+
+    /// Reset all controls (sliders, curve editor, colour wheels) to defaults,
+    /// in place — no widget rebuild, so opening a new image stays fluid.
+    pub fn reset(&self) {
+        for h in &self.reset_hooks {
+            h();
+        }
+        self.restore(&self.defaults);
     }
 
     /// Restore slider UI values from a [`snapshot`](Self::snapshot) (no change

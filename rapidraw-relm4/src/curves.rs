@@ -494,6 +494,20 @@ impl CurveEditor {
         }
         area.add_controller(click);
 
+        // Reset hook: identity curves + default parametric, back to Point mode.
+        {
+            let state = state.clone();
+            let area = area.clone();
+            let point_btn = point_btn.clone();
+            let reload = reload.clone();
+            crate::slider::register_reset(Rc::new(move || {
+                *state.borrow_mut() = State::new();
+                point_btn.set_active(true); // switches to Point, hides param sliders
+                reload();
+                area.queue_draw();
+            }));
+        }
+
         root.append(&area);
         root.append(&param_box);
         Self { root }

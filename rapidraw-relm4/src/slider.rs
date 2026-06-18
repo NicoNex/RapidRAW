@@ -44,11 +44,32 @@ thread_local! {
 /// Start collecting slider handles (call before building a panel).
 pub fn reg_begin() {
     REG.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    RESET.with(|r| *r.borrow_mut() = Some(Vec::new()));
 }
 
 /// Take the collected slider handles (call after building a panel).
 pub fn reg_take() -> Vec<SliderHandle> {
     REG.with(|r| r.borrow_mut().take().unwrap_or_default())
+}
+
+thread_local! {
+    /// Reset closures registered by non-slider components (curve editor, colour
+    /// wheels) during panel build, so the panel can reset their widgets in place.
+    static RESET: RefCell<Option<Vec<Rc<dyn Fn()>>>> = const { RefCell::new(None) };
+}
+
+/// Register a closure that resets a component's widgets to defaults.
+pub fn register_reset(f: Rc<dyn Fn()>) {
+    RESET.with(|r| {
+        if let Some(list) = r.borrow_mut().as_mut() {
+            list.push(f);
+        }
+    });
+}
+
+/// Take the collected reset closures (call after building a panel).
+pub fn reset_take() -> Vec<Rc<dyn Fn()>> {
+    RESET.with(|r| r.borrow_mut().take().unwrap_or_default())
 }
 
 #[derive(Clone)]

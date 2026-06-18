@@ -137,6 +137,18 @@ impl ColorWheel {
         }
         area.add_controller(reset);
 
+        // Reset hook: clears the disc + luminance when a new image opens.
+        {
+            let handle = handle.clone();
+            let area = area.clone();
+            let lum = lum.clone();
+            crate::slider::register_reset(Rc::new(move || {
+                handle.set((0.0, 0.0));
+                area.queue_draw();
+                lum.set_value(0.0);
+            }));
+        }
+
         root.append(&area);
         root.append(&lum);
         Self { root }

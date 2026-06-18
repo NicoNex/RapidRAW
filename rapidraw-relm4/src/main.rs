@@ -1318,6 +1318,31 @@ impl Component for AppModel {
                 self.canvas.clear();
                 self.last_tex = None;
                 self.original_tex = None;
+                // Reset all controls to defaults *now* (in place, no rebuild) so
+                // the previous photo's slider/curve/wheel state isn't shown while
+                // the new image decodes. Saved edits (if any) are applied in
+                // BaseReady, after decode. Cheap → opening stays fluid.
+                self.geom = Geometry::default();
+                self.crop_aspect = 0.0;
+                self.crop_active = false;
+                self.canvas.reset_crop();
+                self.session.adjustments = Default::default();
+                controls::init_defaults(&mut self.session.adjustments.global);
+                self.session.lut = None;
+                self.lut_path = None;
+                self.panel.reset();
+                // Crop panel is small; rebuild so its toggles/straighten reset.
+                let fresh = crop::CropPanel::new(&sender);
+                self.content_stack.remove(self.crop.root());
+                self.content_stack.add_named(fresh.root(), Some("crop"));
+                self.crop = fresh;
+                self.content_stack.set_visible_child_name("adjust");
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("RapidRAW");
+                self.win_title.set_title(name);
+                self.win_title.set_subtitle("");
                 widgets.nav.push_by_tag("editor");
                 let p = path.clone();
                 spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {
@@ -1722,28 +1747,10 @@ impl Component for AppModel {
             CmdMsg::BaseReady(path, img) => {
                 let (w, h) = img.dimensions();
                 log::info!("base image ready: {} ({w}x{h})", path.display());
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("RapidRAW");
-                self.win_title.set_title(name);
+                // Controls were already reset to defaults in OpenInEditor; here we
+                // just fill the EXIF subtitle and apply any saved edits.
                 self.win_title
                     .set_subtitle(&meta::read_summary(&path).unwrap_or_default());
-                // Start from defaults with a fresh panel, then restore this
-                // image's saved edits (unless the user forced reset-on-open).
-                self.geom = Geometry::default();
-                self.crop_aspect = 0.0;
-                self.crop_active = false;
-                self.canvas.reset_crop();
-                self.session.adjustments = Default::default();
-                controls::init_defaults(&mut self.session.adjustments.global);
-                self.session.lut = None;
-                self.lut_path = None;
-                let fresh = AdjustPanel::new(&sender);
-                self.content_stack.remove(self.panel.root());
-                self.content_stack.add_named(fresh.root(), Some("adjust"));
-                self.content_stack.set_visible_child_name("adjust");
-                self.panel = fresh;
                 if !self.settings.reset_on_open {
                     if let Some(e) = sidecar::load(&path) {
                         if e.global.len() == std::mem::size_of::<GlobalAdjustments>() {
