@@ -40,7 +40,7 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 |--------|--------|-------|
 | Point curve editor (Luma/R/G/B) | ✅ | `curves.rs` |
 | **Parametric curve** (highlights/lights/darks/shadows + black/white level) | ✅ | `curves.rs` Point/Parametric mode toggle; splits fixed at 25/50/75 ⚠️ |
-| Copy/paste curve | ❌ | |
+| Copy/paste curve | ✅ | `curves.rs` per-channel clipboard (points + parametric) |
 
 ### Color (`adjustments/Color.tsx`)
 | Control | Status | Notes |
@@ -108,11 +108,12 @@ flipHorizontal, flipVertical, orientationSteps` — wire UI to them.
 | Feature | Status | Notes |
 |--------|--------|-------|
 | Folder open + thumbnail grid | ✅ | `main.rs`, `thumb.rs` |
-| **Continue session** (reopen last folder) | ❌ | persist last folder path, button on home |
-| **Splash / default photo** on home | ❌ | `public/splash-*.jpg` (light/grey/dark) as welcome background |
-| **Raw filter**: All / Raw only / Non-raw only / Prefer raw | ❌ | `RawStatus` enum in original |
-| Sort (name/date/rating/EXIF) | ❌ | |
-| Star ratings | ❌ | |
+| **Continue session** (reopen last folder) | ✅ | last folder persisted to `$XDG_CONFIG_HOME/rapidraw-relm4/last_folder`; button on welcome |
+| **Splash / default photo** on home | ✅ | embedded `splash-grey.jpg` welcome screen (`.osd` card, brand, Open/Continue) |
+| **Raw filter**: All / Raw only / Non-raw only / Prefer raw | ✅ | `library.rs arrange`; toolbar DropDown |
+| Sort (name/date) | ✅ | name + date newest/oldest; toolbar DropDown |
+| Sort by rating/EXIF | ❌ | needs ratings/EXIF index |
+| Star ratings | ❌ | needs a persisted store |
 | Search | ❌ | |
 | Folder tree sidebar | ❌ | |
 
@@ -141,3 +142,8 @@ flipHorizontal, flipVertical, orientationSteps` — wire UI to them.
 11. ✅ This file.
 12. ✅ Slider: shift=fine, click-value-to-type, dedicated reset button, HSL sat/lum gradients.
 13. ✅ EXIF readout in editor toolbar.
+14. ✅ Show-original icon swap; nicer Paned resize grip.
+15. ✅ Copy/paste curves.
+16. ✅ Library: splash welcome, continue session, raw filter, sort.
+17. ✅ Slider look tuned to Adwaita accent.
+18. ❌ Crop panel + right-rail switcher — **next**.

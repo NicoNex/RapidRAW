@@ -121,6 +121,12 @@ enum AppMsg {
     Redo,
     /// Toggle the before/after view (show the unedited original).
     ToggleOriginal,
+    /// Reopen the last folder from a previous session.
+    ContinueSession,
+    /// Library raw-status filter changed.
+    FilterChanged(library::RawFilter),
+    /// Library sort order changed.
+    SortChanged(library::SortBy),
 }
 
 /// One undo/redo step: the full engine state plus the slider UI values needed to
@@ -234,6 +240,12 @@ struct AppModel {
     showing_original: bool,
     /// EXIF readout shown in the editor toolbar.
     exif_label: gtk::Label,
+    /// All images scanned from the current folder (before filter/sort).
+    all_images: Vec<PathBuf>,
+    raw_filter: library::RawFilter,
+    sort_by: library::SortBy,
+    /// Last folder from a previous session (for "Continue session").
+    last_folder: Option<PathBuf>,
 }
 
 impl AppModel {
@@ -250,6 +262,30 @@ impl AppModel {
             Duration::from_millis(500),
             move || sender.input(AppMsg::CommitHistory),
         ));
+    }
+
+    /// Re-filter/-sort `all_images` into `images` and rebuild the thumbnail grid.
+    fn apply_library(&mut self, sender: &ComponentSender<AppModel>) {
+        self.images = library::arrange(&self.all_images, self.raw_filter, self.sort_by);
+        *self.images_shared.borrow_mut() = self.images.clone();
+
+        let mut guard = self.thumbs.guard();
+        guard.clear();
+        for p in &self.images {
+            guard.push_back(p.clone());
+        }
+        drop(guard);
+
+        self.thumb_loaded = vec![false; self.images.len()];
+        let gen = self.thumb_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        dispatch_thumbs(
+            sender,
+            &self.thumb_gen,
+            gen,
+            self.settings.thumb_dim,
+            &self.images,
+            0..self.images.len(),
+        );
     }
 
     /// Apply the history entry at `hist_idx`: set engine state, restore the
@@ -398,24 +434,51 @@ impl Component for AppModel {
                     set_vexpand: true,
                     set_hexpand: true,
 
-                    add_named[Some("library")] = &gtk::ScrolledWindow {
-                        set_hscrollbar_policy: gtk::PolicyType::Never,
+                    add_named[Some("library")] = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
 
-                        #[local_ref]
-                        flow_box -> gtk::FlowBox {
-                            set_valign: gtk::Align::Start,
-                            set_selection_mode: gtk::SelectionMode::Single,
-                            set_homogeneous: true,
-                            set_column_spacing: 8,
-                            set_row_spacing: 8,
-                            set_margin_all: 8,
-                            connect_child_activated[sender, images] => move |_, child| {
-                                let idx = child.index();
-                                if idx >= 0 {
-                                    if let Some(path) = images.borrow().get(idx as usize) {
-                                        sender.input(AppMsg::OpenInEditor(path.clone()));
-                                    }
-                                }
+                        #[name = "lib_stack"]
+                        gtk::Stack {
+                            set_vexpand: true,
+                            set_hexpand: true,
+
+                            add_named[Some("grid")] = &gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+
+                                #[name = "lib_toolbar"]
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Horizontal,
+                                    set_spacing: 8,
+                                    set_margin_all: 8,
+                                    gtk::Label {
+                                        set_label: "Filter",
+                                        add_css_class: "caption",
+                                    },
+                                    // raw filter + sort DropDowns appended in init.
+                                },
+
+                                gtk::ScrolledWindow {
+                                    set_vexpand: true,
+                                    set_hscrollbar_policy: gtk::PolicyType::Never,
+
+                                    #[local_ref]
+                                    flow_box -> gtk::FlowBox {
+                                        set_valign: gtk::Align::Start,
+                                        set_selection_mode: gtk::SelectionMode::Single,
+                                        set_homogeneous: true,
+                                        set_column_spacing: 8,
+                                        set_row_spacing: 8,
+                                        set_margin_all: 8,
+                                        connect_child_activated[sender, images] => move |_, child| {
+                                            let idx = child.index();
+                                            if idx >= 0 {
+                                                if let Some(path) = images.borrow().get(idx as usize) {
+                                                    sender.input(AppMsg::OpenInEditor(path.clone()));
+                                                }
+                                            }
+                                        },
+                                    },
+                                },
                             },
                         },
                     },
@@ -504,6 +567,10 @@ impl Component for AppModel {
             original_tex: None,
             showing_original: false,
             exif_label: gtk::Label::new(None),
+            all_images: Vec::new(),
+            raw_filter: library::RawFilter::All,
+            sort_by: library::SortBy::Name,
+            last_folder: load_last_folder(),
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -522,6 +589,77 @@ impl Component for AppModel {
         model.exif_label.set_hexpand(true);
         model.exif_label.set_margin_end(8);
         widgets.editor_toolbar.append(&model.exif_label);
+
+        // Library toolbar: raw filter + sort DropDowns.
+        let filter_dd = gtk::DropDown::from_strings(&[
+            "All", "Raw only", "Non-raw only", "Prefer raw",
+        ]);
+        {
+            let sender = sender.clone();
+            filter_dd.connect_selected_notify(move |dd| {
+                let f = match dd.selected() {
+                    1 => library::RawFilter::RawOnly,
+                    2 => library::RawFilter::NonRawOnly,
+                    3 => library::RawFilter::PreferRaw,
+                    _ => library::RawFilter::All,
+                };
+                sender.input(AppMsg::FilterChanged(f));
+            });
+        }
+        let sort_lbl = gtk::Label::new(Some("Sort"));
+        sort_lbl.add_css_class("caption");
+        let sort_dd = gtk::DropDown::from_strings(&["Name", "Newest", "Oldest"]);
+        {
+            let sender = sender.clone();
+            sort_dd.connect_selected_notify(move |dd| {
+                let s = match dd.selected() {
+                    1 => library::SortBy::DateNewest,
+                    2 => library::SortBy::DateOldest,
+                    _ => library::SortBy::Name,
+                };
+                sender.input(AppMsg::SortChanged(s));
+            });
+        }
+        widgets.lib_toolbar.append(&filter_dd);
+        widgets.lib_toolbar.append(&sort_lbl);
+        widgets.lib_toolbar.append(&sort_dd);
+
+        // Welcome screen: splash background + brand + Open / Continue buttons.
+        let welcome = gtk::Overlay::new();
+        if let Some(tex) = splash_texture() {
+            let pic = gtk::Picture::for_paintable(&tex);
+            pic.set_content_fit(gtk::ContentFit::Cover);
+            welcome.set_child(Some(&pic));
+        }
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        card.add_css_class("osd");
+        card.set_halign(gtk::Align::Center);
+        card.set_valign(gtk::Align::Center);
+        card.set_margin_all(24);
+        card.set_size_request(280, -1);
+        let brand = gtk::Label::new(Some("RapidRAW"));
+        brand.add_css_class("title-1");
+        let open_btn = gtk::Button::with_label("Open Folder");
+        open_btn.add_css_class("pill");
+        open_btn.add_css_class("suggested-action");
+        {
+            let sender = sender.clone();
+            open_btn.connect_clicked(move |_| sender.input(AppMsg::OpenFolderDialog));
+        }
+        let cont_btn = gtk::Button::with_label("Continue session");
+        cont_btn.add_css_class("pill");
+        cont_btn.set_visible(model.last_folder.is_some());
+        {
+            let sender = sender.clone();
+            cont_btn.connect_clicked(move |_| sender.input(AppMsg::ContinueSession));
+        }
+        card.append(&brand);
+        card.append(&open_btn);
+        card.append(&cont_btn);
+        welcome.add_overlay(&card);
+        widgets.lib_stack.add_named(&welcome, Some("welcome"));
+        widgets.lib_stack.set_visible_child_name("welcome");
+
         // Undo/redo keyboard shortcuts (Ctrl+Z / Ctrl+Shift+Z, plus Ctrl+Y).
         let key = gtk::EventControllerKey::new();
         {
@@ -586,30 +724,26 @@ impl Component for AppModel {
             }
             AppMsg::FolderChosen(path) => {
                 log::info!("Folder chosen: {}", path.display());
-                self.images = library::scan_dir(&path);
-                *self.images_shared.borrow_mut() = self.images.clone();
-                log::info!("{} images", self.images.len());
+                self.all_images = library::scan_dir(&path);
+                log::info!("{} images", self.all_images.len());
+                save_last_folder(&path);
+                self.last_folder = Some(path.clone());
                 self.session.current_folder = Some(path);
-
-                // Rebuild the thumbnail grid: one placeholder cell per image.
-                let mut guard = self.thumbs.guard();
-                guard.clear();
-                for p in &self.images {
-                    guard.push_back(p.clone());
+                widgets.lib_stack.set_visible_child_name("grid");
+                self.apply_library(&sender);
+            }
+            AppMsg::ContinueSession => {
+                if let Some(p) = self.last_folder.clone() {
+                    sender.input(AppMsg::FolderChosen(p));
                 }
-                drop(guard);
-
-                // New generation; decode every thumbnail in the background.
-                self.thumb_loaded = vec![false; self.images.len()];
-                let gen = self.thumb_gen.fetch_add(1, Ordering::Relaxed) + 1;
-                dispatch_thumbs(
-                    &sender,
-                    &self.thumb_gen,
-                    gen,
-                    self.settings.thumb_dim,
-                    &self.images,
-                    0..self.images.len(),
-                );
+            }
+            AppMsg::FilterChanged(f) => {
+                self.raw_filter = f;
+                self.apply_library(&sender);
+            }
+            AppMsg::SortChanged(s) => {
+                self.sort_by = s;
+                self.apply_library(&sender);
             }
             AppMsg::OpenInEditor(path) => {
                 log::info!("Open in editor: {}", path.display());
@@ -1048,6 +1182,36 @@ fn install_app_css() {
             );
         }
     });
+}
+
+/// Path of the file storing the last opened folder (for "Continue session").
+fn state_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rapidraw-relm4").join("last_folder"))
+}
+
+fn save_last_folder(p: &std::path::Path) {
+    if let Some(f) = state_file() {
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(f, p.to_string_lossy().as_bytes());
+    }
+}
+
+fn load_last_folder() -> Option<PathBuf> {
+    let s = std::fs::read_to_string(state_file()?).ok()?;
+    let p = PathBuf::from(s.trim());
+    p.is_dir().then_some(p)
+}
+
+/// The embedded splash image (welcome screen background), as a texture.
+fn splash_texture() -> Option<gdk::MemoryTexture> {
+    let bytes = include_bytes!("../../public/splash-grey.jpg");
+    let img = image::load_from_memory(bytes).ok()?;
+    Some(library::texture_from_rgba(&img.to_rgba8()))
 }
 
 /// Identity comparison for the active LUT (shared `Arc`, or both absent).

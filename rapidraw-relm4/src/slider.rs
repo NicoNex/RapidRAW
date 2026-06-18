@@ -70,12 +70,12 @@ pub enum Track {
     },
 }
 
-const AREA_H: i32 = 20;
-const TRACK_H: f64 = 6.0;
-const THUMB_R: f64 = 6.5;
+const AREA_H: i32 = 22;
+const TRACK_H: f64 = 5.0;
+const THUMB_R: f64 = 7.0;
 const FINE: f64 = 0.2;
-/// Fill overlay colour (semi-transparent accent), drawn over the track.
-const ACCENT: (f64, f64, f64, f64) = (0.40, 0.62, 1.0, 0.55);
+/// Adwaita accent blue (`@accent_bg_color`) for the fill highlight.
+const ACCENT: (f64, f64, f64) = (0.207, 0.517, 0.894);
 
 /// Build a slider row. `on_change` receives the snapped UI value on every change.
 #[allow(clippy::too_many_arguments)]
@@ -329,7 +329,8 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, min: f64, max: f64, default: f64, v
     }
     cr.restore().ok();
 
-    // Fill overlay: from the default position to the current value.
+    // Fill overlay: from the default position to the current value. Solid accent
+    // on a plain track; translucent over a gradient so the gradient still reads.
     let o = ((default - min) / (max - min)).clamp(0.0, 1.0);
     let v = ((value - min) / (max - min)).clamp(0.0, 1.0);
     let (x0, x1) = (o.min(v) * wf, o.max(v) * wf);
@@ -338,19 +339,23 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, min: f64, max: f64, default: f64, v
         cr.save().ok();
         cr.clip();
         cr.rectangle(x0, ty, x1 - x0, TRACK_H);
-        let (rr, gg, bb, aa) = ACCENT;
+        let (rr, gg, bb) = ACCENT;
+        let aa = if matches!(track, Track::Plain) { 1.0 } else { 0.45 };
         cr.set_source_rgba(rr, gg, bb, aa);
         cr.fill().ok();
         cr.restore().ok();
     }
 
-    // Thumb.
+    // Thumb: soft drop shadow, white knob, subtle border (libadwaita-like).
     let tx = (v * wf).clamp(THUMB_R, wf - THUMB_R);
-    cr.arc(tx, cy, THUMB_R, 0.0, TAU);
-    cr.set_source_rgb(0.95, 0.95, 0.97);
+    cr.arc(tx, cy + 0.5, THUMB_R, 0.0, TAU);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.20);
     cr.fill().ok();
     cr.arc(tx, cy, THUMB_R, 0.0, TAU);
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+    cr.set_source_rgb(0.98, 0.98, 0.99);
+    cr.fill().ok();
+    cr.arc(tx, cy, THUMB_R, 0.0, TAU);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.18);
     cr.set_line_width(1.0);
     cr.stroke().ok();
 }

@@ -9,6 +9,75 @@ const EXT: &[&str] = &[
     "dng", "rw2", "pef", "srw", "3fr", "mef",
 ];
 
+const RAW_EXT: &[&str] = &[
+    "raw", "arw", "cr2", "cr3", "nef", "orf", "raf", "dng", "rw2", "pef", "srw", "3fr", "mef",
+];
+
+/// Library raw-status filter, mirroring the original `RawStatus`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RawFilter {
+    All,
+    RawOnly,
+    NonRawOnly,
+    /// Prefer raw: hide a non-raw file when a raw with the same stem exists.
+    PreferRaw,
+}
+
+/// Library sort order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortBy {
+    Name,
+    DateNewest,
+    DateOldest,
+}
+
+/// True if `p` has a raw file extension.
+pub fn is_raw(p: &Path) -> bool {
+    p.extension()
+        .and_then(|x| x.to_str())
+        .map(|x| RAW_EXT.contains(&x.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn stem(p: &Path) -> String {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+/// Apply the raw filter then the sort order to a scanned image list.
+pub fn arrange(all: &[PathBuf], filter: RawFilter, sort: SortBy) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = match filter {
+        RawFilter::All => all.to_vec(),
+        RawFilter::RawOnly => all.iter().filter(|p| is_raw(p)).cloned().collect(),
+        RawFilter::NonRawOnly => all.iter().filter(|p| !is_raw(p)).cloned().collect(),
+        RawFilter::PreferRaw => {
+            let raw_stems: std::collections::HashSet<String> =
+                all.iter().filter(|p| is_raw(p)).map(|p| stem(p)).collect();
+            all.iter()
+                .filter(|p| is_raw(p) || !raw_stems.contains(&stem(p)))
+                .cloned()
+                .collect()
+        }
+    };
+    match sort {
+        SortBy::Name => v.sort(),
+        SortBy::DateNewest | SortBy::DateOldest => {
+            let mtime = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            v.sort_by(|a, b| {
+                let (ma, mb) = (mtime(a), mtime(b));
+                if sort == SortBy::DateNewest {
+                    mb.cmp(&ma).then(a.cmp(b))
+                } else {
+                    ma.cmp(&mb).then(a.cmp(b))
+                }
+            });
+        }
+    }
+    v
+}
+
 /// Scan a directory (non-recursively) for supported image/RAW files, sorted.
 pub fn scan_dir(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
