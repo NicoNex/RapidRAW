@@ -71,14 +71,28 @@ impl ExportFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeMode {
+    LongEdge,
+    Width,
+    Height,
+}
+
+/// Resize on export: target `value` px for `mode`, optionally never upscaling.
+#[derive(Debug, Clone, Copy)]
+pub struct Resize {
+    pub mode: ResizeMode,
+    pub value: u32,
+    pub dont_enlarge: bool,
+}
+
 /// Output options for export.
 #[derive(Debug, Clone, Copy)]
 pub struct ExportOpts {
     pub format: ExportFormat,
     /// JPEG quality 1..=100 (ignored for PNG/TIFF).
     pub quality: u8,
-    /// Optional resize: clamp the longest edge to this many px.
-    pub resize: Option<u32>,
+    pub resize: Option<Resize>,
 }
 
 /// A slider change: a setter that writes one `GlobalAdjustments` field plus the
@@ -1151,12 +1165,30 @@ impl Component for AppModel {
                 qrow.append(&qlabel);
                 qrow.append(&q);
 
-                // Resize: 0 = full resolution.
-                let resize = gtk::SpinButton::with_range(0.0, 20000.0, 100.0);
-                resize.set_value(0.0);
+                // Resize: mode + value (0 = full) + don't-enlarge.
+                let resize_mode = gtk::DropDown::from_strings(&["No resize", "Long edge", "Width", "Height"]);
+                let resize = gtk::SpinButton::with_range(1.0, 20000.0, 100.0);
+                resize.set_value(2048.0);
+                let dont_enlarge = gtk::CheckButton::with_label("Don't enlarge");
+                dont_enlarge.set_active(true);
                 let rrow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                rrow.append(&gtk::Label::new(Some("Resize long edge (0=full)")));
+                rrow.append(&gtk::Label::new(Some("Resize")));
+                rrow.append(&resize_mode);
                 rrow.append(&resize);
+                let rrow2 = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                rrow2.append(&dont_enlarge);
+                {
+                    // value + don't-enlarge only relevant when a resize mode is set.
+                    let resize = resize.clone();
+                    let dont_enlarge = dont_enlarge.clone();
+                    let update = move |d: &gtk::DropDown| {
+                        let on = d.selected() != 0;
+                        resize.set_sensitive(on);
+                        dont_enlarge.set_sensitive(on);
+                    };
+                    update(&resize_mode);
+                    resize_mode.connect_selected_notify(update);
+                }
 
                 // Reactively show settings relevant to the selected format.
                 {
@@ -1164,10 +1196,13 @@ impl Component for AppModel {
                     let rrow = rrow.clone();
                     let qlabel = qlabel.clone();
                     let q = q.clone();
+                    let rrow2 = rrow2.clone();
                     let update = move |d: &gtk::DropDown| {
                         let f = idx_to_format(d.selected());
+                        let raster = !matches!(f, ExportFormat::CubeLut);
                         qrow.set_visible(f.has_quality());
-                        rrow.set_visible(!matches!(f, ExportFormat::CubeLut));
+                        rrow.set_visible(raster);
+                        rrow2.set_visible(raster);
                         // JXL at 100 = lossless.
                         qlabel.set_text(if matches!(f, ExportFormat::Jxl) && q.value() >= 100.0 {
                             "Quality (lossless)"
@@ -1184,6 +1219,7 @@ impl Component for AppModel {
                 vb.append(&fmt);
                 vb.append(&qrow);
                 vb.append(&rrow);
+                vb.append(&rrow2);
                 vb.append(&go);
                 win.set_child(Some(&vb));
 
@@ -1196,11 +1232,21 @@ impl Component for AppModel {
                         sender.input(AppMsg::ExportLutDialog);
                         return;
                     }
-                    let r = resize.value() as u32;
+                    let resize = match resize_mode.selected() {
+                        1 => Some(ResizeMode::LongEdge),
+                        2 => Some(ResizeMode::Width),
+                        3 => Some(ResizeMode::Height),
+                        _ => None,
+                    }
+                    .map(|mode| Resize {
+                        mode,
+                        value: resize.value() as u32,
+                        dont_enlarge: dont_enlarge.is_active(),
+                    });
                     sender.input(AppMsg::ExportConfigured(ExportOpts {
                         format,
                         quality: q.value() as u8,
-                        resize: (r > 0).then_some(r),
+                        resize,
                     }));
                 });
                 win.present();
@@ -1629,13 +1675,35 @@ fn encode_image(
 ) -> Result<(), String> {
     use image::GenericImageView;
     let img = match opts.resize {
-        Some(m) if img.dimensions().0.max(img.dimensions().1) > m => {
-            img.resize(m, m, image::imageops::FilterType::Lanczos3)
-        }
-        _ => img.clone(),
+        Some(r) => resize_for_export(img, r),
+        None => img.clone(),
     };
     let bytes = encode_image_to_bytes(&img, opts.format, opts.quality)?;
     std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+/// Resize `img` per the export resize options (aspect-preserving; honours
+/// "don't enlarge"). Uses a large bound on the free axis for Width/Height so the
+/// constrained axis lands exactly on `value`.
+fn resize_for_export(img: &DynamicImage, r: Resize) -> DynamicImage {
+    use image::GenericImageView;
+    let (w, h) = img.dimensions();
+    if r.dont_enlarge {
+        let exceeds = match r.mode {
+            ResizeMode::LongEdge => r.value < w.max(h),
+            ResizeMode::Width => r.value < w,
+            ResizeMode::Height => r.value < h,
+        };
+        if !exceeds {
+            return img.clone();
+        }
+    }
+    let f = image::imageops::FilterType::Lanczos3;
+    match r.mode {
+        ResizeMode::LongEdge => img.resize(r.value, r.value, f),
+        ResizeMode::Width => img.resize(r.value, u32::MAX, f),
+        ResizeMode::Height => img.resize(u32::MAX, r.value, f),
+    }
 }
 
 /// Encode `img` to bytes for `format` (mirrors the original `export_processing`).
