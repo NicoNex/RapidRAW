@@ -991,6 +991,9 @@ impl Component for AppModel {
         {
             let sender = sender.clone();
             let root_w = root.clone();
+            let nav = widgets.nav.clone();
+            let search_btn = widgets.search_btn.clone();
+            let search_entry = search.clone();
             key.connect_key_pressed(move |_, keyval, _, state| {
                 if !state.contains(gdk::ModifierType::CONTROL_MASK) {
                     // 0..5 set the star rating — unless a text field has focus
@@ -1014,6 +1017,19 @@ impl Component for AppModel {
                     gdk::Key::y => {
                         sender.input(AppMsg::Redo);
                         glib::Propagation::Stop
+                    }
+                    // Ctrl+F: open library search (library page only).
+                    gdk::Key::f => {
+                        let in_lib = nav
+                            .visible_page()
+                            .and_then(|p| p.tag())
+                            .map_or(true, |t| t != "editor");
+                        if in_lib {
+                            search_btn.set_active(true);
+                            search_entry.grab_focus();
+                            return glib::Propagation::Stop;
+                        }
+                        glib::Propagation::Proceed
                     }
                     _ => glib::Propagation::Proceed,
                 }
