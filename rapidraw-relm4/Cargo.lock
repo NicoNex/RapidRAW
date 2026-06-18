@@ -2592,6 +2592,7 @@ dependencies = [
  "gdk4",
  "gtk4",
  "image",
+ "kamadak-exif",
  "libadwaita",
  "log",
  "rapidraw-core",

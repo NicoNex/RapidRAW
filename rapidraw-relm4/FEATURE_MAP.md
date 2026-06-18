@@ -39,7 +39,7 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 | Feature | Status | Notes |
 |--------|--------|-------|
 | Point curve editor (Luma/R/G/B) | ✅ | `curves.rs` |
-| **Parametric curve** (highlights/lights/darks/shadows + black/white level + splits) | ❌ | per-channel `ParametricCurveSettings`; original blends parametric into the point curve |
+| **Parametric curve** (highlights/lights/darks/shadows + black/white level) | ✅ | `curves.rs` Point/Parametric mode toggle; splits fixed at 25/50/75 ⚠️ |
 | Copy/paste curve | ❌ | |
 
 ### Color (`adjustments/Color.tsx`)
@@ -49,7 +49,7 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 | Presence: Vibrance, Saturation, Hue | ✅ | Hue gradient track ✅ |
 | Color Grading wheels (Shadows/Midtones/Highlights/Global) | ✅ | `colorwheel.rs` |
 | Color Grading: Blending, Balance | ✅ | |
-| HSL 8 bands (Hue/Sat/Lum) | ✅ | Hue band gradient ✅; Sat/Lum gradients ⚠️ (still plain — they depend on live hue/sat, need CSS-var-style dynamic ramp) |
+| HSL 8 bands (Hue/Sat/Lum) | ✅ | Hue + Sat + Lum gradient tracks ✅ (sat/lum follow live band hue/sat) |
 | Calibration (shadow tint, R/G/B hue+sat) | ✅ | |
 
 ### Details (`adjustments/Details.tsx`)
@@ -70,11 +70,11 @@ Adjustments / Crop / (later) Masks etc. are selectable.
 | Feature | Status | Notes |
 |--------|--------|-------|
 | Fill from **default** position (centre-origin for bipolar) | ✅ | `slider.rs` |
-| Gradient tracks (temp/tint/hue/HSL-hue) | ✅ | colours copied from `styles.css`; HSL sat/lum still plain ⚠️ |
-| Double-click / label-click to reset | ✅ | `slider.rs` |
+| Gradient tracks (temp/tint/hue/HSL hue+sat+lum) | ✅ | colours from `styles.css` |
+| Reset: dedicated button + double-click + label-click | ✅ | `slider.rs` |
 | Drag, wheel (forwarded to scroll panel) | ✅ | |
-| Shift = fine adjust | ❌ | |
-| Click value to type exact number | ❌ | |
+| Shift = fine adjust | ✅ | |
+| Click value to type exact number | ✅ | |
 
 ---
 
@@ -95,11 +95,11 @@ flipHorizontal, flipVertical, orientationSteps` — wire UI to them.
 | Feature | Status | Notes |
 |--------|--------|-------|
 | Back to library | ✅ | |
-| **Undo / Redo** (Ctrl+Z / Ctrl+Shift+Z) | ❌ | snapshot the adjustments struct on each change |
+| **Undo / Redo** (Ctrl+Z / Ctrl+Shift+Z, Ctrl+Y) | ✅ | `main.rs` history stack; ⚠️ colour-wheel/curve UI widgets don't re-sync on undo (render is correct) |
 | Adjustments history dropdown | ❌ | |
-| **Show original** (before/after toggle) | ❌ | render base (or default adjustments) while held/toggled |
+| **Show original** (before/after toggle) | ✅ | toolbar toggle, preview-size original |
 | Fullscreen | ❌ | |
-| EXIF readout (shutter/aperture/iso/focal/date) | ❌ | |
+| EXIF readout (shutter/aperture/iso/focal/date) | ✅ | `meta.rs` (kamadak-exif), shown right in toolbar |
 | Copy / paste settings between photos | ❌ | |
 
 ---
@@ -135,7 +135,9 @@ flipHorizontal, flipVertical, orientationSteps` — wire UI to them.
 5. ❌ Default/splash photo on the home screen.
 6. ❌ Continue session (reopen last folder).
 7. ❌ Library raw filter (all / raw only / non-raw / prefer raw).
-8. ❌ Curves: parametric mode.
-9. ❌ Crop panel/section (right-rail selectable).
-10. ❌ Undo/redo (Ctrl+Z / Ctrl+Shift+Z) + show-original toggle.
+8. ✅ Curves: parametric mode.
+9. ❌ Crop panel/section (right-rail switcher) — **next**.
+10. ✅ Undo/redo (Ctrl+Z / Ctrl+Shift+Z) + show-original toggle.
 11. ✅ This file.
+12. ✅ Slider: shift=fine, click-value-to-type, dedicated reset button, HSL sat/lum gradients.
+13. ✅ EXIF readout in editor toolbar.

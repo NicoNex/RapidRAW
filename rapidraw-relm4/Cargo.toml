@@ -11,5 +11,6 @@ gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 gdk = { version = "0.9", package = "gdk4" }
 image = "0.25.10"
 bytemuck = "1"
+kamadak-exif = "0.6"
 log = "0.4"
 env_logger = "0.11"

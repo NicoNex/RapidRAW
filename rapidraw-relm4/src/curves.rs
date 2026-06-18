@@ -34,41 +34,97 @@ const HIT_RADIUS: f64 = 10.0;
 /// Number of x samples used to draw the smooth curve.
 const SAMPLES: usize = 128;
 
-/// Per-channel control points in the 0..255 domain, kept sorted by x.
+fn ch_idx(ch: Channel) -> usize {
+    match ch {
+        Channel::Luma => 0,
+        Channel::Red => 1,
+        Channel::Green => 2,
+        Channel::Blue => 3,
+    }
+}
+
+/// Parametric curve regions (each -100..100), plus black/white level offsets.
+/// Ported from the original `ParametricCurveSettings` / `buildParametricPoints`.
+#[derive(Clone, Copy, Default)]
+struct ParamSettings {
+    highlights: f64,
+    lights: f64,
+    darks: f64,
+    shadows: f64,
+    whites: f64,
+    blacks: f64,
+}
+
+/// Per-channel manual control points (0..255, sorted by x) and parametric
+/// settings. The active curve sent to the engine is the parametric one in
+/// parametric mode, else the manual points.
 struct State {
-    luma: Vec<(f64, f64)>,
-    red: Vec<(f64, f64)>,
-    green: Vec<(f64, f64)>,
-    blue: Vec<(f64, f64)>,
+    points: [Vec<(f64, f64)>; 4],
+    param: [ParamSettings; 4],
 }
 
 impl State {
     fn new() -> Self {
         let identity = || vec![(0.0, 0.0), (255.0, 255.0)];
         Self {
-            luma: identity(),
-            red: identity(),
-            green: identity(),
-            blue: identity(),
+            points: [identity(), identity(), identity(), identity()],
+            param: [ParamSettings::default(); 4],
         }
     }
 
     fn points(&self, ch: Channel) -> &Vec<(f64, f64)> {
-        match ch {
-            Channel::Luma => &self.luma,
-            Channel::Red => &self.red,
-            Channel::Green => &self.green,
-            Channel::Blue => &self.blue,
-        }
+        &self.points[ch_idx(ch)]
     }
 
     fn points_mut(&mut self, ch: Channel) -> &mut Vec<(f64, f64)> {
-        match ch {
-            Channel::Luma => &mut self.luma,
-            Channel::Red => &mut self.red,
-            Channel::Green => &mut self.green,
-            Channel::Blue => &mut self.blue,
-        }
+        &mut self.points[ch_idx(ch)]
+    }
+}
+
+/// Port of the original `buildParametricPoints` (splits fixed at 25/50/75).
+fn build_parametric(s: &ParamSettings) -> Vec<(f64, f64)> {
+    let (v_h, v_l, v_d, v_s) = (
+        s.highlights / 100.0,
+        s.lights / 100.0,
+        s.darks / 100.0,
+        s.shadows / 100.0,
+    );
+    let (s1, s2, s3) = (0.25, 0.50, 0.75);
+    let x_h = (s3 + 1.0) / 2.0;
+    let x_s = s1 / 2.0;
+    let xs = [0.0, x_s, s1, s2, s3, x_h, 1.0];
+
+    let response = |v: f64, x: f64| {
+        let headroom = if v >= 0.0 { 1.0 - x } else { x };
+        (v * 1.2).tanh() * 0.35 * headroom.sqrt()
+    };
+    let ys = [
+        0.0,
+        x_s + response(v_s, x_s),
+        s1 + (response(v_s, s1) + response(v_d, s1)) / 2.0,
+        s2 + (response(v_d, s2) + response(v_l, s2)) / 2.0,
+        s3 + (response(v_l, s3) + response(v_h, s3)) / 2.0,
+        x_h + response(v_h, x_h),
+        1.0,
+    ];
+
+    let mut pts: Vec<(f64, f64)> = xs
+        .iter()
+        .zip(ys.iter())
+        .map(|(&x, &y)| (x * 255.0, y.clamp(0.0, 1.0) * 255.0))
+        .collect();
+    let last = pts.len() - 1;
+    pts[0].1 = (pts[0].1 + s.blacks).clamp(0.0, 255.0);
+    pts[last].1 = (pts[last].1 + s.whites).clamp(0.0, 255.0);
+    pts
+}
+
+/// The curve currently driving the engine for `ch` (manual or parametric).
+fn active_curve(s: &State, ch: Channel, parametric: bool) -> Vec<(f64, f64)> {
+    if parametric {
+        build_parametric(&s.param[ch_idx(ch)])
+    } else {
+        s.points(ch).clone()
     }
 }
 
@@ -77,12 +133,14 @@ pub struct CurveEditor {
 }
 
 impl CurveEditor {
-    pub fn new(sender: &ComponentSender<crate::AppModel>) -> Self {
+    pub fn new(sender: &ComponentSender<crate::AppModel>, vadj: &gtk::Adjustment) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
 
         let state = Rc::new(RefCell::new(State::new()));
         let active = Rc::new(Cell::new(Channel::Luma));
         let dragging = Rc::new(Cell::new(None::<usize>));
+        // false = manual point curve, true = parametric region sliders.
+        let parametric = Rc::new(Cell::new(false));
 
         let area = gtk::DrawingArea::new();
         area.set_content_width(SIZE);
@@ -100,6 +158,7 @@ impl CurveEditor {
             ("Blue", Channel::Blue),
         ];
         let mut group: Option<gtk::ToggleButton> = None;
+        let mut channel_btns: Vec<(gtk::ToggleButton, Channel)> = Vec::new();
         for (label, ch) in channels {
             let btn = gtk::ToggleButton::with_label(label);
             if let Some(ref g) = group {
@@ -110,32 +169,126 @@ impl CurveEditor {
             if ch == Channel::Luma {
                 btn.set_active(true);
             }
-            {
-                let active = active.clone();
-                let area = area.clone();
-                btn.connect_toggled(move |b| {
-                    if b.is_active() {
-                        active.set(ch);
-                        area.queue_draw();
-                    }
-                });
-            }
             toggles.append(&btn);
+            channel_btns.push((btn, ch));
         }
         root.append(&toggles);
+
+        // Mode toggle: Point vs Parametric.
+        let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        mode_box.add_css_class("linked");
+        mode_box.set_halign(gtk::Align::Center);
+        let point_btn = gtk::ToggleButton::with_label("Point");
+        let param_btn = gtk::ToggleButton::with_label("Parametric");
+        param_btn.set_group(Some(&point_btn));
+        point_btn.set_active(true);
+        mode_box.append(&point_btn);
+        mode_box.append(&param_btn);
+        root.append(&mode_box);
 
         // Draw the active channel's curve, grid, identity diagonal and dots.
         {
             let state = state.clone();
             let active = active.clone();
+            let parametric = parametric.clone();
             area.set_draw_func(move |_, cr, w, h| {
-                let pts = {
-                    let s = state.borrow();
-                    s.points(active.get()).clone()
-                };
-                draw_curve(cr, w, h, &pts);
+                let pts = active_curve(&state.borrow(), active.get(), parametric.get());
+                draw_curve(cr, w, h, &pts, parametric.get());
             });
         }
+
+        // Parametric region sliders (active channel). Built here so their
+        // handles can be reloaded on channel/mode switch.
+        let param_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        param_box.set_margin_start(4);
+        param_box.set_margin_end(4);
+        let param_rows: [(&str, f64, fn(&mut ParamSettings) -> &mut f64); 6] = [
+            ("Highlights", 100.0, |p| &mut p.highlights),
+            ("Lights", 100.0, |p| &mut p.lights),
+            ("Darks", 100.0, |p| &mut p.darks),
+            ("Shadows", 100.0, |p| &mut p.shadows),
+            ("Whites", 50.0, |p| &mut p.whites),
+            ("Blacks", 50.0, |p| &mut p.blacks),
+        ];
+        let mut handles: Vec<crate::slider::SliderHandle> = Vec::new();
+        for (label, range, field) in param_rows {
+            let state = state.clone();
+            let active = active.clone();
+            let parametric = parametric.clone();
+            let area = area.clone();
+            let sender = sender.clone();
+            let (row, _, handle) = crate::slider::slider_ex(
+                label, -range, range, 1.0, 0.0, crate::slider::Track::Plain, vadj,
+                move |v| {
+                    {
+                        let mut s = state.borrow_mut();
+                        *field(&mut s.param[ch_idx(active.get())]) = v;
+                    }
+                    emit_active(&sender, &state, active.get(), parametric.get());
+                    area.queue_draw();
+                },
+            );
+            handles.push(handle);
+            param_box.append(&row);
+        }
+        let handles = Rc::new(handles);
+
+        // Reload the slider UI from the active channel's stored settings.
+        let reload = {
+            let state = state.clone();
+            let active = active.clone();
+            let handles = handles.clone();
+            Rc::new(move || {
+                let p = state.borrow().param[ch_idx(active.get())];
+                let vals = [p.highlights, p.lights, p.darks, p.shadows, p.whites, p.blacks];
+                for (h, v) in handles.iter().zip(vals) {
+                    h.set_ui(v);
+                }
+            })
+        };
+
+        // Channel switch: redraw and (in parametric mode) reload sliders + emit.
+        for (btn, ch) in &channel_btns {
+            let active = active.clone();
+            let area = area.clone();
+            let parametric = parametric.clone();
+            let reload = reload.clone();
+            let state = state.clone();
+            let sender = sender.clone();
+            let ch = *ch;
+            btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    active.set(ch);
+                    if parametric.get() {
+                        reload();
+                        emit_active(&sender, &state, ch, true);
+                    }
+                    area.queue_draw();
+                }
+            });
+        }
+
+        // Mode switch: show/hide sliders, reload, emit the now-active curve.
+        {
+            let parametric = parametric.clone();
+            let param_box = param_box.clone();
+            let area = area.clone();
+            let reload = reload.clone();
+            let state = state.clone();
+            let active = active.clone();
+            let sender = sender.clone();
+            param_btn.connect_toggled(move |b| {
+                let on = b.is_active();
+                parametric.set(on);
+                param_box.set_visible(on);
+                if on {
+                    reload();
+                }
+                emit_active(&sender, &state, active.get(), on);
+                area.queue_draw();
+            });
+        }
+        param_box.set_visible(false);
 
         // Drag: grab the nearest dot on begin, move it on update.
         let drag = gtk::GestureDrag::new();
@@ -147,7 +300,12 @@ impl CurveEditor {
             let state = state.clone();
             let active = active.clone();
             let area = area.clone();
+            let parametric = parametric.clone();
             drag.connect_drag_begin(move |_, x, y| {
+                if parametric.get() {
+                    dragging.set(None);
+                    return;
+                }
                 start.set((x, y));
                 let pts = {
                     let s = state.borrow();
@@ -205,7 +363,11 @@ impl CurveEditor {
             let active = active.clone();
             let area = area.clone();
             let sender = sender.clone();
+            let parametric = parametric.clone();
             click.connect_pressed(move |_, n, x, y| {
+                if parametric.get() {
+                    return;
+                }
                 let ch = active.get();
                 let pts = {
                     let s = state.borrow();
@@ -252,6 +414,7 @@ impl CurveEditor {
         area.add_controller(click);
 
         root.append(&area);
+        root.append(&param_box);
         Self { root }
     }
 
@@ -260,11 +423,25 @@ impl CurveEditor {
     }
 }
 
-/// Forward the active channel's points (as f32 0..255) to the model.
+/// Forward the active channel's manual points (as f32 0..255) to the model.
 fn emit(sender: &ComponentSender<crate::AppModel>, state: &Rc<RefCell<State>>, ch: Channel) {
     let pts: Vec<(f32, f32)> = state
         .borrow()
         .points(ch)
+        .iter()
+        .map(|&(x, y)| (x as f32, y as f32))
+        .collect();
+    sender.input(crate::AppMsg::CurveChanged(ch, pts));
+}
+
+/// Forward whichever curve is active (manual or parametric) for `ch`.
+fn emit_active(
+    sender: &ComponentSender<crate::AppModel>,
+    state: &Rc<RefCell<State>>,
+    ch: Channel,
+    parametric: bool,
+) {
+    let pts: Vec<(f32, f32)> = active_curve(&state.borrow(), ch, parametric)
         .iter()
         .map(|&(x, y)| (x as f32, y as f32))
         .collect();
@@ -388,7 +565,8 @@ fn apply_curve(val: f64, points: &[(f64, f64)]) -> f64 {
 }
 
 /// Render grid, identity diagonal, the smooth curve and the control dots.
-fn draw_curve(cr: &cairo::Context, w: i32, h: i32, pts: &[(f64, f64)]) {
+/// Dots are hidden in parametric mode (the curve isn't directly editable).
+fn draw_curve(cr: &cairo::Context, w: i32, h: i32, pts: &[(f64, f64)], parametric: bool) {
     if w <= 0 || h <= 0 {
         return;
     }
@@ -432,14 +610,16 @@ fn draw_curve(cr: &cairo::Context, w: i32, h: i32, pts: &[(f64, f64)]) {
     }
     let _ = cr.stroke();
 
-    // Control points as draggable dots.
-    for &(x, y) in pts {
-        let (cx, cy) = curve_to_px(wf, hf, x, y);
-        cr.set_source_rgb(0.1, 0.1, 0.1);
-        cr.arc(cx, cy, 5.0, 0.0, TAU);
-        let _ = cr.fill();
-        cr.set_source_rgb(0.95, 0.95, 0.95);
-        cr.arc(cx, cy, 4.0, 0.0, TAU);
-        let _ = cr.fill();
+    // Control points as draggable dots (manual mode only).
+    if !parametric {
+        for &(x, y) in pts {
+            let (cx, cy) = curve_to_px(wf, hf, x, y);
+            cr.set_source_rgb(0.1, 0.1, 0.1);
+            cr.arc(cx, cy, 5.0, 0.0, TAU);
+            let _ = cr.fill();
+            cr.set_source_rgb(0.95, 0.95, 0.95);
+            cr.arc(cx, cy, 4.0, 0.0, TAU);
+            let _ = cr.fill();
+        }
     }
 }

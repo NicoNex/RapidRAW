@@ -89,12 +89,14 @@ pub fn slider(
     vadj: &gtk::Adjustment,
     on_change: impl Fn(f64) + 'static,
 ) -> gtk::Box {
-    slider_ex(label, min, max, step, default, track, vadj, on_change).0
+    let (root, _, _) = slider_ex(label, min, max, step, default, track, vadj, on_change);
+    root
 }
 
-/// Like [`slider`], but also returns the track `DrawingArea` so callers can
+/// Like [`slider`], but also returns the track `DrawingArea` (so callers can
 /// `queue_draw()` it when a *sibling* slider changes a value its gradient
-/// depends on (HSL sat/lum tracks follow the band's hue/sat).
+/// depends on — HSL sat/lum tracks follow the band's hue/sat) and a
+/// [`SliderHandle`] (to read/set the value externally, e.g. on channel switch).
 #[allow(clippy::too_many_arguments)]
 pub fn slider_ex(
     label: &str,
@@ -105,7 +107,7 @@ pub fn slider_ex(
     track: Track,
     vadj: &gtk::Adjustment,
     on_change: impl Fn(f64) + 'static,
-) -> (gtk::Box, gtk::DrawingArea) {
+) -> (gtk::Box, gtk::DrawingArea, SliderHandle) {
     let decimals = if step < 1.0 { 2 } else { 0 };
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
@@ -281,18 +283,19 @@ pub fn slider_ex(
             area.queue_draw();
         })
     };
+    let handle = SliderHandle {
+        value: value.clone(),
+        set_ui,
+    };
     REG.with(|r| {
         if let Some(list) = r.borrow_mut().as_mut() {
-            list.push(SliderHandle {
-                value: value.clone(),
-                set_ui,
-            });
+            list.push(handle.clone());
         }
     });
 
     root.append(&header);
     root.append(&area);
-    (root, area)
+    (root, area, handle)
 }
 
 fn fmt(v: f64, decimals: usize) -> String {

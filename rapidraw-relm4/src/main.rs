@@ -16,6 +16,7 @@ mod controls;
 mod curves;
 mod editor;
 mod library;
+mod meta;
 mod scopes;
 mod settings;
 mod slider;
@@ -231,6 +232,8 @@ struct AppModel {
     original_tex: Option<gdk::MemoryTexture>,
     /// Whether the before/after view is currently showing the original.
     showing_original: bool,
+    /// EXIF readout shown in the editor toolbar.
+    exif_label: gtk::Label,
 }
 
 impl AppModel {
@@ -420,6 +423,7 @@ impl Component for AppModel {
                     add_named[Some("editor")] = &gtk::Box {
                         set_orientation: gtk::Orientation::Vertical,
 
+                        #[name = "editor_toolbar"]
                         gtk::Box {
                             set_orientation: gtk::Orientation::Horizontal,
                             set_spacing: 4,
@@ -498,6 +502,7 @@ impl Component for AppModel {
             last_tex: None,
             original_tex: None,
             showing_original: false,
+            exif_label: gtk::Label::new(None),
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -508,6 +513,13 @@ impl Component for AppModel {
         let images = model.images_shared.clone();
         let widgets = view_output!();
         model.toasts = widgets.toast_overlay.clone();
+        // EXIF readout, right-aligned in the editor toolbar.
+        model.exif_label.add_css_class("caption");
+        model.exif_label.add_css_class("dim-label");
+        model.exif_label.set_halign(gtk::Align::End);
+        model.exif_label.set_hexpand(true);
+        model.exif_label.set_margin_end(8);
+        widgets.editor_toolbar.append(&model.exif_label);
         // Undo/redo keyboard shortcuts (Ctrl+Z / Ctrl+Shift+Z, plus Ctrl+Y).
         let key = gtk::EventControllerKey::new();
         {
@@ -926,6 +938,8 @@ impl Component for AppModel {
             CmdMsg::BaseReady(path, img) => {
                 let (w, h) = img.dimensions();
                 log::info!("base image ready: {} ({w}x{h})", path.display());
+                self.exif_label
+                    .set_text(&meta::read_summary(&path).unwrap_or_default());
                 // Start each image from defaults (unless disabled in settings),
                 // rebuilding the panel so the controls reflect the reset.
                 if self.settings.reset_on_open {

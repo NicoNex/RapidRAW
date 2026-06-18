@@ -169,7 +169,7 @@ impl AdjustPanel {
         let vadj = root.vadjustment();
 
         crate::slider::reg_begin();
-        let curves = CurveEditor::new(sender);
+        let curves = CurveEditor::new(sender, &vadj);
         list.append(&card(&expander("Curves", curves.root(), true)));
         list.append(&card(&section("Basic", BASIC, sender, &vadj)));
         list.append(&card(&build_color(sender, &vadj)));
@@ -364,12 +364,12 @@ fn build_hsl(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk:
 
         // Build luminance and saturation first so the hue/sat callbacks can
         // redraw them when their dependent gradients change.
-        let (lum_box, lum_area) = slider_ex(
+        let (lum_box, lum_area, _) = slider_ex(
             "Luminance", -100.0, 100.0, 1.0, 0.0,
             Track::HslLum { base: center, hue: hue_cell.clone(), sat: sat_cell.clone() },
             vadj, adjust(lum_set, 100.0, sender.clone()),
         );
-        let (sat_box, sat_area) = {
+        let (sat_box, sat_area, _) = {
             let lum_area = lum_area.clone();
             let sat_cell = sat_cell.clone();
             let emit = adjust(sat_set, 100.0, sender.clone());
@@ -384,7 +384,7 @@ fn build_hsl(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk:
                 },
             )
         };
-        let (hue_box, _) = {
+        let (hue_box, _, _) = {
             let sat_area = sat_area.clone();
             let lum_area = lum_area.clone();
             let hue_cell = hue_cell.clone();
