@@ -18,6 +18,7 @@ mod editor;
 mod library;
 mod scopes;
 mod settings;
+mod slider;
 mod state;
 mod thumb;
 use controls::AdjustPanel;

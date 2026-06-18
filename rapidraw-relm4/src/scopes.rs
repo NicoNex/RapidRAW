@@ -51,12 +51,22 @@ pub struct Scopes {
 impl Scopes {
     pub fn new() -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        // Inset to line up edge-to-edge with the `.card` widgets in the panel
+        // below (their container has a 6px margin).
+        root.set_margin_start(6);
+        root.set_margin_end(6);
+        root.set_margin_top(6);
         let data = Rc::new(RefCell::new(Data::empty()));
         let mode = Rc::new(Cell::new(Mode::Histogram));
 
         let area = gtk::DrawingArea::new();
         area.set_content_height(110);
         area.set_hexpand(true);
+        // Rounded corners: clip the cairo fill to a rounded rect so the scope
+        // matches the `.card` widgets below it.
+        install_scope_css();
+        area.add_css_class("scope-area");
+        area.set_overflow(gtk::Overflow::Hidden);
         {
             let data = data.clone();
             let mode = mode.clone();
@@ -147,6 +157,23 @@ impl Default for Scopes {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Install the rounded-corner CSS for the scope area once for the default display.
+fn install_scope_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(".scope-area { border-radius: 12px; }");
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
 }
 
 fn draw(cr: &cairo::Context, w: i32, h: i32, d: &Data, mode: Mode) {

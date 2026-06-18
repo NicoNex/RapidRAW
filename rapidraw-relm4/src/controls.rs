@@ -12,6 +12,7 @@ use relm4::{ComponentSender, RelmWidgetExt};
 
 use crate::colorwheel::ColorWheel;
 use crate::curves::CurveEditor;
+use crate::slider::{slider, Track};
 use crate::{AppModel, AppMsg};
 use rapidraw_core::image_processing::GlobalAdjustments;
 
@@ -230,7 +231,9 @@ fn append_rows(
     vadj: &gtk::Adjustment,
 ) {
     for &(label, min, max, step, scale, default, set) in rows {
-        body.append(&build_row(label, min, max, step, scale, default, set, sender, vadj));
+        body.append(&build_row(
+            label, min, max, step, scale, default, set, Track::Plain, sender, vadj,
+        ));
     }
 }
 
@@ -239,10 +242,24 @@ fn build_color(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gt
     body.set_margin_all(4);
 
     body.append(&subheader("White Balance"));
-    append_rows(&body, COLOR_WB, sender, vadj);
+    for &(label, min, max, step, scale, default, set) in COLOR_WB {
+        let track = match label {
+            "Temperature" => Track::Temperature,
+            "Tint" => Track::Tint,
+            _ => Track::Plain,
+        };
+        body.append(&build_row(
+            label, min, max, step, scale, default, set, track, sender, vadj,
+        ));
+    }
 
     body.append(&subheader("Presence"));
-    append_rows(&body, COLOR_PRESENCE, sender, vadj);
+    for &(label, min, max, step, scale, default, set) in COLOR_PRESENCE {
+        let track = if label == "Hue" { Track::Hue } else { Track::Plain };
+        body.append(&build_row(
+            label, min, max, step, scale, default, set, track, sender, vadj,
+        ));
+    }
 
     body.append(&subheader("Color Grading"));
     body.append(&build_grading(sender, vadj));
@@ -300,17 +317,25 @@ fn build_grading(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> 
     wrap
 }
 
+/// Band centre hue (deg), matching `src/styles.css` HSL mixer gradients, in the
+/// same order as `HSL_BANDS`.
+const HSL_CENTERS: [f64; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 340.0];
+
 fn build_hsl(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Box {
     let wrap = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    for &(band, hue_set, sat_set, lum_set) in HSL_BANDS {
+    for (i, &(band, hue_set, sat_set, lum_set)) in HSL_BANDS.iter().enumerate() {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
         body.set_margin_all(4);
-        let rows: [Row; 3] = [
-            ("Hue", -100.0, 100.0, 1.0, HSL_HUE_SCALE, 0.0, hue_set),
-            ("Saturation", -100.0, 100.0, 1.0, 100.0, 0.0, sat_set),
-            ("Luminance", -100.0, 100.0, 1.0, 100.0, 0.0, lum_set),
-        ];
-        append_rows(&body, &rows, sender, vadj);
+        body.append(&build_row(
+            "Hue", -100.0, 100.0, 1.0, HSL_HUE_SCALE, 0.0, hue_set,
+            Track::HslHue(HSL_CENTERS[i]), sender, vadj,
+        ));
+        body.append(&build_row(
+            "Saturation", -100.0, 100.0, 1.0, 100.0, 0.0, sat_set, Track::Plain, sender, vadj,
+        ));
+        body.append(&build_row(
+            "Luminance", -100.0, 100.0, 1.0, 100.0, 0.0, lum_set, Track::Plain, sender, vadj,
+        ));
         wrap.append(&expander(band, &body, false));
     }
     wrap
@@ -325,48 +350,17 @@ fn build_row(
     scale: f64,
     default: f64,
     set: Setter,
+    track: Track,
     sender: &ComponentSender<AppModel>,
     vadj: &gtk::Adjustment,
 ) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-
-    let lbl = gtk::Label::new(Some(label));
-    lbl.set_halign(gtk::Align::Start);
-    lbl.add_css_class("caption");
-
-    let s = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
-    s.set_hexpand(true);
-    s.set_draw_value(true);
-    s.set_digits(if step < 1.0 { 2 } else { 0 });
-    s.set_value(default); // before connecting, so this doesn't emit
-
-    forward_wheel(&s, vadj);
-
-    {
-        let sender = sender.clone();
-        s.connect_value_changed(move |s| {
-            sender.input(AppMsg::Adjust(crate::Adjust {
-                set,
-                value: (s.value() / scale) as f32,
-            }));
-        });
-    }
-
-    // Double-click resets to the field's default.
-    let reset = gtk::GestureClick::new();
-    {
-        let s = s.clone();
-        reset.connect_pressed(move |_, n, _, _| {
-            if n == 2 {
-                s.set_value(default);
-            }
-        });
-    }
-    s.add_controller(reset);
-
-    row.append(&lbl);
-    row.append(&s);
-    row
+    let sender = sender.clone();
+    slider(label, min, max, step, default, track, vadj, move |v| {
+        sender.input(AppMsg::Adjust(crate::Adjust {
+            set,
+            value: (v / scale) as f32,
+        }));
+    })
 }
 
 /// Make a widget's mouse wheel scroll the panel (`vadj`) instead of changing
