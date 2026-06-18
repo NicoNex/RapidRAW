@@ -151,6 +151,7 @@ enum AppMsg {
     FlipH(bool),
     FlipV(bool),
     Straighten(f32),
+    CropSwapOrient,
     CropReset,
     /// Right-rail switcher: show the adjustments panel / the crop panel.
     ShowAdjustPanel,
@@ -372,6 +373,25 @@ impl AppModel {
             Duration::from_millis(500),
             move || sender.input(AppMsg::CommitHistory),
         ));
+    }
+
+    /// Native aspect (w/h) of the current image, accounting for 90° rotation.
+    fn native_aspect(&self) -> f32 {
+        use image::GenericImageView;
+        let Some(base) = &self.session.base_image else {
+            return 1.0;
+        };
+        let (w, h) = base.dimensions();
+        let (w, h) = if self.geom.orientation_steps % 2 == 1 {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        if h == 0 {
+            1.0
+        } else {
+            w as f32 / h as f32
+        }
     }
 
     /// Persist the active image's edits (adjustments + geometry + LUT) so
@@ -970,9 +990,19 @@ impl Component for AppModel {
                 self.apply_library(&sender);
             }
             AppMsg::CropAspect(a) => {
-                self.crop_aspect = a;
+                // -1 = "Original": the image's native aspect (after 90° rotation).
+                let aspect = if a < 0.0 { self.native_aspect() } else { a };
+                self.crop_aspect = aspect;
                 if self.crop_active {
-                    self.canvas.set_crop_aspect(a as f64);
+                    self.canvas.set_crop_aspect(aspect as f64);
+                }
+            }
+            AppMsg::CropSwapOrient => {
+                if self.crop_aspect > 0.0 {
+                    self.crop_aspect = 1.0 / self.crop_aspect;
+                    if self.crop_active {
+                        self.canvas.set_crop_aspect(self.crop_aspect as f64);
+                    }
                 }
             }
             AppMsg::RotateCw => {

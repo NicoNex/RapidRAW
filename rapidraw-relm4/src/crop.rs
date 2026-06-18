@@ -9,9 +9,10 @@ use relm4::{ComponentSender, RelmWidgetExt};
 
 use crate::{AppModel, AppMsg};
 
-/// Aspect presets: (label, ratio w/h; 0 = free).
+/// Aspect presets: (label, ratio w/h; 0 = free, -1 = original/native).
 const ASPECTS: &[(&str, f32)] = &[
     ("Free", 0.0),
+    ("Original", -1.0),
     ("1:1", 1.0),
     ("5:4", 5.0 / 4.0),
     ("4:3", 4.0 / 3.0),
@@ -43,8 +44,18 @@ impl CropPanel {
                 sender.input(AppMsg::CropAspect(a));
             });
         }
+        let aspect_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        aspect_dd.set_hexpand(true);
+        let swap = gtk::Button::from_icon_name("object-rotate-right-symbolic");
+        swap.set_tooltip_text(Some("Swap orientation (e.g. 3:2 ↔ 2:3)"));
+        {
+            let sender = sender.clone();
+            swap.connect_clicked(move |_| sender.input(AppMsg::CropSwapOrient));
+        }
+        aspect_row.append(&aspect_dd);
+        aspect_row.append(&swap);
         list.append(&aspect_lbl);
-        list.append(&aspect_dd);
+        list.append(&aspect_row);
 
         // Rotate + flip.
         let rot_lbl = gtk::Label::new(Some("Rotate & Flip"));

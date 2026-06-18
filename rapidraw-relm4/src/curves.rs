@@ -43,9 +43,10 @@ fn ch_idx(ch: Channel) -> usize {
     }
 }
 
-/// Parametric curve regions (each -100..100), plus black/white level offsets.
-/// Ported from the original `ParametricCurveSettings` / `buildParametricPoints`.
-#[derive(Clone, Copy, Default)]
+/// Parametric curve regions (each -100..100), black/white level offsets, and the
+/// three split points (region boundaries, 0..100). Ported from the original
+/// `ParametricCurveSettings` / `buildParametricPoints`.
+#[derive(Clone, Copy)]
 struct ParamSettings {
     highlights: f64,
     lights: f64,
@@ -53,6 +54,25 @@ struct ParamSettings {
     shadows: f64,
     whites: f64,
     blacks: f64,
+    split1: f64,
+    split2: f64,
+    split3: f64,
+}
+
+impl Default for ParamSettings {
+    fn default() -> Self {
+        Self {
+            highlights: 0.0,
+            lights: 0.0,
+            darks: 0.0,
+            shadows: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            split1: 25.0,
+            split2: 50.0,
+            split3: 75.0,
+        }
+    }
 }
 
 /// Per-channel manual control points (0..255, sorted by x) and parametric
@@ -89,7 +109,7 @@ fn build_parametric(s: &ParamSettings) -> Vec<(f64, f64)> {
         s.darks / 100.0,
         s.shadows / 100.0,
     );
-    let (s1, s2, s3) = (0.25, 0.50, 0.75);
+    let (s1, s2, s3) = (s.split1 / 100.0, s.split2 / 100.0, s.split3 / 100.0);
     let x_h = (s3 + 1.0) / 2.0;
     let x_s = s1 / 2.0;
     let xs = [0.0, x_s, s1, s2, s3, x_h, 1.0];
@@ -208,23 +228,27 @@ impl CurveEditor {
         let param_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         param_box.set_margin_start(4);
         param_box.set_margin_end(4);
-        let param_rows: [(&str, f64, fn(&mut ParamSettings) -> &mut f64); 6] = [
-            ("Highlights", 100.0, |p| &mut p.highlights),
-            ("Lights", 100.0, |p| &mut p.lights),
-            ("Darks", 100.0, |p| &mut p.darks),
-            ("Shadows", 100.0, |p| &mut p.shadows),
-            ("Whites", 50.0, |p| &mut p.whites),
-            ("Blacks", 50.0, |p| &mut p.blacks),
+        // (label, min, max, default, field). Splits are the region boundaries.
+        let param_rows: [(&str, f64, f64, f64, fn(&mut ParamSettings) -> &mut f64); 9] = [
+            ("Highlights", -100.0, 100.0, 0.0, |p| &mut p.highlights),
+            ("Lights", -100.0, 100.0, 0.0, |p| &mut p.lights),
+            ("Darks", -100.0, 100.0, 0.0, |p| &mut p.darks),
+            ("Shadows", -100.0, 100.0, 0.0, |p| &mut p.shadows),
+            ("Whites", -50.0, 50.0, 0.0, |p| &mut p.whites),
+            ("Blacks", -50.0, 50.0, 0.0, |p| &mut p.blacks),
+            ("Split 1", 5.0, 45.0, 25.0, |p| &mut p.split1),
+            ("Split 2", 25.0, 75.0, 50.0, |p| &mut p.split2),
+            ("Split 3", 55.0, 95.0, 75.0, |p| &mut p.split3),
         ];
         let mut handles: Vec<crate::slider::SliderHandle> = Vec::new();
-        for (label, range, field) in param_rows {
+        for (label, min, max, default, field) in param_rows {
             let state = state.clone();
             let active = active.clone();
             let parametric = parametric.clone();
             let area = area.clone();
             let sender = sender.clone();
             let (row, _, handle) = crate::slider::slider_ex(
-                label, -range, range, 1.0, 0.0, crate::slider::Track::Plain, vadj,
+                label, min, max, 1.0, default, crate::slider::Track::Plain, vadj,
                 move |v| {
                     {
                         let mut s = state.borrow_mut();
@@ -246,7 +270,10 @@ impl CurveEditor {
             let handles = handles.clone();
             Rc::new(move || {
                 let p = state.borrow().param[ch_idx(active.get())];
-                let vals = [p.highlights, p.lights, p.darks, p.shadows, p.whites, p.blacks];
+                let vals = [
+                    p.highlights, p.lights, p.darks, p.shadows, p.whites, p.blacks,
+                    p.split1, p.split2, p.split3,
+                ];
                 for (h, v) in handles.iter().zip(vals) {
                     h.set_ui(v);
                 }
