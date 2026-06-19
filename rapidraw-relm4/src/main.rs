@@ -203,6 +203,20 @@ enum AppMsg {
         sub: usize,
         mode: u32,
     },
+    /// Add another sub-mask of `ty` to container `mask`.
+    AddSubMask(usize, &'static str),
+    DeleteSubMask {
+        mask: usize,
+        sub: usize,
+    },
+    ToggleSubMaskVisible {
+        mask: usize,
+        sub: usize,
+    },
+    ToggleSubMaskInvert {
+        mask: usize,
+        sub: usize,
+    },
     /// Editor toolbar: copy the current edit settings, paste onto this image.
     CopySettings,
     PasteSettings,
@@ -1424,6 +1438,70 @@ impl Component for AppModel {
                     .and_then(|m| m.sub_masks.get_mut(sub))
                 {
                     sm.mode = masks::mode_from_index(mode);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::AddSubMask(mask, ty) => {
+                let (w, h) = self
+                    .session
+                    .base_image
+                    .as_ref()
+                    .map(|b| {
+                        use image::GenericImageView;
+                        let (w, h) = b.dimensions();
+                        (w as f32, h as f32)
+                    })
+                    .unwrap_or((1000.0, 1000.0));
+                if let Some(m) = self.session.masks.get_mut(mask) {
+                    // Reuse new_mask's sub-mask seeding, then move it onto this
+                    // container (keeps default geometry/params in one place).
+                    let label = masks::MASK_TYPES
+                        .iter()
+                        .find(|(_, t)| *t == ty)
+                        .map(|(l, _)| *l)
+                        .unwrap_or(ty);
+                    let sub = masks::new_mask(label, ty, w, h).sub_masks.remove(0);
+                    m.sub_masks.push(sub);
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::DeleteSubMask { mask, sub } => {
+                if let Some(m) = self.session.masks.get_mut(mask) {
+                    if sub < m.sub_masks.len() {
+                        m.sub_masks.remove(sub);
+                        self.masks_panel
+                            .rebuild(&self.session.masks, self.selected_mask, &sender);
+                        self.schedule_history(&sender);
+                        sender.input(AppMsg::RequestRender);
+                    }
+                }
+            }
+            AppMsg::ToggleSubMaskVisible { mask, sub } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    sm.visible = !sm.visible;
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::ToggleSubMaskInvert { mask, sub } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    sm.invert = !sm.invert;
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }

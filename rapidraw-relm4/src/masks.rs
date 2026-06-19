@@ -284,6 +284,34 @@ fn add_menu(sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
     btn
 }
 
+/// "Add sub-mask" menu for a container (non-AI types), emitting `AddSubMask`.
+fn sub_add_menu(mask_i: usize, sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
+    let btn = gtk::MenuButton::new();
+    btn.set_label("Add sub-mask");
+    btn.add_css_class("flat");
+    btn.set_margin_start(6);
+    btn.set_margin_end(6);
+
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.set_margin_all(4);
+    let pop = gtk::Popover::new();
+    pop.set_child(Some(&list));
+    for &(label, ty) in MASK_TYPES {
+        let item = gtk::Button::with_label(label);
+        item.add_css_class("flat");
+        item.set_halign(gtk::Align::Fill);
+        let sender = sender.clone();
+        let pop = pop.clone();
+        item.connect_clicked(move |_| {
+            pop.popdown();
+            sender.input(AppMsg::AddSubMask(mask_i, ty));
+        });
+        list.append(&item);
+    }
+    btn.set_popover(Some(&pop));
+    btn
+}
+
 /// One mask-list row: visibility toggle | name (selects) | delete.
 fn mask_row(
     i: usize,
@@ -377,6 +405,7 @@ fn mask_details(
     for (si, sm) in m.sub_masks.iter().enumerate() {
         card.append(&submask_editor(i, si, sm, sender));
     }
+    card.append(&sub_add_menu(i, sender));
 
     let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
     sep.set_margin_top(4);
@@ -410,6 +439,57 @@ fn submask_editor(
     group.set_margin_start(6);
     group.set_margin_end(6);
     group.set_margin_top(4);
+
+    // Header controls: visibility, invert, delete.
+    let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    let eye = gtk::ToggleButton::new();
+    eye.set_icon_name(if sm.visible {
+        "display-brightness-symbolic"
+    } else {
+        "weather-clear-night-symbolic"
+    });
+    eye.set_active(sm.visible);
+    eye.add_css_class("flat");
+    eye.set_tooltip_text(Some("Toggle sub-mask visibility"));
+    {
+        let sender = sender.clone();
+        eye.connect_clicked(move |_| {
+            sender.input(AppMsg::ToggleSubMaskVisible {
+                mask: mask_i,
+                sub: sub_i,
+            })
+        });
+    }
+    let inv = gtk::ToggleButton::new();
+    inv.set_icon_name("object-flip-horizontal-symbolic");
+    inv.set_active(sm.invert);
+    inv.add_css_class("flat");
+    inv.set_tooltip_text(Some("Invert sub-mask"));
+    {
+        let sender = sender.clone();
+        inv.connect_clicked(move |_| {
+            sender.input(AppMsg::ToggleSubMaskInvert {
+                mask: mask_i,
+                sub: sub_i,
+            })
+        });
+    }
+    let del = gtk::Button::from_icon_name("user-trash-symbolic");
+    del.add_css_class("flat");
+    del.set_tooltip_text(Some("Delete sub-mask"));
+    {
+        let sender = sender.clone();
+        del.connect_clicked(move |_| {
+            sender.input(AppMsg::DeleteSubMask {
+                mask: mask_i,
+                sub: sub_i,
+            })
+        });
+    }
+    suffix.append(&eye);
+    suffix.append(&inv);
+    suffix.append(&del);
+    group.set_header_suffix(Some(&suffix));
 
     // Compositing mode.
     let mode = adw::ComboRow::new();
