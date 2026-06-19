@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gtk::prelude::*;
+use adw::prelude::*;
 use relm4::{ComponentSender, RelmWidgetExt};
 use serde_json::{json, Value};
 
@@ -68,6 +68,66 @@ const MASK_ADJ: &[AdjRow] = &[
     ("Halation", "halationAmount", 0.0, 100.0, 1.0, 0.0),
     ("Light Flares", "flareAmount", 0.0, 100.0, 1.0, 0.0),
 ];
+
+/// Per-sub-mask geometry field: `(label, json-key, min, max, step, digits, mult,
+/// default)`. Ranges/`default` are in DISPLAY units matching the React UI
+/// (`SUB_MASK_CONFIG` in `MasksPanel.tsx`); the stored JSON value is `display /
+/// mult` (e.g. radial feather shows 0..100 default 50 but stores 0.5). Coordinate
+/// rows (center/radius/target/endpoints) are a numeric fallback the React UI
+/// places on the canvas instead — the canvas lands in P4.
+type GeoRow = (&'static str, &'static str, f64, f64, f64, u32, f64, f64);
+
+const GEO_RADIAL: &[GeoRow] = &[
+    ("Center X", "centerX", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Center Y", "centerY", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Radius X", "radiusX", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Radius Y", "radiusY", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Rotation", "rotation", -180.0, 180.0, 1.0, 0, 1.0, 0.0),
+    // React: 0..100 default 50, multiplier 100 -> stored 0.5.
+    ("Feather", "feather", 0.0, 100.0, 1.0, 0, 100.0, 50.0),
+];
+const GEO_LINEAR: &[GeoRow] = &[
+    ("Start X", "startX", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Start Y", "startY", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("End X", "endX", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("End Y", "endY", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Range", "range", 0.0, 100.0, 1.0, 0, 1.0, 50.0),
+];
+/// Color + Luminance both use `ParametricMaskParameters` (React defaults:
+/// tolerance 1..100 = 20, grow -100..100 = 0, feather 0..100 = 35). targetX/Y are
+/// a numeric fallback (React picks them on the canvas).
+const GEO_PARAMETRIC: &[GeoRow] = &[
+    ("Target X", "targetX", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Target Y", "targetY", 0.0, 100_000.0, 1.0, 0, 1.0, 0.0),
+    ("Tolerance", "tolerance", 1.0, 100.0, 1.0, 0, 1.0, 20.0),
+    ("Grow", "grow", -100.0, 100.0, 1.0, 0, 1.0, 0.0),
+    ("Feather", "feather", 0.0, 100.0, 1.0, 0, 1.0, 35.0),
+];
+
+fn geo_rows(mask_type: &str) -> &'static [GeoRow] {
+    match mask_type {
+        "radial" => GEO_RADIAL,
+        "linear" => GEO_LINEAR,
+        "color" | "luminance" => GEO_PARAMETRIC,
+        _ => &[], // brush/flow (canvas, P4), all (no geometry)
+    }
+}
+
+fn mode_index(m: SubMaskMode) -> u32 {
+    match m {
+        SubMaskMode::Additive => 0,
+        SubMaskMode::Subtractive => 1,
+        SubMaskMode::Intersect => 2,
+    }
+}
+
+pub fn mode_from_index(i: u32) -> SubMaskMode {
+    match i {
+        1 => SubMaskMode::Subtractive,
+        2 => SubMaskMode::Intersect,
+        _ => SubMaskMode::Additive,
+    }
+}
 
 static MASK_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -313,6 +373,11 @@ fn mask_details(
     op_row.set_margin_end(6);
     card.append(&op_row);
 
+    // Sub-mask geometry + compositing mode (one group per sub-mask).
+    for (si, sm) in m.sub_masks.iter().enumerate() {
+        card.append(&submask_editor(i, si, sm, sender));
+    }
+
     let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
     sep.set_margin_top(4);
     card.append(&sep);
@@ -332,6 +397,90 @@ fn mask_details(
     card
 }
 
+/// Geometry + compositing-mode editor for one sub-mask (libadwaita rows). Brush/
+/// flow show a canvas hint (P4); "all" has no geometry.
+fn submask_editor(
+    mask_i: usize,
+    sub_i: usize,
+    sm: &SubMask,
+    sender: &ComponentSender<AppModel>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title(&pretty_type(&sm.mask_type));
+    group.set_margin_start(6);
+    group.set_margin_end(6);
+    group.set_margin_top(4);
+
+    // Compositing mode.
+    let mode = adw::ComboRow::new();
+    mode.set_title("Mode");
+    mode.set_model(Some(&gtk::StringList::new(&[
+        "Additive",
+        "Subtractive",
+        "Intersect",
+    ])));
+    mode.set_selected(mode_index(sm.mode));
+    {
+        let sender = sender.clone();
+        mode.connect_selected_notify(move |r| {
+            sender.input(AppMsg::SetSubMaskMode {
+                mask: mask_i,
+                sub: sub_i,
+                mode: r.selected(),
+            });
+        });
+    }
+    group.add(&mode);
+
+    let rows = geo_rows(&sm.mask_type);
+    if rows.is_empty() {
+        let hint = adw::ActionRow::new();
+        hint.set_title(if matches!(sm.mask_type.as_str(), "brush" | "flow") {
+            "Paint on canvas (coming soon)"
+        } else {
+            "No geometry"
+        });
+        hint.add_css_class("dim-label");
+        group.add(&hint);
+        return group;
+    }
+
+    for &(label, key, min, max, step, digits, mult, default) in rows {
+        // `default`/ranges are display units; JSON stores `display / mult`.
+        let stored_default = default / mult;
+        let stored = sm
+            .parameters
+            .get(key)
+            .and_then(Value::as_f64)
+            .unwrap_or(stored_default);
+        let row = adw::SpinRow::with_range(min, max, step);
+        row.set_title(label);
+        row.set_digits(digits);
+        row.set_value(stored * mult);
+        // Connect AFTER set_value so the initial seed doesn't emit a change.
+        let sender = sender.clone();
+        row.connect_changed(move |r| {
+            sender.input(AppMsg::SetSubMaskParam {
+                mask: mask_i,
+                sub: sub_i,
+                key,
+                value: r.value() / mult,
+            });
+        });
+        group.add(&row);
+    }
+    group
+}
+
+/// Title-case a mask type string for display (e.g. "color" -> "Color").
+fn pretty_type(ty: &str) -> String {
+    MASK_TYPES
+        .iter()
+        .find(|(_, t)| *t == ty)
+        .map(|(l, _)| l.to_string())
+        .unwrap_or_else(|| ty.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +496,21 @@ mod tests {
         // adjustments seeded so sliders match JSON (no drift)
         assert_eq!(m.adjustments["sharpnessThreshold"], json!(15.0));
         assert_eq!(m.adjustments["exposure"], json!(0.0));
+    }
+
+    #[test]
+    fn geometry_defaults_match_react_ui() {
+        // Radial feather: UI shows 0..100 default 50, multiplier 100 -> stored 0.5.
+        let feather = GEO_RADIAL.iter().find(|r| r.1 == "feather").unwrap();
+        let (_, _, min, max, _, _, mult, default) = *feather;
+        assert_eq!((min, max, mult, default), (0.0, 100.0, 100.0, 50.0));
+        assert_eq!(default / mult, 0.5); // stored value == createSubMask seed
+
+        // Parametric tolerance: React min is 1 (not 0), default 20.
+        let tol = GEO_PARAMETRIC.iter().find(|r| r.1 == "tolerance").unwrap();
+        assert_eq!((tol.2, tol.7), (1.0, 20.0));
+        // Parametric feather default 35 (core ParametricMaskParameters default).
+        let pf = GEO_PARAMETRIC.iter().find(|r| r.1 == "feather").unwrap();
+        assert_eq!(pf.7, 35.0);
     }
 }

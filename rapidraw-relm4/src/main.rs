@@ -190,6 +190,19 @@ enum AppMsg {
         key: &'static str,
         value: f64,
     },
+    /// Set one geometry key in a sub-mask's parameters JSON.
+    SetSubMaskParam {
+        mask: usize,
+        sub: usize,
+        key: &'static str,
+        value: f64,
+    },
+    /// Set a sub-mask's compositing mode (0=Additive,1=Subtractive,2=Intersect).
+    SetSubMaskMode {
+        mask: usize,
+        sub: usize,
+        mode: u32,
+    },
     /// Editor toolbar: copy the current edit settings, paste onto this image.
     CopySettings,
     PasteSettings,
@@ -1365,6 +1378,39 @@ impl Component for AppModel {
                     if let Some(obj) = m.adjustments.as_object_mut() {
                         obj.insert(key.to_string(), serde_json::json!(value));
                     }
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetSubMaskParam {
+                mask,
+                sub,
+                key,
+                value,
+            } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    if !sm.parameters.is_object() {
+                        sm.parameters = serde_json::json!({});
+                    }
+                    if let Some(obj) = sm.parameters.as_object_mut() {
+                        obj.insert(key.to_string(), serde_json::json!(value));
+                    }
+                    // No rebuild: the spin row already shows the value.
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetSubMaskMode { mask, sub, mode } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    sm.mode = masks::mode_from_index(mode);
                     sender.input(AppMsg::RequestRender);
                 }
             }
