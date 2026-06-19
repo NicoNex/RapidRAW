@@ -68,7 +68,9 @@ pub fn render(
     );
     let input_view = input_texture.create_view(&Default::default());
 
-    // Compute scale for mask rasterization (render size / full size).
+    // Compute scale for mask rasterization (render size / full size). The
+    // preview downscale is aspect-preserving (resize longest edge), so X and Y
+    // scale are equal — a single uniform `scale` is correct.
     let scale = if base_full_dims.0 > 0 {
         width as f32 / base_full_dims.0 as f32
     } else {
@@ -81,6 +83,9 @@ pub fn render(
     let mut mask_bitmaps: Vec<GrayImage> = Vec::new();
     let mut layer = 0usize;
     for m in masks.iter().take(crate::image_processing::MAX_MASKS) {
+        // ponytail: `base` here is pre-color-grading, so color/luminance masks
+        // sample the unadjusted image rather than the final output. Acceptable
+        // for the foundation pass; revisit if color-mask accuracy matters.
         if let Some(bmp) =
             generate_mask_bitmap(m, width, height, scale, (0.0, 0.0), Some(&base), None)
         {
