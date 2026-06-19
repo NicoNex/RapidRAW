@@ -30,6 +30,7 @@ use controls::AdjustPanel;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
+use rapidraw_core::mask_generation::MaskDefinition;
 use rapidraw_core::lut_processing::{parse_lut_file, Lut};
 use scopes::Scopes;
 use settings::Settings;
@@ -277,6 +278,7 @@ enum RenderJob {
     Preview {
         base: Arc<DynamicImage>,
         adj: Box<rapidraw_core::image_processing::AllAdjustments>,
+        masks: Vec<MaskDefinition>,
         lut: Option<Arc<Lut>>,
         dim: u32,
         geom: Geometry,
@@ -284,6 +286,7 @@ enum RenderJob {
     Export {
         base: Arc<DynamicImage>,
         adj: Box<rapidraw_core::image_processing::AllAdjustments>,
+        masks: Vec<MaskDefinition>,
         lut: Option<Arc<Lut>>,
         path: PathBuf,
         opts: ExportOpts,
@@ -589,13 +592,14 @@ fn spawn_render_worker(
                     RenderJob::Export {
                         base,
                         adj,
+                        masks,
                         lut,
                         path,
                         opts,
                         geom,
                     } => {
                         let base = apply_geometry(&base, geom);
-                        let res = rapidraw_core::render(&ctx, &base, &adj, lut, None)
+                        let res = rapidraw_core::render(&ctx, &base, &adj, &masks, lut, None)
                             .and_then(|out| encode_image(&out, &path, opts))
                             .map(|()| path);
                         let _ = cmd.send(CmdMsg::ExportDone(res));
@@ -609,13 +613,14 @@ fn spawn_render_worker(
             if let Some(RenderJob::Preview {
                 base,
                 adj,
+                masks,
                 lut,
                 dim,
                 geom,
             }) = latest_preview
             {
                 let base = apply_geometry(&base, geom);
-                match rapidraw_core::render(&ctx, &base, &adj, lut, Some(dim)) {
+                match rapidraw_core::render(&ctx, &base, &adj, &masks, lut, Some(dim)) {
                     Ok(out) => {
                         let _ = cmd.send(CmdMsg::RenderReady(out.to_rgba8()));
                     }
@@ -1387,6 +1392,7 @@ impl Component for AppModel {
                 let _ = self.render_tx.send(RenderJob::Preview {
                     base,
                     adj: Box::new(self.session.adjustments),
+                    masks: self.session.masks.clone(),
                     lut: self.session.lut.clone(),
                     dim: self.settings.preview_dim,
                     geom,
@@ -1544,6 +1550,7 @@ impl Component for AppModel {
                 let _ = self.render_tx.send(RenderJob::Export {
                     base,
                     adj: Box::new(self.session.adjustments),
+                    masks: self.session.masks.clone(),
                     lut: self.session.lut.clone(),
                     path,
                     opts,
@@ -2050,7 +2057,7 @@ fn export_lut(
 ) -> Result<(), String> {
     const SIZE: u32 = 33;
     let identity = rapidraw_core::lut_processing::generate_identity_lut_image(SIZE);
-    let processed = rapidraw_core::render(ctx, &identity, adj, lut, None)?;
+    let processed = rapidraw_core::render(ctx, &identity, adj, &[], lut, None)?;
     let cube = rapidraw_core::lut_processing::convert_image_to_cube_lut(&processed, SIZE)?;
     std::fs::write(path, cube).map_err(|e| e.to_string())
 }
