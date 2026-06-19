@@ -153,6 +153,8 @@ enum AppMsg {
     Redo,
     /// Toggle the before/after view (show the unedited original).
     ToggleOriginal,
+    /// Clipping indicator toggled (from the scopes panel).
+    ToggleClipping(bool),
     /// Reopen the last folder from a previous session.
     ContinueSession,
     /// Library raw-status filter changed.
@@ -372,6 +374,11 @@ struct AppModel {
     original_tex: Option<gdk::MemoryTexture>,
     /// Whether the before/after view is currently showing the original.
     showing_original: bool,
+    /// Clipping indicator on: show `clip_tex` (blown/crushed pixels tinted).
+    clipping: bool,
+    clip_tex: Option<gdk::MemoryTexture>,
+    /// Last preview RGBA, kept so the clip overlay can be (re)built on toggle.
+    last_rgba: Option<RgbaImage>,
     /// Header bar title widget (filename as title, EXIF as subtitle).
     win_title: adw::WindowTitle,
     /// All images scanned from the current folder (before filter/sort).
@@ -455,6 +462,24 @@ impl AppModel {
                 .map(|p| p.to_string_lossy().into_owned()),
         };
         sidecar::save(&path, &e);
+    }
+
+    /// Texture to display now: original (before/after) > clipping overlay > edited.
+    fn active_tex(&self) -> Option<gdk::MemoryTexture> {
+        if self.showing_original {
+            self.original_tex.clone()
+        } else if self.clipping {
+            self.clip_tex.clone().or_else(|| self.last_tex.clone())
+        } else {
+            self.last_tex.clone()
+        }
+    }
+
+    /// Update the canvas to the active texture (preserving zoom/pan).
+    fn show_active_tex(&self) {
+        if let Some(tex) = self.active_tex() {
+            self.canvas.update_texture(&tex);
+        }
     }
 
     /// Re-filter/-sort `all_images` into `images` and rebuild the thumbnail grid.
@@ -823,6 +848,9 @@ impl Component for AppModel {
             last_tex: None,
             original_tex: None,
             showing_original: false,
+            clipping: false,
+            clip_tex: None,
+            last_rgba: None,
             win_title: adw::WindowTitle::new("RapidRAW", ""),
             all_images: Vec::new(),
             raw_filter: library::RawFilter::All,
@@ -1117,6 +1145,14 @@ impl Component for AppModel {
         paned.set_shrink_end_child(false);
         // No absolute position: the divider follows the end child's natural width
         // (370) regardless of window size, and the user can drag to override.
+
+        // Scopes clipping toggle feeds back into the model.
+        {
+            let sender = sender.clone();
+            model
+                .scopes
+                .set_clip_toggle(move |on| sender.input(AppMsg::ToggleClipping(on)));
+        }
         ComponentParts { model, widgets }
     }
 
@@ -1219,6 +1255,8 @@ impl Component for AppModel {
             }
             AppMsg::ShowAdjustPanel => {
                 self.content_stack.set_visible_child_name("adjust");
+                // Scopes show in Edit (hidden in Crop, like the reference).
+                self.scopes.root().set_visible(true);
                 // Commit the interactive crop on leaving crop mode.
                 if self.crop_active {
                     self.crop_active = false;
@@ -1233,6 +1271,8 @@ impl Component for AppModel {
             }
             AppMsg::ShowCropPanel => {
                 self.content_stack.set_visible_child_name("crop");
+                // Crop hides the scopes (matches the reference UI).
+                self.scopes.root().set_visible(false);
                 self.crop_active = true;
                 // Show the full (uncropped) image with the crop overlay.
                 self.canvas.enter_crop(self.crop_aspect as f64);
@@ -1711,14 +1751,16 @@ impl Component for AppModel {
                 } else {
                     "view-reveal-symbolic"
                 });
-                let tex = if self.showing_original {
-                    self.original_tex.as_ref()
+                self.show_active_tex();
+            }
+            AppMsg::ToggleClipping(on) => {
+                self.clipping = on;
+                self.clip_tex = if on {
+                    self.last_rgba.as_ref().map(build_clip_tex)
                 } else {
-                    self.last_tex.as_ref()
+                    None
                 };
-                if let Some(tex) = tex {
-                    self.canvas.update_texture(tex);
-                }
+                self.show_active_tex();
             }
         }
         self.update_view(widgets, sender);
@@ -1811,12 +1853,17 @@ impl Component for AppModel {
                     return;
                 }
                 self.scopes.set_data(&rgba);
-                let tex = library::texture_from_rgba(&rgba);
-                self.last_tex = Some(tex.clone());
+                self.last_tex = Some(library::texture_from_rgba(&rgba));
+                self.clip_tex = if self.clipping {
+                    Some(build_clip_tex(&rgba))
+                } else {
+                    None
+                };
+                self.last_rgba = Some(rgba);
                 // Preserve the user's zoom/pan across preview updates. Don't
                 // clobber the canvas while the user is viewing the original.
                 if !self.showing_original {
-                    self.canvas.update_texture(&tex);
+                    self.show_active_tex();
                 }
             }
             CmdMsg::ExportDone(Ok(path)) => {
@@ -1835,6 +1882,21 @@ impl Component for AppModel {
             }
         }
     }
+}
+
+/// Build the clipping-indicator texture: blown pixels (any channel 255) tinted
+/// red, crushed pixels (all channels 0) blue, everything else unchanged.
+fn build_clip_tex(rgba: &RgbaImage) -> gdk::MemoryTexture {
+    let mut out = rgba.clone();
+    for px in out.pixels_mut() {
+        let [r, g, b, _] = px.0;
+        if r == 255 || g == 255 || b == 255 {
+            px.0 = [255, 0, 0, 255];
+        } else if r == 0 && g == 0 && b == 0 {
+            px.0 = [0, 0, 255, 255];
+        }
+    }
+    library::texture_from_rgba(&out)
 }
 
 /// Encode a rendered image to `path` per `opts` (format, JPEG quality, resize).

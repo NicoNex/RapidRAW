@@ -50,11 +50,21 @@ impl Data {
     }
 }
 
+/// Callback fired when the clipping toggle changes (the model overlays
+/// blown/crushed pixels on the preview).
+type ClipCb = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
+
 pub struct Scopes {
     root: gtk::Box,
     area: gtk::DrawingArea,
     data: Rc<RefCell<Data>>,
+    clip_cb: ClipCb,
 }
+
+/// Scope area height bounds (px), user-resizable via the grip.
+const SCOPE_H_MIN: i32 = 80;
+const SCOPE_H_MAX: i32 = 400;
+const SCOPE_H_DEFAULT: i32 = 110;
 
 impl Scopes {
     pub fn new() -> Self {
@@ -114,13 +124,72 @@ impl Scopes {
             toggles.append(&b);
         }
 
-        root.append(&toggles);
+        // Clipping toggle (separate from the mode group): highlights blown/
+        // crushed pixels on the preview via a model callback.
+        let clip_cb: ClipCb = Rc::new(RefCell::new(None));
+        let clip_btn = gtk::ToggleButton::with_label("⚠");
+        clip_btn.add_css_class("caption");
+        clip_btn.set_tooltip_text(Some("Show clipped highlights/shadows"));
+        clip_btn.set_margin_start(6);
+        {
+            let clip_cb = clip_cb.clone();
+            clip_btn.connect_toggled(move |b| {
+                if let Some(cb) = clip_cb.borrow().as_ref() {
+                    cb(b.is_active());
+                }
+            });
+        }
+        let toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        toggle_row.set_halign(gtk::Align::Center);
+        toggle_row.append(&toggles);
+        toggle_row.append(&clip_btn);
+
+        // Drag grip below the scope to resize its height (in-session).
+        let grip = gtk::DrawingArea::new();
+        grip.set_content_height(8);
+        grip.set_cursor_from_name(Some("ns-resize"));
+        grip.set_draw_func(|_, cr, w, h| {
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.25);
+            let cw = (w as f64 * 0.25).min(40.0);
+            cr.rectangle((w as f64 - cw) / 2.0, h as f64 / 2.0 - 1.0, cw, 2.0);
+            let _ = cr.fill();
+        });
+        {
+            let area = area.clone();
+            let drag = gtk::GestureDrag::new();
+            let start_h = Rc::new(Cell::new(SCOPE_H_DEFAULT));
+            {
+                let start_h = start_h.clone();
+                let area = area.clone();
+                drag.connect_drag_begin(move |_, _, _| {
+                    start_h.set(area.content_height().max(SCOPE_H_MIN));
+                });
+            }
+            drag.connect_drag_update(move |_, _, dy| {
+                let h = (start_h.get() + dy as i32).clamp(SCOPE_H_MIN, SCOPE_H_MAX);
+                area.set_content_height(h);
+            });
+            grip.add_controller(drag);
+        }
+
+        root.append(&toggle_row);
         root.append(&area);
-        Self { root, area, data }
+        root.append(&grip);
+        Self {
+            root,
+            area,
+            data,
+            clip_cb,
+        }
     }
 
     pub fn root(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Set the callback invoked when the clipping toggle changes.
+    pub fn set_clip_toggle(&self, cb: impl Fn(bool) + 'static) {
+        *self.clip_cb.borrow_mut() = Some(Box::new(cb));
     }
 
     /// Recompute all scopes from a rendered preview (sampled every few pixels).
@@ -229,18 +298,32 @@ fn draw_histogram(cr: &cairo::Context, wf: f64, hf: f64, hist: &[[u32; 256]; 3])
         .unwrap_or(1)
         .max(1) as f64;
     let colors = [(0.90, 0.25, 0.25), (0.25, 0.85, 0.30), (0.35, 0.55, 1.0)];
+    // Lighten so overlapping channels brighten (mirrors the reference's
+    // mix-blend lighten), each as a filled area plus a crisp top line.
+    cr.set_operator(cairo::Operator::Lighten);
+    let y_at = |ch: usize, i: usize| -> f64 {
+        hf - ((hist[ch][i] as f64).sqrt() / peak.sqrt()).min(1.0) * hf
+    };
     for (ch, col) in colors.iter().enumerate() {
-        cr.set_source_rgba(col.0, col.1, col.2, 0.5);
+        // Fill.
         cr.move_to(0.0, hf);
         for i in 0..256 {
-            let x = i as f64 / 255.0 * wf;
-            let y = hf - ((hist[ch][i] as f64).sqrt() / peak.sqrt()).min(1.0) * hf;
-            cr.line_to(x, y);
+            cr.line_to(i as f64 / 255.0 * wf, y_at(ch, i));
         }
         cr.line_to(wf, hf);
         cr.close_path();
+        cr.set_source_rgba(col.0, col.1, col.2, 0.40);
         let _ = cr.fill();
+        // Top line.
+        cr.move_to(0.0, y_at(ch, 0));
+        for i in 1..256 {
+            cr.line_to(i as f64 / 255.0 * wf, y_at(ch, i));
+        }
+        cr.set_source_rgba(col.0, col.1, col.2, 0.95);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
     }
+    cr.set_operator(cairo::Operator::Over);
 }
 
 /// Draw an intensity grid (waveform/vectorscope) into the widget rect `(x,y,w,h)`.
