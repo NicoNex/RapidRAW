@@ -192,6 +192,21 @@ enum AppMsg {
         key: &'static str,
         value: f64,
     },
+    /// Set a color-grading wheel for mask `index`, zone `zone`
+    /// (shadows/midtones/highlights/global): hue°, sat 0..1, lum -100..100.
+    MaskGrade {
+        index: usize,
+        zone: &'static str,
+        hue: f64,
+        sat: f64,
+        lum: f64,
+    },
+    /// Set a color-grading scalar (blending/balance) for mask `index`.
+    MaskGradeScalar {
+        index: usize,
+        key: &'static str,
+        value: f64,
+    },
     /// Set one geometry key in a sub-mask's parameters JSON.
     SetSubMaskParam {
         mask: usize,
@@ -1520,6 +1535,30 @@ impl Component for AppModel {
                     sender.input(AppMsg::RequestRender);
                 }
             }
+            AppMsg::MaskGrade { index, zone, hue, sat, lum } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    // adjustments.colorGrading.<zone> = { hue, saturation, luminance }
+                    // (UI units; the engine divides per SCALES.)
+                    let cg = mask_cg_obj(&mut m.adjustments);
+                    cg.insert(
+                        zone.to_string(),
+                        serde_json::json!({
+                            "hue": hue,
+                            "saturation": sat * 100.0,
+                            "luminance": lum,
+                        }),
+                    );
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskGradeScalar { index, key, value } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    mask_cg_obj(&mut m.adjustments).insert(key.to_string(), serde_json::json!(value));
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
             AppMsg::SetSubMaskParam {
                 mask,
                 sub,
@@ -2350,6 +2389,18 @@ impl Component for AppModel {
             }
         }
     }
+}
+
+/// Get (creating if needed) the `colorGrading` object inside a mask's
+/// `adjustments` JSON, so grading writes nest under it.
+fn mask_cg_obj(adj: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+    if !adj.is_object() {
+        *adj = serde_json::json!({});
+    }
+    let obj = adj.as_object_mut().unwrap();
+    obj.entry("colorGrading")
+        .or_insert_with(|| serde_json::json!({}));
+    obj["colorGrading"].as_object_mut().unwrap()
 }
 
 /// Build the clipping-indicator texture: blown pixels (any channel 255) tinted

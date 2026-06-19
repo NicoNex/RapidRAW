@@ -23,13 +23,17 @@ const DISC: i32 = 110;
 /// engine receives the same magnitude as the original UI.
 const CG_SCALE: f64 = 500.0;
 
+/// Sink fired on any wheel change with the three live components:
+/// `(hue degrees, saturation 0..1, luminance -100..100)`.
+type Emit3 = Rc<dyn Fn(f64, f64, f64)>;
+
 pub struct ColorWheel {
     root: gtk::Box,
 }
 
 impl ColorWheel {
-    /// `hue_set`/`sat_set`/`lum_set` write the three components of one
-    /// `color_grading_*` field.
+    /// Global color-grading wheel: `hue_set`/`sat_set`/`lum_set` write one
+    /// `color_grading_*` field (engine units) via `AppMsg::Adjust`.
     pub fn new(
         title: &str,
         sender: &ComponentSender<AppModel>,
@@ -38,125 +42,150 @@ impl ColorWheel {
         sat_set: Setter,
         lum_set: Setter,
     ) -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        root.set_halign(gtk::Align::Center);
-
-        let label = gtk::Label::new(Some(title));
-        label.add_css_class("caption");
-        root.append(&label);
-
-        // (hue degrees, saturation 0..1) for drawing the handle.
-        let handle = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
-
-        let area = gtk::DrawingArea::new();
-        area.set_content_width(DISC);
-        area.set_content_height(DISC);
-        {
-            let handle = handle.clone();
-            area.set_draw_func(move |_, cr, w, h| draw_wheel(cr, w, h, handle.get()));
-        }
-
-        // Drag the handle: set hue/sat from the pointer.
-        let drag = gtk::GestureDrag::new();
-        let start = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
-        {
-            let start = start.clone();
-            drag.connect_drag_begin(move |_, x, y| start.set((x, y)));
-        }
-        {
-            let area_w = area.clone();
-            let handle = handle.clone();
-            let sender = sender.clone();
-            let start = start.clone();
-            drag.connect_drag_update(move |_, ox, oy| {
-                let (sx, sy) = start.get();
-                let (hue, sat) = point_to_hue_sat(&area_w, sx + ox, sy + oy);
-                handle.set((hue, sat));
-                area_w.queue_draw();
-                sender.input(AppMsg::Adjust(crate::Adjust {
-                    set: hue_set,
-                    value: hue as f32, // hue stays in degrees
-                }));
-                sender.input(AppMsg::Adjust(crate::Adjust {
-                    set: sat_set,
-                    // radius 0..1 -> 0..100 slider-equiv -> / CG_SCALE
-                    value: (sat * 100.0 / CG_SCALE) as f32,
-                }));
-            });
-        }
-        area.add_controller(drag);
-
-        let lum = gtk::Scale::with_range(gtk::Orientation::Horizontal, -100.0, 100.0, 1.0);
-        lum.set_hexpand(true);
-        lum.set_draw_value(true);
-        lum.set_value(0.0);
-        crate::controls::forward_wheel(&lum, vadj); // wheel scrolls panel, not the slider
-        {
-            let sender = sender.clone();
-            lum.connect_value_changed(move |s| {
-                sender.input(AppMsg::Adjust(crate::Adjust {
-                    set: lum_set,
-                    value: (s.value() / CG_SCALE) as f32,
-                }));
-            });
-        }
-        // Double-click the luminance slider resets it to 0.
-        let lum_reset = gtk::GestureClick::new();
-        {
-            let lum = lum.clone();
-            lum_reset.connect_pressed(move |_, n, _, _| {
-                if n == 2 {
-                    lum.set_value(0.0);
-                }
-            });
-        }
-        lum.add_controller(lum_reset);
-
-        // Double-click anywhere on the wheel resets all three components.
-        let reset = gtk::GestureClick::new();
-        {
-            let area_w = area.clone();
-            let handle = handle.clone();
-            let lum = lum.clone();
-            let sender = sender.clone();
-            reset.connect_pressed(move |_, n, _, _| {
-                if n == 2 {
-                    handle.set((0.0, 0.0));
-                    area_w.queue_draw();
-                    lum.set_value(0.0); // fires lum change -> sets field + render
-                    sender.input(AppMsg::Adjust(crate::Adjust {
-                        set: hue_set,
-                        value: 0.0,
-                    }));
-                    sender.input(AppMsg::Adjust(crate::Adjust {
-                        set: sat_set,
-                        value: 0.0,
-                    }));
-                }
-            });
-        }
-        area.add_controller(reset);
-
-        // Reset hook: clears the disc + luminance when a new image opens.
-        {
-            let handle = handle.clone();
-            let area = area.clone();
-            let lum = lum.clone();
-            crate::slider::register_reset(Rc::new(move || {
-                handle.set((0.0, 0.0));
-                area.queue_draw();
-                lum.set_value(0.0);
+        let sender = sender.clone();
+        let emit: Emit3 = Rc::new(move |hue, sat, lum| {
+            sender.input(AppMsg::Adjust(crate::Adjust { set: hue_set, value: hue as f32 }));
+            sender.input(AppMsg::Adjust(crate::Adjust {
+                set: sat_set,
+                value: (sat * 100.0 / CG_SCALE) as f32,
             }));
-        }
+            sender.input(AppMsg::Adjust(crate::Adjust {
+                set: lum_set,
+                value: (lum / CG_SCALE) as f32,
+            }));
+        });
+        Self { root: build(title, vadj, (0.0, 0.0, 0.0), emit, true) }
+    }
 
-        root.append(&area);
-        root.append(&lum);
-        Self { root }
+    /// Generic wheel for non-global targets (e.g. per-mask color grading): seeded
+    /// with `initial` (hue°, sat 0..1, lum -100..100), reporting changes to
+    /// `on_change`. No global reset-hook registration.
+    pub fn with_sink(
+        title: &str,
+        vadj: &gtk::Adjustment,
+        initial: (f64, f64, f64),
+        on_change: impl Fn(f64, f64, f64) + 'static,
+    ) -> Self {
+        Self { root: build(title, vadj, initial, Rc::new(on_change), false) }
     }
 
     pub fn root(&self) -> &gtk::Box {
         &self.root
     }
+}
+
+/// Build the wheel. `emit(hue°, sat01, lum)` fires on any change; `register_reset`
+/// opts into the global panel's reset registry.
+fn build(
+    title: &str,
+    vadj: &gtk::Adjustment,
+    initial: (f64, f64, f64),
+    emit: Emit3,
+    register_reset: bool,
+) -> gtk::Box {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    root.set_halign(gtk::Align::Center);
+
+    let label = gtk::Label::new(Some(title));
+    label.add_css_class("caption");
+    root.append(&label);
+
+    // (hue degrees, saturation 0..1) for drawing the handle; luminance tracked
+    // separately so `emit` can always report all three.
+    let handle = Rc::new(Cell::new((initial.0, initial.1)));
+    let lum_val = Rc::new(Cell::new(initial.2));
+
+    let area = gtk::DrawingArea::new();
+    area.set_content_width(DISC);
+    area.set_content_height(DISC);
+    {
+        let handle = handle.clone();
+        area.set_draw_func(move |_, cr, w, h| draw_wheel(cr, w, h, handle.get()));
+    }
+
+    // Drag the handle: set hue/sat from the pointer.
+    let drag = gtk::GestureDrag::new();
+    let start = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+    {
+        let start = start.clone();
+        drag.connect_drag_begin(move |_, x, y| start.set((x, y)));
+    }
+    {
+        let area_w = area.clone();
+        let handle = handle.clone();
+        let lum_val = lum_val.clone();
+        let emit = emit.clone();
+        let start = start.clone();
+        drag.connect_drag_update(move |_, ox, oy| {
+            let (sx, sy) = start.get();
+            let (hue, sat) = point_to_hue_sat(&area_w, sx + ox, sy + oy);
+            handle.set((hue, sat));
+            area_w.queue_draw();
+            emit(hue, sat, lum_val.get());
+        });
+    }
+    area.add_controller(drag);
+
+    let lum = gtk::Scale::with_range(gtk::Orientation::Horizontal, -100.0, 100.0, 1.0);
+    lum.set_hexpand(true);
+    lum.set_draw_value(true);
+    lum.set_value(initial.2);
+    crate::controls::forward_wheel(&lum, vadj); // wheel scrolls panel, not the slider
+    {
+        let handle = handle.clone();
+        let lum_val = lum_val.clone();
+        let emit = emit.clone();
+        lum.connect_value_changed(move |s| {
+            lum_val.set(s.value());
+            let (hue, sat) = handle.get();
+            emit(hue, sat, s.value());
+        });
+    }
+    // Double-click the luminance slider resets it to 0.
+    let lum_reset = gtk::GestureClick::new();
+    {
+        let lum = lum.clone();
+        lum_reset.connect_pressed(move |_, n, _, _| {
+            if n == 2 {
+                lum.set_value(0.0);
+            }
+        });
+    }
+    lum.add_controller(lum_reset);
+
+    // Double-click anywhere on the wheel resets all three components.
+    let reset = gtk::GestureClick::new();
+    {
+        let area_w = area.clone();
+        let handle = handle.clone();
+        let lum = lum.clone();
+        let emit = emit.clone();
+        reset.connect_pressed(move |_, n, _, _| {
+            if n == 2 {
+                handle.set((0.0, 0.0));
+                area_w.queue_draw();
+                lum.set_value(0.0); // fires lum change -> emit
+                emit(0.0, 0.0, 0.0);
+            }
+        });
+    }
+    area.add_controller(reset);
+
+    // Reset hook: clears the disc + luminance when a new image opens (global only).
+    if register_reset {
+        let handle = handle.clone();
+        let area = area.clone();
+        let lum = lum.clone();
+        crate::slider::register_reset(Rc::new(move || {
+            handle.set((0.0, 0.0));
+            area.queue_draw();
+            lum.set_value(0.0);
+        }));
+    }
+
+    root.append(&area);
+    root.append(&lum);
+    root
 }
 
 /// Map a pointer position within `area` to (hue degrees [0,360), saturation [0,1]).

@@ -460,7 +460,72 @@ fn mask_details(
         body.append(&sl);
     }
     card.append(&body);
+
+    card.append(&build_mask_grading(i, m, vadj, sender));
     card
+}
+
+/// Per-mask color grading: 4 wheels (shadows/midtones/highlights/global) + the
+/// blending/balance sliders, writing the mask's `adjustments.colorGrading` JSON.
+fn build_mask_grading(
+    i: usize,
+    m: &MaskDefinition,
+    vadj: &gtk::Adjustment,
+    sender: &ComponentSender<AppModel>,
+) -> gtk::Box {
+    use crate::colorwheel::ColorWheel;
+
+    let wrap = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    wrap.set_margin_all(6);
+    let head = gtk::Label::new(Some("Color Grading"));
+    head.set_halign(gtk::Align::Start);
+    head.add_css_class("heading");
+    wrap.append(&head);
+
+    let cg = m.adjustments.get("colorGrading");
+    // Read a zone's stored (hue°, sat 0..1, lum) from JSON for seeding the wheel.
+    let seed = |zone: &str| -> (f64, f64, f64) {
+        let z = cg.and_then(|c| c.get(zone));
+        let g = |k: &str| z.and_then(|z| z.get(k)).and_then(Value::as_f64).unwrap_or(0.0);
+        (g("hue"), g("saturation") / 100.0, g("luminance"))
+    };
+
+    let flow = gtk::FlowBox::new();
+    flow.set_selection_mode(gtk::SelectionMode::None);
+    flow.set_column_spacing(4);
+    flow.set_row_spacing(4);
+    flow.set_homogeneous(true);
+    for (label, zone) in [
+        ("Shadows", "shadows"),
+        ("Midtones", "midtones"),
+        ("Highlights", "highlights"),
+        ("Global", "global"),
+    ] {
+        let sender = sender.clone();
+        let w = ColorWheel::with_sink(label, vadj, seed(zone), move |hue, sat, lum| {
+            sender.input(AppMsg::MaskGrade { index: i, zone, hue, sat, lum })
+        });
+        flow.append(w.root());
+    }
+    wrap.append(&flow);
+
+    // Blending (default 50) + Balance (default 0).
+    for (label, key, min, max, default) in [
+        ("Blending", "blending", 0.0, 100.0, 50.0),
+        ("Balance", "balance", -100.0, 100.0, 0.0),
+    ] {
+        let cur = cg
+            .and_then(|c| c.get(key))
+            .and_then(Value::as_f64)
+            .unwrap_or(default);
+        let (sl, _, h) = slider_ex(label, min, max, 1.0, default, Track::Plain, vadj, {
+            let sender = sender.clone();
+            move |v| sender.input(AppMsg::MaskGradeScalar { index: i, key, value: v })
+        });
+        h.set_ui(cur);
+        wrap.append(&sl);
+    }
+    wrap
 }
 
 /// Geometry + compositing-mode editor for one sub-mask (libadwaita rows). Brush/
