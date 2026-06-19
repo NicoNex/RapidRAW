@@ -14,9 +14,9 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 pub use crate::gpu_processing::RenderRequest;
-// Coupling-cut: AppState and mask_generation::MaskDefinition do not move to core.
-// The JSON->adjustments mask parsing path is not part of the minimal render loop,
-// so masks are dropped from get_all_adjustments_from_json (mask_count stays 0).
+// Masks are applied in `render()` directly (rasterize -> atlas + per-mask
+// adjustments), not through this JSON->AllAdjustments path, so
+// get_all_adjustments_from_json leaves mask_count at 0.
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 pub trait IntoCowImage<'a> {
@@ -2160,8 +2160,8 @@ fn get_global_adjustments_from_json(
     }
 }
 
-// ponytail: kept for the not-yet-ported masks feature; remove if masks land differently.
-#[allow(dead_code)]
+/// Parse a mask's `adjustments` JSON into the GPU `MaskAdjustments`. Called by
+/// `render()` per visible mask.
 pub(crate) fn get_mask_adjustments_from_json(adj: &serde_json::Value) -> MaskAdjustments {
     if adj.is_null() {
         return MaskAdjustments::default();
@@ -2299,8 +2299,8 @@ pub fn get_all_adjustments_from_json(
     tonemapper_override: Option<u32>,
 ) -> AllAdjustments {
     let global = get_global_adjustments_from_json(js_adjustments, is_raw, tonemapper_override);
-    // Coupling-cut: mask parsing depends on mask_generation::MaskDefinition which
-    // is not part of core's minimal slice. Global adjustments only.
+    // Masks are applied in render() from the MaskDefinition list, not via this
+    // JSON path, so we leave them empty here. Global adjustments only.
     let mask_adjustments = [MaskAdjustments::default(); MAX_MASKS];
     let mask_count = 0;
 

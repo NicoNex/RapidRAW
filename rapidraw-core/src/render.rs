@@ -83,9 +83,11 @@ pub fn render(
     let mut mask_bitmaps: Vec<GrayImage> = Vec::new();
     let mut layer = 0usize;
     for m in masks.iter().take(crate::image_processing::MAX_MASKS) {
-        // ponytail: `base` here is pre-color-grading, so color/luminance masks
-        // sample the unadjusted image rather than the final output. Acceptable
-        // for the foundation pass; revisit if color-mask accuracy matters.
+        // ponytail: `base` here is pre-color-grading AND preview-downscaled, so
+        // color/luminance masks sample the unadjusted image and compare their
+        // full-res target_x/target_y against downscaled dimensions. Acceptable
+        // for the foundation pass (relm4 masks are empty today); revisit both
+        // when color/luminance mask wiring lands.
         if let Some(bmp) =
             generate_mask_bitmap(m, width, height, scale, (0.0, 0.0), Some(&base), None)
         {
