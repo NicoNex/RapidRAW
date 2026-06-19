@@ -44,9 +44,12 @@ ConfigurePreset. Plus Community page.
 
 ## Phases
 
-### P2 — Masks UI: list + per-mask adjustments (non-AI)
+### P2 — Masks UI: list + per-mask adjustments (non-AI) ✅ DONE
 
 Wire the existing foundation to the screen. No canvas interaction yet.
+Implemented in `rapidraw-relm4/src/masks.rs` (Masks tab, add/delete/select,
+visibility/invert/opacity, scalar Basic/Color/Details/Effects sliders). Curves/
+HSL/colour-grading per-mask sliders + sub-mask mode UI remain for a follow-up.
 
 - New `masks` module + right-panel tab (`AdwViewStack` page).
 - Mask list: `AdwPreferencesGroup` of `AdwExpanderRow` rows (one per
