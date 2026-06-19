@@ -298,6 +298,7 @@ struct HistEntry {
     adj: rapidraw_core::image_processing::AllAdjustments,
     lut: Option<Arc<Lut>>,
     vals: Vec<f64>,
+    masks: Vec<rapidraw_core::mask_generation::MaskDefinition>,
 }
 
 /// Work sent to the persistent render thread. Keeping a single long-lived
@@ -489,6 +490,7 @@ impl AppModel {
                 .lut_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            masks: self.session.masks.clone(),
         };
         sidecar::save(&path, &e);
     }
@@ -530,6 +532,12 @@ impl AppModel {
         let entry = self.history[self.hist_idx].clone();
         self.session.adjustments = entry.adj;
         self.session.lut = entry.lut;
+        self.session.masks = entry.masks;
+        self.selected_mask = self
+            .selected_mask
+            .filter(|&i| i < self.session.masks.len());
+        self.masks_panel
+            .rebuild(&self.session.masks, self.selected_mask, sender);
         self.suppress_history = true;
         self.panel.restore(&entry.vals);
         self.suppress_history = false;
@@ -1330,8 +1338,7 @@ impl Component for AppModel {
                 self.selected_mask = Some(self.session.masks.len() - 1);
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
-                // ponytail: masks aren't in HistEntry yet (undo won't revert
-                // them); wire into history with sidecar persistence in P4.
+                self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
             }
             AppMsg::SelectMask(idx) => {
@@ -1350,6 +1357,7 @@ impl Component for AppModel {
                     };
                     self.masks_panel
                         .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
@@ -1358,18 +1366,21 @@ impl Component for AppModel {
                     m.visible = !m.visible;
                     self.masks_panel
                         .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
             AppMsg::ToggleMaskInvert(i) => {
                 if let Some(m) = self.session.masks.get_mut(i) {
                     m.invert = !m.invert;
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
             AppMsg::SetMaskOpacity(i, v) => {
                 if let Some(m) = self.session.masks.get_mut(i) {
                     m.opacity = v as f32;
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
@@ -1378,6 +1389,7 @@ impl Component for AppModel {
                     if let Some(obj) = m.adjustments.as_object_mut() {
                         obj.insert(key.to_string(), serde_json::json!(value));
                     }
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
@@ -1400,6 +1412,7 @@ impl Component for AppModel {
                         obj.insert(key.to_string(), serde_json::json!(value));
                     }
                     // No rebuild: the spin row already shows the value.
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
@@ -1411,6 +1424,7 @@ impl Component for AppModel {
                     .and_then(|m| m.sub_masks.get_mut(sub))
                 {
                     sm.mode = masks::mode_from_index(mode);
+                    self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
@@ -1851,12 +1865,15 @@ impl Component for AppModel {
                 }
                 let cur = self.session.adjustments;
                 let lut = self.session.lut.clone();
+                let masks = self.session.masks.clone();
+                let masks_json = serde_json::to_value(&masks).unwrap_or_default();
                 let same = self
                     .history
                     .get(self.hist_idx)
                     .map(|e| {
                         bytemuck::bytes_of(&e.adj.global) == bytemuck::bytes_of(&cur.global)
                             && lut_eq(&e.lut, &lut)
+                            && serde_json::to_value(&e.masks).unwrap_or_default() == masks_json
                     })
                     .unwrap_or(false);
                 if same {
@@ -1867,6 +1884,7 @@ impl Component for AppModel {
                     adj: cur,
                     lut,
                     vals: self.panel.snapshot(),
+                    masks,
                 });
                 self.hist_idx = self.history.len() - 1;
                 self.save_edits();
@@ -1956,6 +1974,9 @@ impl Component for AppModel {
                             }
                         }
                         self.panel.restore(&e.vals);
+                        self.session.masks = e.masks;
+                        self.selected_mask = None;
+                        self.masks_panel.rebuild(&self.session.masks, None, &sender);
                     }
                 }
                 // Show the un-adjusted base immediately. We're on the GTK main
@@ -1979,6 +2000,7 @@ impl Component for AppModel {
                     adj: self.session.adjustments,
                     lut: self.session.lut.clone(),
                     vals: self.panel.snapshot(),
+                    masks: self.session.masks.clone(),
                 }];
                 self.hist_idx = 0;
                 // Kick an initial engine render so the preview reflects the

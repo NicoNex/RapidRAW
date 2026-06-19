@@ -10,6 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use rapidraw_core::mask_generation::MaskDefinition;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -25,6 +26,10 @@ pub struct Edits {
     pub crop: Option<[f32; 4]>,
     /// Path of the active .cube LUT, if any.
     pub lut: Option<String>,
+    /// Masks (containers + sub-masks), camelCase JSON (same contract as the
+    /// Tauri sidecar). Defaulted so old sidecars without it still load.
+    #[serde(default)]
+    pub masks: Vec<MaskDefinition>,
 }
 
 fn edits_path(image: &Path) -> Option<PathBuf> {
