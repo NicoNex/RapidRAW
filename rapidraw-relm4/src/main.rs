@@ -509,6 +509,29 @@ impl AppModel {
         sidecar::save(&path, &e);
     }
 
+    /// Push the selected mask's drawable shapes to the canvas overlay (only while
+    /// the Masks tab is active); hides it otherwise.
+    fn refresh_mask_overlay(&self) {
+        let on = self
+            .content_stack
+            .visible_child_name()
+            .map(|s| s == "masks")
+            .unwrap_or(false);
+        let shapes = match (on, self.selected_mask, self.session.base_image.as_ref()) {
+            (true, Some(i), Some(base)) => {
+                use image::GenericImageView;
+                let (w, h) = base.dimensions();
+                self.session
+                    .masks
+                    .get(i)
+                    .map(|m| masks::overlay_shapes(m, w as f64, h as f64))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        self.canvas.set_mask_overlay(shapes, on);
+    }
+
     /// Re-filter/-sort `all_images` into `images` and rebuild the thumbnail grid.
     fn apply_library(&mut self, sender: &ComponentSender<AppModel>) {
         self.images = library::arrange(
@@ -1998,6 +2021,9 @@ impl Component for AppModel {
                 }
             }
         }
+        // Keep the mask overlay in sync with selection/geometry/tab after any
+        // message (cheap no-op when the Masks tab isn't showing).
+        self.refresh_mask_overlay();
         self.update_view(widgets, sender);
     }
 

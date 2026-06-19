@@ -18,7 +18,7 @@
 //! // ponytail: no live re-fit on window resize (only on open); add a resize
 //! // hook if "fit" should track the window continuously.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::cairo;
@@ -27,6 +27,26 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::settings::Background;
+
+/// A selected mask's geometric sub-mask, in normalized image coords (0..1), for
+/// the read-only overlay. Brush/flow/color/luminance have no drawable shape.
+#[derive(Clone)]
+pub enum MaskShape {
+    /// Centre + radii normalized; rotation in degrees.
+    Radial {
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        rot: f64,
+    },
+    Linear {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
+}
 
 /// Which part of the crop rectangle a drag is manipulating.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +94,9 @@ pub struct EditorCanvas {
     fixed: gtk::Fixed,
     picture: gtk::Picture,
     overlay: gtk::DrawingArea,
+    /// Read-only overlay drawing the selected mask's geometric shapes.
+    mask_overlay: gtk::DrawingArea,
+    mask_shapes: Rc<RefCell<Vec<MaskShape>>>,
     view: View,
     /// Crop rectangle, normalized (x, y, w, h) in image space.
     crop_rect: Rc<Cell<(f64, f64, f64, f64)>>,
@@ -121,6 +144,19 @@ impl EditorCanvas {
         let crop_rect = Rc::new(Cell::new((0.0, 0.0, 1.0, 1.0)));
         let crop_aspect = Rc::new(Cell::new(0.0_f64));
 
+        // Read-only mask overlay: draws the selected mask's radial/linear shapes.
+        // `can_target(false)` so it never steals zoom/pan input (purely visual).
+        let mask_overlay = gtk::DrawingArea::new();
+        mask_overlay.set_visible(false);
+        mask_overlay.set_can_target(false);
+        let mask_shapes: Rc<RefCell<Vec<MaskShape>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let view = view.clone();
+            let shapes = mask_shapes.clone();
+            mask_overlay.set_draw_func(move |_, cr, _w, _h| {
+                draw_masks(cr, &view, &shapes.borrow());
+            });
+        }
         // Track the pointer so the wheel can zoom toward it.
         let motion = gtk::EventControllerMotion::new();
         {
@@ -137,6 +173,7 @@ impl EditorCanvas {
             let picture = picture.clone();
             let fixed_w = fixed.clone();
             let overlay_w = overlay.clone();
+            let mask_w = mask_overlay.clone();
             let view = view.clone();
             scroll.connect_scroll(move |_, _dx, dy| {
                 let (nw, nh) = view.natural.get();
@@ -152,7 +189,7 @@ impl EditorCanvas {
                         .set((cx - (cx - ox) * ratio, cy - (cy - oy) * ratio));
                     view.scale.set(new);
                     view.fit.set(false);
-                    apply(&picture, &fixed_w, &overlay_w, &view);
+                    apply(&picture, &fixed_w, &overlay_w, &mask_w, &view);
                 }
                 glib::Propagation::Stop
             });
@@ -172,6 +209,7 @@ impl EditorCanvas {
                 let picture = picture.clone();
                 let fixed_w = fixed.clone();
                 let overlay_w = overlay.clone();
+                let mask_w = mask_overlay.clone();
                 let view = view.clone();
                 let start = start.clone();
                 drag.connect_drag_update(move |_, dx, dy| {
@@ -181,7 +219,7 @@ impl EditorCanvas {
                     let (sx, sy) = start.get();
                     view.offset.set((sx + dx, sy + dy));
                     view.fit.set(false);
-                    apply(&picture, &fixed_w, &overlay_w, &view);
+                    apply(&picture, &fixed_w, &overlay_w, &mask_w, &view);
                 });
             }
         }
@@ -248,10 +286,11 @@ impl EditorCanvas {
             let fixed = fixed.clone();
             let view = view.clone();
             let overlay_w = overlay.clone();
+            let mask_w = mask_overlay.clone();
             overlay.connect_resize(move |_, _, _| {
                 if overlay_w.is_visible() {
                     view.fit.set(true);
-                    fit_now(&picture, &fixed, &overlay_w, &view);
+                    fit_now(&picture, &fixed, &overlay_w, &mask_w, &view);
                 }
             });
         }
@@ -262,6 +301,7 @@ impl EditorCanvas {
         root.set_vexpand(true);
         root.set_child(Some(&sw));
         root.add_overlay(&overlay);
+        root.add_overlay(&mask_overlay);
 
         Self {
             root,
@@ -269,10 +309,21 @@ impl EditorCanvas {
             fixed,
             picture,
             overlay,
+            mask_overlay,
+            mask_shapes,
             view,
             crop_rect,
             crop_aspect,
         }
+    }
+
+    /// Show/update the mask overlay with `shapes` (normalized coords). Empty +
+    /// `on = false` hides it.
+    pub fn set_mask_overlay(&self, shapes: Vec<MaskShape>, on: bool) {
+        let show = on && !shapes.is_empty();
+        *self.mask_shapes.borrow_mut() = shapes;
+        self.mask_overlay.set_visible(show);
+        self.mask_overlay.queue_draw();
     }
 
     pub fn root(&self) -> &gtk::Overlay {
@@ -303,7 +354,7 @@ impl EditorCanvas {
         }
         self.view.natural.set((nw, nh));
         self.picture.set_paintable(Some(texture));
-        apply(&self.picture, &self.fixed, &self.overlay, &self.view);
+        apply(&self.picture, &self.fixed, &self.overlay, &self.mask_overlay, &self.view);
     }
 
     /// Drop the current image (blank canvas) — e.g. while the next one decodes,
@@ -318,7 +369,7 @@ impl EditorCanvas {
         self.view.natural.set((texture.width(), texture.height()));
         self.picture.set_paintable(Some(texture));
         self.view.fit.set(true);
-        fit_now(&self.picture, &self.fixed, &self.overlay, &self.view);
+        fit_now(&self.picture, &self.fixed, &self.overlay, &self.mask_overlay, &self.view);
 
         // The Fixed may not be allocated yet on first open (size 0); re-fit once
         // its real size lands so the initial image is correctly centered (not
@@ -327,13 +378,14 @@ impl EditorCanvas {
         let picture = self.picture.clone();
         let fixed = self.fixed.clone();
         let overlay = self.overlay.clone();
+        let mask = self.mask_overlay.clone();
         let view = self.view.clone();
         self.fixed.add_tick_callback(move |w, _| {
             if !view.fit.get() {
                 return glib::ControlFlow::Break;
             }
             if w.width() > 0 && w.height() > 0 {
-                fit_now(&picture, &fixed, &overlay, &view);
+                fit_now(&picture, &fixed, &overlay, &mask, &view);
                 return glib::ControlFlow::Break;
             }
             glib::ControlFlow::Continue
@@ -349,7 +401,7 @@ impl EditorCanvas {
         }
         // Fit the whole image so the crop rectangle is fully reachable.
         self.view.fit.set(true);
-        fit_now(&self.picture, &self.fixed, &self.overlay, &self.view);
+        fit_now(&self.picture, &self.fixed, &self.overlay, &self.mask_overlay, &self.view);
         self.overlay.set_visible(true);
         self.overlay.queue_draw();
     }
@@ -410,7 +462,13 @@ fn install_bg_css() {
 }
 
 /// Compute and apply the fit-to-viewport scale, centered.
-fn fit_now(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingArea, view: &View) {
+fn fit_now(
+    picture: &gtk::Picture,
+    fixed: &gtk::Fixed,
+    overlay: &gtk::DrawingArea,
+    mask: &gtk::DrawingArea,
+    view: &View,
+) {
     let (nw, nh) = view.natural.get();
     if nw <= 0 || nh <= 0 {
         return;
@@ -420,7 +478,7 @@ fn fit_now(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingAre
     view.scale.set(s);
     view.offset
         .set(((vw - nw as f64 * s) / 2.0, (vh - nh as f64 * s) / 2.0));
-    apply(picture, fixed, overlay, view);
+    apply(picture, fixed, overlay, mask, view);
 }
 
 /// Viewport size = the ScrolledWindow's allocation (the Fixed is forced to match
@@ -444,7 +502,13 @@ fn viewport(fixed: &gtk::Fixed) -> (f64, f64) {
 /// Size and position the Picture from the current scale/offset. Pins the Fixed
 /// (and the crop overlay) to the viewport size so the wheel/cursor coordinate
 /// space matches.
-fn apply(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingArea, view: &View) {
+fn apply(
+    picture: &gtk::Picture,
+    fixed: &gtk::Fixed,
+    overlay: &gtk::DrawingArea,
+    mask: &gtk::DrawingArea,
+    view: &View,
+) {
     let (nw, nh) = view.natural.get();
     if nw <= 0 || nh <= 0 {
         return;
@@ -457,8 +521,61 @@ fn apply(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingArea,
     picture.set_size_request(w.max(1), h.max(1));
     let (ox, oy) = view.offset.get();
     fixed.move_(picture, ox, oy);
-    // The crop overlay is a separate layer that auto-fills; just repaint it.
+    // Crop + mask overlays are separate auto-filling layers; repaint them so they
+    // track the new image position/scale.
     overlay.queue_draw();
+    mask.queue_draw();
+}
+
+/// Draw the selected mask's geometric shapes over the image (read-only). Coords
+/// are normalized (0..1) and mapped through the same image→screen transform the
+/// crop overlay uses, so shapes stay glued to the photo under zoom/pan.
+fn draw_masks(cr: &cairo::Context, view: &View, shapes: &[MaskShape]) {
+    let (nw, nh) = view.natural.get();
+    if nw <= 0 || nh <= 0 {
+        return;
+    }
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    cr.set_line_width(1.5);
+    for shape in shapes {
+        match *shape {
+            MaskShape::Radial { cx, cy, rx, ry, rot } => {
+                let (scx, scy) = (ix + cx * iw, iy + cy * ih);
+                let (srx, sry) = (rx * iw, ry * ih);
+                let r = rot.to_radians();
+                let (cr_, sr_) = (r.cos(), r.sin());
+                // Sample the rotated ellipse as a polyline (transform-free, so the
+                // 1.5px stroke isn't distorted by a cairo scale).
+                for i in 0..=64 {
+                    let a = i as f64 / 64.0 * std::f64::consts::TAU;
+                    let (ex, ey) = (srx * a.cos(), sry * a.sin());
+                    let (px, py) = (scx + ex * cr_ - ey * sr_, scy + ex * sr_ + ey * cr_);
+                    if i == 0 {
+                        cr.move_to(px, py);
+                    } else {
+                        cr.line_to(px, py);
+                    }
+                }
+                stroke_outlined(cr);
+            }
+            MaskShape::Linear { x1, y1, x2, y2 } => {
+                cr.move_to(ix + x1 * iw, iy + y1 * ih);
+                cr.line_to(ix + x2 * iw, iy + y2 * ih);
+                stroke_outlined(cr);
+            }
+        }
+    }
+}
+
+/// Stroke the current path twice (dark halo, then white) so it reads on any
+/// background. Consumes the path.
+fn stroke_outlined(cr: &cairo::Context) {
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+    cr.set_line_width(3.0);
+    let _ = cr.stroke_preserve();
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_line_width(1.25);
+    let _ = cr.stroke();
 }
 
 /// Image rect (full picture) on screen, in widget px: (x, y, w, h).

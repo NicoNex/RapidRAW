@@ -191,6 +191,40 @@ pub fn new_mask(label: &str, mask_type: &str, w: f32, h: f32) -> MaskDefinition 
     }
 }
 
+/// Normalized (0..1) drawable shapes for a mask's visible radial/linear
+/// sub-masks, for the canvas overlay. `(w, h)` is the full image size (params are
+/// full-res pixels). Brush/flow/color/luminance/all have no drawable shape.
+pub fn overlay_shapes(m: &MaskDefinition, w: f64, h: f64) -> Vec<crate::editor::MaskShape> {
+    use crate::editor::MaskShape;
+    if w <= 0.0 || h <= 0.0 {
+        return Vec::new();
+    }
+    let g = |p: &Value, k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    m.sub_masks
+        .iter()
+        .filter(|sm| sm.visible)
+        .filter_map(|sm| {
+            let p = &sm.parameters;
+            match sm.mask_type.as_str() {
+                "radial" => Some(MaskShape::Radial {
+                    cx: g(p, "centerX") / w,
+                    cy: g(p, "centerY") / h,
+                    rx: g(p, "radiusX") / w,
+                    ry: g(p, "radiusY") / h,
+                    rot: g(p, "rotation"),
+                }),
+                "linear" => Some(MaskShape::Linear {
+                    x1: g(p, "startX") / w,
+                    y1: g(p, "startY") / h,
+                    x2: g(p, "endX") / w,
+                    y2: g(p, "endY") / h,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 pub struct MasksPanel {
     root: gtk::ScrolledWindow,
     /// Mask list (one row per container) + selected mask's controls below.
