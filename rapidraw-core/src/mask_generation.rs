@@ -54,15 +54,6 @@ impl MaskDefinition {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-struct GrowFeatherParameters {
-    #[serde(default)]
-    grow: f32,
-    #[serde(default)]
-    feather: f32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
 struct RadialMaskParameters {
     center_x: f64,
     center_y: f64,
@@ -278,7 +269,7 @@ fn grayscale_erode(image: &GrayImage, k: u8) -> GrayImage {
     GrayImage::from_raw(width, height, out).unwrap()
 }
 
-fn apply_grow_and_feather(mask: &mut GrayImage, grow: f32, feather: f32, width: u32, height: u32) {
+pub fn apply_grow_and_feather(mask: &mut GrayImage, grow: f32, feather: f32, width: u32, height: u32) {
     let base_dimension = width.min(height) as f32;
 
     if grow.abs() > 0.01 {
