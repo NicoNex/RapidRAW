@@ -64,15 +64,17 @@ HSL/colour-grading per-mask sliders + sub-mask mode UI remain for a follow-up.
 Defaults source-of-truth: React `INITIAL_MASK_ADJUSTMENTS`.
 Acceptance: add a radial mask, change exposure, see only the masked region change.
 
-### P3 — Mask geometry via numeric controls
+### P3 — Mask geometry via numeric controls ✅ DONE
 
 Edit sub-mask geometry without the canvas (parity-incremental, easy first).
+Implemented in `masks.rs::submask_editor` (AdwPreferencesGroup per sub-mask):
 
-- Radial: centerX/Y, radiusX/Y, rotation, feather (`AdwSpinRow`).
-- Linear: start/end points, range.
-- Color/Luminance: `ParametricMaskParameters` (tolerance, feather, range).
-- Brush/Flow: list of lines is canvas-driven — defer the editor to P4, but allow
-  clear/delete here.
+- Radial: centerX/Y, radiusX/Y, rotation, feather (`AdwSpinRow`). ✅
+- Linear: start/end points, range. ✅
+- Color/Luminance: `ParametricMaskParameters` (target, tolerance, grow, feather). ✅
+- Compositing **Mode** combo (Additive/Subtractive/Intersect) per sub-mask. ✅
+- Brush/Flow: canvas-driven — hint shown, editor deferred to P4.
+- Defaults verified against React `SUB_MASK_CONFIG` (display/stored multiplier).
 
 ### P4 — Canvas interaction + persistence
 
