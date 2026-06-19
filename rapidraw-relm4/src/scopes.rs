@@ -127,8 +127,9 @@ impl Scopes {
         // Clipping toggle (separate from the mode group): highlights blown/
         // crushed pixels on the preview via a model callback.
         let clip_cb: ClipCb = Rc::new(RefCell::new(None));
-        let clip_btn = gtk::ToggleButton::with_label("⚠");
-        clip_btn.add_css_class("caption");
+        let clip_btn = gtk::ToggleButton::new();
+        clip_btn.set_icon_name("dialog-warning-symbolic");
+        clip_btn.add_css_class("flat");
         clip_btn.set_tooltip_text(Some("Show clipped highlights/shadows"));
         clip_btn.set_margin_start(6);
         {
@@ -157,16 +158,25 @@ impl Scopes {
         {
             let area = area.clone();
             let drag = gtk::GestureDrag::new();
-            let start_h = Rc::new(Cell::new(SCOPE_H_DEFAULT));
+            // Anchor on the pointer's surface (toplevel) Y, not the gesture offset:
+            // resizing moves the grip, so an offset relative to it would feed back
+            // and flicker. Surface coords are stable. (start_height, start_surface_y)
+            let start = Rc::new(Cell::new((SCOPE_H_DEFAULT, 0.0_f64)));
+            let surf_y = |g: &gtk::GestureDrag| -> Option<f64> {
+                g.current_event().and_then(|e| e.position()).map(|(_, y)| y)
+            };
             {
-                let start_h = start_h.clone();
+                let start = start.clone();
                 let area = area.clone();
-                drag.connect_drag_begin(move |_, _, _| {
-                    start_h.set(area.content_height().max(SCOPE_H_MIN));
+                drag.connect_drag_begin(move |g, _, _| {
+                    let y = surf_y(g).unwrap_or(0.0);
+                    start.set((area.content_height().max(SCOPE_H_MIN), y));
                 });
             }
-            drag.connect_drag_update(move |_, _, dy| {
-                let h = (start_h.get() + dy as i32).clamp(SCOPE_H_MIN, SCOPE_H_MAX);
+            drag.connect_drag_update(move |g, _, _| {
+                let Some(y) = surf_y(g) else { return };
+                let (sh, sy) = start.get();
+                let h = (sh + (y - sy).round() as i32).clamp(SCOPE_H_MIN, SCOPE_H_MAX);
                 area.set_content_height(h);
             });
             grip.add_controller(drag);
