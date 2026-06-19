@@ -79,13 +79,15 @@ pub fn render(
     // applies it (`has_lut`/`lut_intensity` gate the mix in shader.wgsl).
     let mut adj = *adj;
     let mut mask_bitmaps: Vec<GrayImage> = Vec::new();
-    for (i, m) in masks.iter().take(crate::image_processing::MAX_MASKS).enumerate() {
+    let mut layer = 0usize;
+    for m in masks.iter().take(crate::image_processing::MAX_MASKS) {
         if let Some(bmp) =
             generate_mask_bitmap(m, width, height, scale, (0.0, 0.0), Some(&base), None)
         {
-            adj.mask_adjustments[i] =
+            adj.mask_adjustments[layer] =
                 crate::image_processing::get_mask_adjustments_from_json(&m.adjustments);
             mask_bitmaps.push(bmp);
+            layer += 1;
         }
     }
     adj.mask_count = mask_bitmaps.len() as u32;
@@ -160,5 +162,40 @@ mod tests {
         let center = out.get_pixel(32, 32)[0];
         let corner = out.get_pixel(1, 1)[0];
         assert!(center > corner + 5, "masked center ({center}) should be brighter than corner ({corner})");
+    }
+
+    #[test]
+    fn skipped_first_mask_does_not_misalign_adjustments() {
+        let ctx = match crate::headless_context() {
+            Ok(c) => c,
+            Err(_) => { eprintln!("no GPU; skipping"); return; }
+        };
+        let base = DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, image::Rgba([128, 128, 128, 255])));
+        let adj = AllAdjustments::default();
+        // First mask: invisible -> generate_mask_bitmap returns None (no bitmap, no layer)
+        let hidden = MaskDefinition {
+            id: "hidden".into(), name: "hidden".into(), visible: false, invert: false, opacity: 100.0,
+            adjustments: json!({ "exposure": -100.0 }),
+            sub_masks: vec![SubMask {
+                id: "h1".into(), mask_type: "radial".into(), visible: true, invert: false,
+                opacity: 100.0, mode: SubMaskMode::Additive,
+                parameters: json!({ "centerX": 32.0, "centerY": 32.0, "radiusX": 16.0, "radiusY": 16.0, "rotation": 0.0, "feather": 0.2 }),
+            }],
+        };
+        // Second mask: visible radial, exposure boost. Must end up at atlas layer 0 WITH its own adjustments.
+        let visible = MaskDefinition {
+            id: "vis".into(), name: "vis".into(), visible: true, invert: false, opacity: 100.0,
+            adjustments: json!({ "exposure": 100.0 }),
+            sub_masks: vec![SubMask {
+                id: "v1".into(), mask_type: "radial".into(), visible: true, invert: false,
+                opacity: 100.0, mode: SubMaskMode::Additive,
+                parameters: json!({ "centerX": 32.0, "centerY": 32.0, "radiusX": 16.0, "radiusY": 16.0, "rotation": 0.0, "feather": 0.2 }),
+            }],
+        };
+        let masks = [hidden, visible];
+        let out = render(&ctx, &base, &adj, &masks, None, None).unwrap().to_rgba8();
+        let center = out.get_pixel(32, 32)[0];
+        let corner = out.get_pixel(1, 1)[0];
+        assert!(center > corner + 5, "second mask's exposure must apply at layer 0 (center {center} vs corner {corner})");
     }
 }
