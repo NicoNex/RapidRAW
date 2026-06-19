@@ -207,6 +207,14 @@ enum AppMsg {
         key: &'static str,
         value: f64,
     },
+    /// Set an HSL component for mask `index`: band (reds/oranges/...), comp
+    /// (hue/saturation/luminance), UI value -100..100.
+    MaskHsl {
+        index: usize,
+        band: &'static str,
+        comp: &'static str,
+        value: f64,
+    },
     /// Set one geometry key in a sub-mask's parameters JSON.
     SetSubMaskParam {
         mask: usize,
@@ -1559,6 +1567,14 @@ impl Component for AppModel {
                     sender.input(AppMsg::RequestRender);
                 }
             }
+            AppMsg::MaskHsl { index, band, comp, value } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    mask_nested(&mut m.adjustments, "hsl", band)
+                        .insert(comp.to_string(), serde_json::json!(value));
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
             AppMsg::SetSubMaskParam {
                 mask,
                 sub,
@@ -2394,13 +2410,31 @@ impl Component for AppModel {
 /// Get (creating if needed) the `colorGrading` object inside a mask's
 /// `adjustments` JSON, so grading writes nest under it.
 fn mask_cg_obj(adj: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+    mask_nested_1(adj, "colorGrading")
+}
+
+/// Get (creating if needed) `adj[outer]` as an object.
+fn mask_nested_1<'a>(
+    adj: &'a mut serde_json::Value,
+    outer: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
     if !adj.is_object() {
         *adj = serde_json::json!({});
     }
     let obj = adj.as_object_mut().unwrap();
-    obj.entry("colorGrading")
-        .or_insert_with(|| serde_json::json!({}));
-    obj["colorGrading"].as_object_mut().unwrap()
+    obj.entry(outer).or_insert_with(|| serde_json::json!({}));
+    obj[outer].as_object_mut().unwrap()
+}
+
+/// Get (creating if needed) `adj[outer][inner]` as an object (e.g. hsl.reds).
+fn mask_nested<'a>(
+    adj: &'a mut serde_json::Value,
+    outer: &str,
+    inner: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let om = mask_nested_1(adj, outer);
+    om.entry(inner).or_insert_with(|| serde_json::json!({}));
+    om[inner].as_object_mut().unwrap()
 }
 
 /// Build the clipping-indicator texture: blown pixels (any channel 255) tinted

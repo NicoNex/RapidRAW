@@ -461,8 +461,83 @@ fn mask_details(
     }
     card.append(&body);
 
+    card.append(&build_mask_hsl(i, m, vadj, sender));
     card.append(&build_mask_grading(i, m, vadj, sender));
     card
+}
+
+/// HSL bands: `(display, json key)`, in core's band order.
+const HSL_BANDS: &[(&str, &str)] = &[
+    ("Reds", "reds"),
+    ("Oranges", "oranges"),
+    ("Yellows", "yellows"),
+    ("Greens", "greens"),
+    ("Aquas", "aquas"),
+    ("Blues", "blues"),
+    ("Purples", "purples"),
+    ("Magentas", "magentas"),
+];
+
+/// Per-mask HSL mixer: a band selector + Hue/Sat/Lum sliders for the chosen
+/// band, writing `adjustments.hsl.<band>` JSON. Sliders rebuild on band switch,
+/// seeded from stored values.
+fn build_mask_hsl(
+    i: usize,
+    m: &MaskDefinition,
+    vadj: &gtk::Adjustment,
+    sender: &ComponentSender<AppModel>,
+) -> gtk::Box {
+    let wrap = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    wrap.set_margin_all(6);
+    let head = gtk::Label::new(Some("HSL"));
+    head.set_halign(gtk::Align::Start);
+    head.add_css_class("heading");
+    wrap.append(&head);
+
+    let band = adw::ComboRow::new();
+    band.set_title("Band");
+    band.set_model(Some(&gtk::StringList::new(
+        &HSL_BANDS.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+    )));
+    wrap.append(&band);
+
+    let sliders = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    wrap.append(&sliders);
+
+    // Snapshot adjustments so the rebuild closure can seed from JSON.
+    let adj = m.adjustments.clone();
+    let vadj = vadj.clone();
+    let sender = sender.clone();
+    let rebuild = move |b: usize| {
+        while let Some(c) = sliders.first_child() {
+            sliders.remove(&c);
+        }
+        let (_, key) = HSL_BANDS[b];
+        let zone = adj.get("hsl").and_then(|h| h.get(key));
+        for (label, comp) in [
+            ("Hue", "hue"),
+            ("Saturation", "saturation"),
+            ("Luminance", "luminance"),
+        ] {
+            let cur = zone
+                .and_then(|z| z.get(comp))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let (sl, _, h) = slider_ex(label, -100.0, 100.0, 1.0, 0.0, Track::Plain, &vadj, {
+                let sender = sender.clone();
+                move |v| sender.input(AppMsg::MaskHsl { index: i, band: key, comp, value: v })
+            });
+            h.set_ui(cur);
+            sliders.append(&sl);
+        }
+    };
+    let rebuild = std::rc::Rc::new(rebuild);
+    {
+        let rebuild = rebuild.clone();
+        band.connect_selected_notify(move |r| rebuild(r.selected() as usize));
+    }
+    rebuild(0);
+    wrap
 }
 
 /// Per-mask color grading: 4 wheels (shadows/midtones/highlights/global) + the
