@@ -208,6 +208,17 @@ enum AppMsg {
     /// A mask handle was dragged on the canvas: write the edited geometry back to
     /// the selected mask's sub-mask (`shape.sub`).
     EditMaskGeom(editor::MaskShape),
+    /// Brush radius (image px) for painting brush/flow sub-masks.
+    SetBrushSize(f64),
+    /// Arm/disarm canvas painting into sub-mask index (within the selected mask).
+    ArmPaint(Option<usize>),
+    /// A finished brush stroke: normalized points to append to sub-mask `sub`.
+    AddBrushStroke {
+        sub: usize,
+        points: Vec<(f64, f64)>,
+    },
+    /// Clear all painted strokes from sub-mask `sub`.
+    ClearStrokes(usize),
     /// Add another sub-mask of `ty` to container `mask`.
     AddSubMask(usize, &'static str),
     DeleteSubMask {
@@ -446,6 +457,10 @@ struct AppModel {
     masks_panel: MasksPanel,
     /// Index of the mask whose adjustments are shown in the masks panel.
     selected_mask: Option<usize>,
+    /// Brush radius (image px) for painting brush/flow sub-masks.
+    brush_size: f64,
+    /// Sub-mask index currently armed for canvas painting (within selected mask).
+    paint_sub: Option<usize>,
     /// Switches the right column between adjustments / crop / masks panels.
     content_stack: gtk::Stack,
     /// True while the crop panel is active (canvas shows the crop overlay; the
@@ -540,6 +555,16 @@ impl AppModel {
             _ => Vec::new(),
         };
         self.canvas.set_mask_overlay(shapes, on);
+    }
+
+    /// Full (pre-preview) image dimensions as f64, if an image is open.
+    fn image_dims(&self) -> Option<(f64, f64)> {
+        use image::GenericImageView;
+        self.session
+            .base_image
+            .as_ref()
+            .map(|b| b.dimensions())
+            .map(|(w, h)| (w as f64, h as f64))
     }
 
     /// Texture to display now: original (before/after) > clipping overlay > edited.
@@ -947,6 +972,8 @@ impl Component for AppModel {
             crop: crop::CropPanel::new(&sender),
             masks_panel: MasksPanel::new(&sender),
             selected_mask: None,
+            brush_size: 50.0,
+            paint_sub: None,
             content_stack: gtk::Stack::new(),
             crop_active: false,
             crop_aspect: 0.0,
@@ -1256,6 +1283,13 @@ impl Component for AppModel {
                 .canvas
                 .set_mask_editor(move |shape| sender.input(AppMsg::EditMaskGeom(shape)));
         }
+        // Brush/flow strokes painted on the canvas append to the sub-mask.
+        {
+            let sender = sender.clone();
+            model.canvas.set_paint_sink(move |sub, points, _erase| {
+                sender.input(AppMsg::AddBrushStroke { sub, points })
+            });
+        }
         // Scopes clipping toggle feeds back into the model.
         {
             let sender = sender.clone();
@@ -1432,6 +1466,10 @@ impl Component for AppModel {
             }
             AppMsg::SelectMask(idx) => {
                 self.selected_mask = idx;
+                // Disarm painting (it targets a sub-mask of the prior selection).
+                if self.paint_sub.take().is_some() {
+                    self.canvas.set_paint(None);
+                }
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
             }
@@ -1564,6 +1602,66 @@ impl Component for AppModel {
                     // ponytail: spin rows stay stale until the panel rebuilds
                     // (reselect); the overlay updates live. Rebuild on every drag
                     // tick would thrash the panel.
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetBrushSize(px) => {
+                self.brush_size = px.max(1.0);
+                // Re-arm so the live brush preview tracks the new size.
+                if let Some(sub) = self.paint_sub {
+                    sender.input(AppMsg::ArmPaint(Some(sub)));
+                }
+            }
+            AppMsg::ArmPaint(sub) => {
+                self.paint_sub = sub;
+                let arm = sub.and_then(|s| {
+                    self.image_dims().map(|(w, _)| (s, self.brush_size / w, false))
+                });
+                self.canvas.set_paint(arm);
+            }
+            AppMsg::AddBrushStroke { sub, points } => {
+                let Some((w, h)) = self.image_dims() else { return };
+                if let Some(m) = self.session.masks.get_mut(self.selected_mask.unwrap_or(usize::MAX)) {
+                    if let Some(sm) = m.sub_masks.get_mut(sub) {
+                        let is_flow = sm.mask_type == "flow";
+                        let pts: Vec<serde_json::Value> = points
+                            .iter()
+                            .map(|(x, y)| serde_json::json!({ "x": x * w, "y": y * h }))
+                            .collect();
+                        let mut line = serde_json::json!({
+                            "tool": "brush",
+                            "brushSize": self.brush_size,
+                            "feather": 0.5,
+                            "points": pts,
+                        });
+                        if is_flow {
+                            // Flow lines carry a per-line flow (default matches core).
+                            line["flow"] = serde_json::json!(10.0);
+                        }
+                        let obj = sm.parameters.as_object_mut();
+                        if let Some(obj) = obj {
+                            obj.entry("lines")
+                                .or_insert_with(|| serde_json::json!([]));
+                            if let Some(arr) = obj["lines"].as_array_mut() {
+                                arr.push(line);
+                            }
+                        }
+                        self.schedule_history(&sender);
+                        sender.input(AppMsg::RequestRender);
+                    }
+                }
+            }
+            AppMsg::ClearStrokes(sub) => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(self.selected_mask.unwrap_or(usize::MAX))
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    if let Some(obj) = sm.parameters.as_object_mut() {
+                        obj.insert("lines".into(), serde_json::json!([]));
+                    }
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }

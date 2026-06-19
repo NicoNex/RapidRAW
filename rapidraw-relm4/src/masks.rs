@@ -551,14 +551,14 @@ fn submask_editor(
 
     let rows = geo_rows(&sm.mask_type);
     if rows.is_empty() {
-        let hint = adw::ActionRow::new();
-        hint.set_title(if matches!(sm.mask_type.as_str(), "brush" | "flow") {
-            "Paint on canvas (coming soon)"
+        if matches!(sm.mask_type.as_str(), "brush" | "flow") {
+            brush_controls(&group, sub_i, sm, sender);
         } else {
-            "No geometry"
-        });
-        hint.add_css_class("dim-label");
-        group.add(&hint);
+            let hint = adw::ActionRow::new();
+            hint.set_title("No geometry");
+            hint.add_css_class("dim-label");
+            group.add(&hint);
+        }
         return group;
     }
 
@@ -587,6 +587,54 @@ fn submask_editor(
         group.add(&row);
     }
     group
+}
+
+/// Brush/flow painting controls: brush size, a Paint arm toggle, and Clear.
+/// Stroke count shown so the user sees painting took effect.
+fn brush_controls(
+    group: &adw::PreferencesGroup,
+    sub_i: usize,
+    sm: &SubMask,
+    sender: &ComponentSender<AppModel>,
+) {
+    let size = adw::SpinRow::with_range(1.0, 1000.0, 1.0);
+    size.set_title("Brush size (px)");
+    size.set_value(50.0);
+    {
+        let sender = sender.clone();
+        size.connect_changed(move |r| sender.input(AppMsg::SetBrushSize(r.value())));
+    }
+    group.add(&size);
+
+    let paint = adw::SwitchRow::new();
+    paint.set_title("Paint");
+    paint.set_subtitle("Drag on the image to paint this mask");
+    {
+        let sender = sender.clone();
+        paint.connect_active_notify(move |r| {
+            sender.input(AppMsg::ArmPaint(r.is_active().then_some(sub_i)));
+        });
+    }
+    group.add(&paint);
+
+    let strokes = sm
+        .parameters
+        .get("lines")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let clear = adw::ActionRow::new();
+    clear.set_title("Clear strokes");
+    clear.set_subtitle(&format!("{strokes} painted"));
+    let clear_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+    clear_btn.add_css_class("flat");
+    clear_btn.set_valign(gtk::Align::Center);
+    {
+        let sender = sender.clone();
+        clear_btn.connect_clicked(move |_| sender.input(AppMsg::ClearStrokes(sub_i)));
+    }
+    clear.add_suffix(&clear_btn);
+    group.add(&clear);
 }
 
 /// Title-case a mask type string for display (e.g. "color" -> "Color").

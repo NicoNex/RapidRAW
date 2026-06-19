@@ -69,6 +69,19 @@ enum Region {
 /// Callback invoked live during a mask-handle drag with the edited shape.
 type MaskEditCb = Rc<RefCell<Option<Box<dyn Fn(MaskShape)>>>>;
 
+/// Callback fired when a brush/flow stroke finishes: `(sub index, normalized
+/// points, erase)`. The model denormalizes and appends a line to the sub-mask.
+type PaintSink = Rc<RefCell<Option<Box<dyn Fn(usize, Vec<(f64, f64)>, bool)>>>>;
+
+/// Armed brush/flow painting: which sub-mask, the brush radius (normalized to
+/// image width, for the live preview), and whether it erases.
+#[derive(Clone, Copy)]
+struct PaintArm {
+    sub: usize,
+    size_norm: f64,
+    erase: bool,
+}
+
 /// What a mask drag manipulates.
 #[derive(Clone, Copy)]
 enum MaskGrab {
@@ -126,6 +139,9 @@ pub struct EditorCanvas {
     mask_active: Rc<Cell<bool>>,
     /// Callback to the model with an edited shape (live, during drag).
     mask_edit: MaskEditCb,
+    /// Armed brush/flow painting (drag paints a stroke instead of panning).
+    paint: Rc<Cell<Option<PaintArm>>>,
+    paint_sink: PaintSink,
     view: View,
     /// Crop rectangle, normalized (x, y, w, h) in image space.
     crop_rect: Rc<Cell<(f64, f64, f64, f64)>>,
@@ -181,11 +197,17 @@ impl EditorCanvas {
         let mask_shapes: Rc<RefCell<Vec<MaskShape>>> = Rc::new(RefCell::new(Vec::new()));
         let mask_active = Rc::new(Cell::new(false));
         let mask_edit: MaskEditCb = Rc::new(RefCell::new(None));
+        let paint: Rc<Cell<Option<PaintArm>>> = Rc::new(Cell::new(None));
+        let stroke: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let paint_sink: PaintSink = Rc::new(RefCell::new(None));
         {
             let view = view.clone();
             let shapes = mask_shapes.clone();
+            let paint = paint.clone();
+            let stroke = stroke.clone();
             mask_overlay.set_draw_func(move |_, cr, _w, _h| {
                 draw_masks(cr, &view, &shapes.borrow());
+                draw_stroke(cr, &view, &stroke.borrow(), paint.get());
             });
         }
         // Track the pointer so the wheel can zoom toward it.
@@ -233,14 +255,33 @@ impl EditorCanvas {
         {
             let start = Rc::new(Cell::new((0.0, 0.0)));
             let mask_drag: Rc<Cell<Option<MaskDrag>>> = Rc::new(Cell::new(None));
+            // Widget point where a paint stroke began (to rebuild absolute points
+            // from the gesture's offsets).
+            let paint_start = Rc::new(Cell::new((0.0, 0.0)));
             {
                 let view = view.clone();
                 let start = start.clone();
                 let mask_drag = mask_drag.clone();
                 let mask_active = mask_active.clone();
                 let shapes = mask_shapes.clone();
+                let paint = paint.clone();
+                let stroke = stroke.clone();
+                let paint_start = paint_start.clone();
+                let mask_w = mask_overlay.clone();
                 drag.connect_drag_begin(move |_, x, y| {
                     start.set(view.offset.get());
+                    // Painting takes precedence over handle-edit and pan.
+                    if paint.get().is_some() {
+                        paint_start.set((x, y));
+                        let mut s = stroke.borrow_mut();
+                        s.clear();
+                        if let Some(p) = to_norm(&view, x, y) {
+                            s.push(p);
+                        }
+                        mask_drag.set(None);
+                        mask_w.queue_draw();
+                        return;
+                    }
                     mask_drag.set(if mask_active.get() {
                         hit_mask(&view, &shapes.borrow(), x, y)
                     } else {
@@ -257,8 +298,21 @@ impl EditorCanvas {
                 let start = start.clone();
                 let mask_drag = mask_drag.clone();
                 let mask_edit = mask_edit.clone();
+                let paint = paint.clone();
+                let stroke = stroke.clone();
+                let paint_start = paint_start.clone();
+                let mask_w2 = mask_overlay.clone();
                 drag.connect_drag_update(move |_, dx, dy| {
                     if overlay_w.is_visible() {
+                        return;
+                    }
+                    // Painting a brush/flow stroke takes precedence.
+                    if paint.get().is_some() {
+                        let (bx, by) = paint_start.get();
+                        if let Some(p) = to_norm(&view, bx + dx, by + dy) {
+                            stroke.borrow_mut().push(p);
+                            mask_w2.queue_draw();
+                        }
                         return;
                     }
                     // Editing a mask handle takes precedence over panning.
@@ -282,7 +336,22 @@ impl EditorCanvas {
             }
             {
                 let mask_drag = mask_drag.clone();
-                drag.connect_drag_end(move |_, _, _| mask_drag.set(None));
+                let paint = paint.clone();
+                let stroke = stroke.clone();
+                let paint_sink = paint_sink.clone();
+                let mask_w = mask_overlay.clone();
+                drag.connect_drag_end(move |_, _, _| {
+                    if let Some(arm) = paint.get() {
+                        let pts = std::mem::take(&mut *stroke.borrow_mut());
+                        if !pts.is_empty() {
+                            if let Some(cb) = paint_sink.borrow().as_ref() {
+                                cb(arm.sub, pts, arm.erase);
+                            }
+                        }
+                        mask_w.queue_draw();
+                    }
+                    mask_drag.set(None);
+                });
             }
         }
         fixed.add_controller(drag);
@@ -375,6 +444,8 @@ impl EditorCanvas {
             mask_shapes,
             mask_active,
             mask_edit,
+            paint,
+            paint_sink,
             view,
             crop_rect,
             crop_aspect,
@@ -395,6 +466,27 @@ impl EditorCanvas {
     /// shape; the model writes it back to the sub-mask's parameters.
     pub fn set_mask_editor(&self, cb: impl Fn(MaskShape) + 'static) {
         *self.mask_edit.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Arm brush/flow painting into sub-mask `sub` with brush radius `size_norm`
+    /// (normalized to image width) and `erase`; `None` disarms (drag pans again).
+    pub fn set_paint(&self, arm: Option<(usize, f64, bool)>) {
+        self.paint.set(arm.map(|(sub, size_norm, erase)| PaintArm {
+            sub,
+            size_norm,
+            erase,
+        }));
+        // The live stroke draws on the mask overlay; brush/flow masks have no
+        // radial/linear shape to keep it shown, so force it visible while armed.
+        if arm.is_some() {
+            self.mask_overlay.set_visible(true);
+        }
+        self.mask_overlay.queue_draw();
+    }
+
+    /// Set the callback fired when a brush/flow stroke finishes.
+    pub fn set_paint_sink(&self, cb: impl Fn(usize, Vec<(f64, f64)>, bool) + 'static) {
+        *self.paint_sink.borrow_mut() = Some(Box::new(cb));
     }
 
     pub fn root(&self) -> &gtk::Overlay {
@@ -719,6 +811,43 @@ fn apply_mask_drag(md: MaskDrag, cur: (f64, f64)) -> MaskShape {
         // Grab/shape mismatch can't happen (grab derived from the same shape).
         (_, s) => s,
     }
+}
+
+/// Widget point -> normalized image coords (0..1), clamped to the image.
+fn to_norm(view: &View, x: f64, y: f64) -> Option<(f64, f64)> {
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 || ih <= 0.0 {
+        return None;
+    }
+    Some((((x - ix) / iw).clamp(0.0, 1.0), ((y - iy) / ih).clamp(0.0, 1.0)))
+}
+
+/// Draw the in-progress brush/flow stroke as a thick translucent polyline.
+fn draw_stroke(cr: &cairo::Context, view: &View, pts: &[(f64, f64)], arm: Option<PaintArm>) {
+    let Some(arm) = arm else { return };
+    if pts.is_empty() {
+        return;
+    }
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 {
+        return;
+    }
+    // Brush diameter on screen = 2 * radius_norm * image_screen_width.
+    let width = (arm.size_norm * 2.0 * iw).max(2.0);
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.set_line_join(cairo::LineJoin::Round);
+    cr.set_line_width(width);
+    if arm.erase {
+        cr.set_source_rgba(1.0, 0.3, 0.3, 0.35);
+    } else {
+        cr.set_source_rgba(0.4, 0.7, 1.0, 0.35);
+    }
+    let (x0, y0) = pts[0];
+    cr.move_to(ix + x0 * iw, iy + y0 * ih);
+    for &(x, y) in &pts[1..] {
+        cr.line_to(ix + x * iw, iy + y * ih);
+    }
+    let _ = cr.stroke();
 }
 
 /// Draw a small grab handle (white dot, dark ring) at a screen point.
