@@ -18,6 +18,7 @@ mod crop;
 mod curves;
 mod editor;
 mod library;
+mod masks;
 mod meta;
 mod scopes;
 mod settings;
@@ -27,6 +28,7 @@ mod state;
 mod thumb;
 mod thumb_cache;
 use controls::AdjustPanel;
+use masks::MasksPanel;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
@@ -174,6 +176,20 @@ enum AppMsg {
     /// Right-rail switcher: show the adjustments panel / the crop panel.
     ShowAdjustPanel,
     ShowCropPanel,
+    ShowMasksPanel,
+    /// Masks panel actions.
+    AddMask(&'static str),
+    SelectMask(Option<usize>),
+    DeleteMask(usize),
+    ToggleMaskVisible(usize),
+    ToggleMaskInvert(usize),
+    SetMaskOpacity(usize, f64),
+    /// Set one scalar key in mask `index`'s adjustments JSON.
+    MaskAdjust {
+        index: usize,
+        key: &'static str,
+        value: f64,
+    },
     /// Editor toolbar: copy the current edit settings, paste onto this image.
     CopySettings,
     PasteSettings,
@@ -388,7 +404,11 @@ struct AppModel {
     geom: Geometry,
     /// Crop panel (right-rail "Crop" section).
     crop: crop::CropPanel,
-    /// Switches the right column between the adjustments panel and crop panel.
+    /// Masks panel (right-rail "Masks" section).
+    masks_panel: MasksPanel,
+    /// Index of the mask whose adjustments are shown in the masks panel.
+    selected_mask: Option<usize>,
+    /// Switches the right column between adjustments / crop / masks panels.
     content_stack: gtk::Stack,
     /// True while the crop panel is active (canvas shows the crop overlay; the
     /// preview is rendered uncropped so the overlay can be adjusted).
@@ -836,6 +856,8 @@ impl Component for AppModel {
             last_folder: load_last_folder(),
             geom: Geometry::default(),
             crop: crop::CropPanel::new(&sender),
+            masks_panel: MasksPanel::new(&sender),
+            selected_mask: None,
             content_stack: gtk::Stack::new(),
             crop_active: false,
             crop_aspect: 0.0,
@@ -1068,6 +1090,9 @@ impl Component for AppModel {
         model
             .content_stack
             .add_named(model.crop.root(), Some("crop"));
+        model
+            .content_stack
+            .add_named(model.masks_panel.root(), Some("masks"));
         model.content_stack.set_visible_child_name("adjust");
         // Fixed, comfortable panel width. The Paned sizes the end child to this
         // natural width at any window size (the canvas absorbs the rest), so the
@@ -1088,6 +1113,9 @@ impl Component for AppModel {
         let crop_btn = gtk::ToggleButton::with_label("Crop");
         crop_btn.set_tooltip_text(Some("Crop & geometry"));
         crop_btn.set_group(Some(&adj_btn));
+        let masks_btn = gtk::ToggleButton::with_label("Masks");
+        masks_btn.set_tooltip_text(Some("Masks"));
+        masks_btn.set_group(Some(&adj_btn));
         {
             let sender = sender.clone();
             adj_btn.connect_toggled(move |b| {
@@ -1104,8 +1132,17 @@ impl Component for AppModel {
                 }
             });
         }
+        {
+            let sender = sender.clone();
+            masks_btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::ShowMasksPanel);
+                }
+            });
+        }
         tabs.append(&adj_btn);
         tabs.append(&crop_btn);
+        tabs.append(&masks_btn);
 
         model.right_col.append(&tabs);
         model.right_col.append(model.scopes.root());
@@ -1243,6 +1280,94 @@ impl Component for AppModel {
                 self.canvas.enter_crop(self.crop_aspect as f64);
                 sender.input(AppMsg::RequestRender);
             }
+            AppMsg::ShowMasksPanel => {
+                self.content_stack.set_visible_child_name("masks");
+                // Leaving crop mode commits the interactive crop (mirror ShowAdjustPanel).
+                if self.crop_active {
+                    self.crop_active = false;
+                    let (x, y, w, h) = self.canvas.exit_crop();
+                    self.geom.crop = if w >= 0.999 && h >= 0.999 && x <= 0.001 && y <= 0.001 {
+                        None
+                    } else {
+                        Some([x as f32, y as f32, w as f32, h as f32])
+                    };
+                    sender.input(AppMsg::RequestRender);
+                }
+                self.masks_panel
+                    .rebuild(&self.session.masks, self.selected_mask, &sender);
+            }
+            AppMsg::AddMask(ty) => {
+                // Default sub-mask geometry needs the full image size.
+                let (w, h) = self
+                    .session
+                    .base_image
+                    .as_ref()
+                    .map(|b| {
+                        use image::GenericImageView;
+                        let (w, h) = b.dimensions();
+                        (w as f32, h as f32)
+                    })
+                    .unwrap_or((1000.0, 1000.0));
+                let label = masks::MASK_TYPES
+                    .iter()
+                    .find(|(_, t)| *t == ty)
+                    .map(|(l, _)| *l)
+                    .unwrap_or(ty);
+                self.session.masks.push(masks::new_mask(label, ty, w, h));
+                self.selected_mask = Some(self.session.masks.len() - 1);
+                self.masks_panel
+                    .rebuild(&self.session.masks, self.selected_mask, &sender);
+                // ponytail: masks aren't in HistEntry yet (undo won't revert
+                // them); wire into history with sidecar persistence in P4.
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::SelectMask(idx) => {
+                self.selected_mask = idx;
+                self.masks_panel
+                    .rebuild(&self.session.masks, self.selected_mask, &sender);
+            }
+            AppMsg::DeleteMask(i) => {
+                if i < self.session.masks.len() {
+                    self.session.masks.remove(i);
+                    // Keep the selection valid after removal.
+                    self.selected_mask = match self.selected_mask {
+                        Some(s) if s == i => None,
+                        Some(s) if s > i => Some(s - 1),
+                        other => other,
+                    };
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::ToggleMaskVisible(i) => {
+                if let Some(m) = self.session.masks.get_mut(i) {
+                    m.visible = !m.visible;
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::ToggleMaskInvert(i) => {
+                if let Some(m) = self.session.masks.get_mut(i) {
+                    m.invert = !m.invert;
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetMaskOpacity(i, v) => {
+                if let Some(m) = self.session.masks.get_mut(i) {
+                    m.opacity = v as f32;
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskAdjust { index, key, value } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    if let Some(obj) = m.adjustments.as_object_mut() {
+                        obj.insert(key.to_string(), serde_json::json!(value));
+                    }
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
             AppMsg::CopySettings => {
                 self.settings_clip = Some(SettingsClip {
                     global: self.session.adjustments.global,
@@ -1335,6 +1460,9 @@ impl Component for AppModel {
                 controls::init_defaults(&mut self.session.adjustments.global);
                 self.session.lut = None;
                 self.lut_path = None;
+                self.session.masks.clear();
+                self.selected_mask = None;
+                self.masks_panel.rebuild(&self.session.masks, None, &sender);
                 self.panel.reset();
                 // Crop panel is small; rebuild so its toggles/straighten reset.
                 let fresh = crop::CropPanel::new(&sender);
