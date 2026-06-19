@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use image::{DynamicImage, GenericImageView, RgbaImage};
+use image::{DynamicImage, GenericImageView, GrayImage, RgbaImage};
 use wgpu::util::{DeviceExt, TextureDataOrder};
 
 use crate::gpu_processing::{to_rgba_f16, GpuProcessor, RenderRequest};
 use crate::image_processing::{AllAdjustments, GpuContext};
 use crate::lut_processing::Lut;
+use crate::mask_generation::{generate_mask_bitmap, MaskDefinition};
 
 /// Render `base` through the GPU pipeline with `adj`. Optionally apply a 3D
 /// `lut` (its strength is `adj.global.lut_intensity`, 0.0..1.0) and optionally
@@ -15,9 +16,13 @@ pub fn render(
     ctx: &GpuContext,
     base: &DynamicImage,
     adj: &AllAdjustments,
+    masks: &[MaskDefinition],
     lut: Option<Arc<Lut>>,
     max_dim: Option<u32>,
 ) -> Result<DynamicImage, String> {
+    // Capture full dimensions before any downscale.
+    let base_full_dims = base.dimensions();
+
     // Optional downscale for preview.
     let base = match max_dim {
         Some(m) => {
@@ -63,14 +68,32 @@ pub fn render(
     );
     let input_view = input_texture.create_view(&Default::default());
 
+    // Compute scale for mask rasterization (render size / full size).
+    let scale = if base_full_dims.0 > 0 {
+        width as f32 / base_full_dims.0 as f32
+    } else {
+        1.0
+    };
+
     // AllAdjustments is Pod (Copy); flag whether a LUT is bound so the shader
     // applies it (`has_lut`/`lut_intensity` gate the mix in shader.wgsl).
     let mut adj = *adj;
+    let mut mask_bitmaps: Vec<GrayImage> = Vec::new();
+    for (i, m) in masks.iter().take(crate::image_processing::MAX_MASKS).enumerate() {
+        if let Some(bmp) =
+            generate_mask_bitmap(m, width, height, scale, (0.0, 0.0), Some(&base), None)
+        {
+            adj.mask_adjustments[i] =
+                crate::image_processing::get_mask_adjustments_from_json(&m.adjustments);
+            mask_bitmaps.push(bmp);
+        }
+    }
+    adj.mask_count = mask_bitmaps.len() as u32;
     adj.global.has_lut = if lut.is_some() { 1 } else { 0 };
 
     let request = RenderRequest {
         adjustments: adj,
-        mask_bitmaps: &[],
+        mask_bitmaps: &mask_bitmaps,
         lut,
         roi: None,
     };
@@ -101,4 +124,41 @@ thread_local! {
     /// when the render size changes.
     static PROCESSOR_CACHE: std::cell::RefCell<Option<(u32, u32, GpuProcessor)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image_processing::AllAdjustments;
+    use crate::mask_generation::{MaskDefinition, SubMask, SubMaskMode};
+    use image::{DynamicImage, RgbaImage};
+    use serde_json::json;
+
+    #[test]
+    fn mask_with_exposure_changes_only_masked_region() {
+        let ctx = match crate::headless_context() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("no GPU; skipping mask render test");
+                return;
+            }
+        };
+        let base = DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, image::Rgba([128, 128, 128, 255])));
+        let adj = AllAdjustments::default();
+        let mask = MaskDefinition {
+            id: "m".into(), name: "m".into(), visible: true, invert: false, opacity: 100.0,
+            adjustments: json!({ "exposure": 100.0 }),
+            sub_masks: vec![SubMask {
+                id: "s".into(), mask_type: "radial".into(), visible: true, invert: false,
+                opacity: 100.0, mode: SubMaskMode::Additive,
+                parameters: json!({ "centerX": 32.0, "centerY": 32.0, "radiusX": 16.0, "radiusY": 16.0, "rotation": 0.0, "feather": 0.2 }),
+            }],
+        };
+        let out = render(&ctx, &base, &adj, std::slice::from_ref(&mask), None, None)
+            .unwrap()
+            .to_rgba8();
+        let center = out.get_pixel(32, 32)[0];
+        let corner = out.get_pixel(1, 1)[0];
+        assert!(center > corner + 5, "masked center ({center}) should be brighter than corner ({corner})");
+    }
 }

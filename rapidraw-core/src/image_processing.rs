@@ -2162,7 +2162,7 @@ fn get_global_adjustments_from_json(
 
 // ponytail: kept for the not-yet-ported masks feature; remove if masks land differently.
 #[allow(dead_code)]
-fn get_mask_adjustments_from_json(adj: &serde_json::Value) -> MaskAdjustments {
+pub(crate) fn get_mask_adjustments_from_json(adj: &serde_json::Value) -> MaskAdjustments {
     if adj.is_null() {
         return MaskAdjustments::default();
     }
