@@ -29,11 +29,13 @@ use gtk::prelude::*;
 use crate::settings::Background;
 
 /// A selected mask's geometric sub-mask, in normalized image coords (0..1), for
-/// the read-only overlay. Brush/flow/color/luminance have no drawable shape.
-#[derive(Clone)]
+/// the canvas overlay. `sub` is the index into the mask's `sub_masks` (so a drag
+/// maps back to the right one). Brush/flow/color/luminance have no shape.
+#[derive(Clone, Copy, Debug)]
 pub enum MaskShape {
     /// Centre + radii normalized; rotation in degrees.
     Radial {
+        sub: usize,
         cx: f64,
         cy: f64,
         rx: f64,
@@ -41,6 +43,7 @@ pub enum MaskShape {
         rot: f64,
     },
     Linear {
+        sub: usize,
         x1: f64,
         y1: f64,
         x2: f64,
@@ -61,6 +64,27 @@ enum Region {
     Ne,
     Sw,
     Se,
+}
+
+/// Callback invoked live during a mask-handle drag with the edited shape.
+type MaskEditCb = Rc<RefCell<Option<Box<dyn Fn(MaskShape)>>>>;
+
+/// What a mask drag manipulates.
+#[derive(Clone, Copy)]
+enum MaskGrab {
+    RadialMove,
+    RadialResize,
+    LinearStart,
+    LinearEnd,
+}
+
+/// In-progress mask drag: which grab, the shape at press, and the press point in
+/// normalized image coords.
+#[derive(Clone, Copy)]
+struct MaskDrag {
+    grab: MaskGrab,
+    orig: MaskShape,
+    press: (f64, f64),
 }
 
 /// Hit-test radius (px) for crop handles.
@@ -94,9 +118,14 @@ pub struct EditorCanvas {
     fixed: gtk::Fixed,
     picture: gtk::Picture,
     overlay: gtk::DrawingArea,
-    /// Read-only overlay drawing the selected mask's geometric shapes.
+    /// Overlay drawing (and hit-testing) the selected mask's geometric shapes.
     mask_overlay: gtk::DrawingArea,
     mask_shapes: Rc<RefCell<Vec<MaskShape>>>,
+    /// True while the Masks tab is active with a geometric mask selected — gates
+    /// whether canvas drags edit a mask handle (vs. pan).
+    mask_active: Rc<Cell<bool>>,
+    /// Callback to the model with an edited shape (live, during drag).
+    mask_edit: MaskEditCb,
     view: View,
     /// Crop rectangle, normalized (x, y, w, h) in image space.
     crop_rect: Rc<Cell<(f64, f64, f64, f64)>>,
@@ -150,6 +179,8 @@ impl EditorCanvas {
         mask_overlay.set_visible(false);
         mask_overlay.set_can_target(false);
         let mask_shapes: Rc<RefCell<Vec<MaskShape>>> = Rc::new(RefCell::new(Vec::new()));
+        let mask_active = Rc::new(Cell::new(false));
+        let mask_edit: MaskEditCb = Rc::new(RefCell::new(None));
         {
             let view = view.clone();
             let shapes = mask_shapes.clone();
@@ -196,14 +227,26 @@ impl EditorCanvas {
         }
         fixed.add_controller(scroll);
 
-        // Drag = pan (disabled in crop mode, where the overlay handles drags).
+        // Drag = pan, except: in crop mode the crop overlay handles it, and in
+        // masks mode a press on a mask handle edits that handle instead of panning.
         let drag = gtk::GestureDrag::new();
         {
             let start = Rc::new(Cell::new((0.0, 0.0)));
+            let mask_drag: Rc<Cell<Option<MaskDrag>>> = Rc::new(Cell::new(None));
             {
                 let view = view.clone();
                 let start = start.clone();
-                drag.connect_drag_begin(move |_, _x, _y| start.set(view.offset.get()));
+                let mask_drag = mask_drag.clone();
+                let mask_active = mask_active.clone();
+                let shapes = mask_shapes.clone();
+                drag.connect_drag_begin(move |_, x, y| {
+                    start.set(view.offset.get());
+                    mask_drag.set(if mask_active.get() {
+                        hit_mask(&view, &shapes.borrow(), x, y)
+                    } else {
+                        None
+                    });
+                });
             }
             {
                 let picture = picture.clone();
@@ -212,8 +255,23 @@ impl EditorCanvas {
                 let mask_w = mask_overlay.clone();
                 let view = view.clone();
                 let start = start.clone();
+                let mask_drag = mask_drag.clone();
+                let mask_edit = mask_edit.clone();
                 drag.connect_drag_update(move |_, dx, dy| {
                     if overlay_w.is_visible() {
+                        return;
+                    }
+                    // Editing a mask handle takes precedence over panning.
+                    if let Some(md) = mask_drag.get() {
+                        let (_, _, iw, ih) = image_screen_rect(&view);
+                        if iw <= 0.0 || ih <= 0.0 {
+                            return;
+                        }
+                        let cur = (md.press.0 + dx / iw, md.press.1 + dy / ih);
+                        let shape = apply_mask_drag(md, cur);
+                        if let Some(cb) = mask_edit.borrow().as_ref() {
+                            cb(shape);
+                        }
                         return;
                     }
                     let (sx, sy) = start.get();
@@ -221,6 +279,10 @@ impl EditorCanvas {
                     view.fit.set(false);
                     apply(&picture, &fixed_w, &overlay_w, &mask_w, &view);
                 });
+            }
+            {
+                let mask_drag = mask_drag.clone();
+                drag.connect_drag_end(move |_, _, _| mask_drag.set(None));
             }
         }
         fixed.add_controller(drag);
@@ -311,19 +373,28 @@ impl EditorCanvas {
             overlay,
             mask_overlay,
             mask_shapes,
+            mask_active,
+            mask_edit,
             view,
             crop_rect,
             crop_aspect,
         }
     }
 
-    /// Show/update the mask overlay with `shapes` (normalized coords). Empty +
-    /// `on = false` hides it.
+    /// Show/update the mask overlay with `shapes` (normalized coords). `on` =
+    /// Masks tab active; drives both visibility and whether drags edit handles.
     pub fn set_mask_overlay(&self, shapes: Vec<MaskShape>, on: bool) {
         let show = on && !shapes.is_empty();
         *self.mask_shapes.borrow_mut() = shapes;
+        self.mask_active.set(show);
         self.mask_overlay.set_visible(show);
         self.mask_overlay.queue_draw();
+    }
+
+    /// Set the callback invoked (live, during a handle drag) with the edited
+    /// shape; the model writes it back to the sub-mask's parameters.
+    pub fn set_mask_editor(&self, cb: impl Fn(MaskShape) + 'static) {
+        *self.mask_edit.borrow_mut() = Some(Box::new(cb));
     }
 
     pub fn root(&self) -> &gtk::Overlay {
@@ -539,7 +610,7 @@ fn draw_masks(cr: &cairo::Context, view: &View, shapes: &[MaskShape]) {
     cr.set_line_width(1.5);
     for shape in shapes {
         match *shape {
-            MaskShape::Radial { cx, cy, rx, ry, rot } => {
+            MaskShape::Radial { cx, cy, rx, ry, rot, .. } => {
                 let (scx, scy) = (ix + cx * iw, iy + cy * ih);
                 let (srx, sry) = (rx * iw, ry * ih);
                 let r = rot.to_radians();
@@ -557,14 +628,107 @@ fn draw_masks(cr: &cairo::Context, view: &View, shapes: &[MaskShape]) {
                     }
                 }
                 stroke_outlined(cr);
+                handle(cr, scx, scy); // centre = move
             }
-            MaskShape::Linear { x1, y1, x2, y2 } => {
-                cr.move_to(ix + x1 * iw, iy + y1 * ih);
-                cr.line_to(ix + x2 * iw, iy + y2 * ih);
+            MaskShape::Linear { x1, y1, x2, y2, .. } => {
+                let (a, b) = ((ix + x1 * iw, iy + y1 * ih), (ix + x2 * iw, iy + y2 * ih));
+                cr.move_to(a.0, a.1);
+                cr.line_to(b.0, b.1);
                 stroke_outlined(cr);
+                handle(cr, a.0, a.1);
+                handle(cr, b.0, b.1);
             }
         }
     }
+}
+
+/// Hit-test mask handles at widget point `(x, y)`. Returns the grab + the shape
+/// at press + the press point in normalized image coords. Radial: centre =>
+/// move, near boundary => resize. Linear: nearest endpoint.
+fn hit_mask(view: &View, shapes: &[MaskShape], x: f64, y: f64) -> Option<MaskDrag> {
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 || ih <= 0.0 {
+        return None;
+    }
+    let press = ((x - ix) / iw, (y - iy) / ih);
+    let near = |px: f64, py: f64| (px - x).hypot(py - y) <= HANDLE;
+    for shape in shapes {
+        match *shape {
+            MaskShape::Radial { cx, cy, rx, ry, rot, .. } => {
+                let (scx, scy) = (ix + cx * iw, iy + cy * ih);
+                if near(scx, scy) {
+                    return Some(MaskDrag { grab: MaskGrab::RadialMove, orig: *shape, press });
+                }
+                // Boundary hit: rotate the press into the ellipse's local frame,
+                // measure radial distance d (==1 on the boundary), and check the
+                // pixel gap from press to the boundary along that ray.
+                let r = rot.to_radians();
+                let (lx, ly) = (x - scx, y - scy);
+                let (ux, uy) = (lx * r.cos() + ly * r.sin(), -lx * r.sin() + ly * r.cos());
+                let (srx, sry) = ((rx * iw).max(1.0), (ry * ih).max(1.0));
+                let d = (ux / srx).hypot(uy / sry);
+                let gap = ux.hypot(uy) * (1.0 - 1.0 / d.max(1e-6)).abs();
+                if d > 0.1 && gap <= HANDLE {
+                    return Some(MaskDrag { grab: MaskGrab::RadialResize, orig: *shape, press });
+                }
+            }
+            MaskShape::Linear { x1, y1, x2, y2, .. } => {
+                if near(ix + x1 * iw, iy + y1 * ih) {
+                    return Some(MaskDrag { grab: MaskGrab::LinearStart, orig: *shape, press });
+                }
+                if near(ix + x2 * iw, iy + y2 * ih) {
+                    return Some(MaskDrag { grab: MaskGrab::LinearEnd, orig: *shape, press });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Produce the edited shape for a drag whose pointer is at normalized `cur`.
+fn apply_mask_drag(md: MaskDrag, cur: (f64, f64)) -> MaskShape {
+    let cl = |v: f64| v.clamp(0.0, 1.0);
+    match (md.grab, md.orig) {
+        (MaskGrab::RadialMove, MaskShape::Radial { sub, cx, cy, rx, ry, rot }) => {
+            let dx = cur.0 - md.press.0;
+            let dy = cur.1 - md.press.1;
+            MaskShape::Radial { sub, cx: cl(cx + dx), cy: cl(cy + dy), rx, ry, rot }
+        }
+        (MaskGrab::RadialResize, MaskShape::Radial { sub, cx, cy, rot, .. }) => MaskShape::Radial {
+            sub,
+            cx,
+            cy,
+            rx: (cur.0 - cx).abs().max(0.005),
+            ry: (cur.1 - cy).abs().max(0.005),
+            rot,
+        },
+        (MaskGrab::LinearStart, MaskShape::Linear { sub, x2, y2, .. }) => MaskShape::Linear {
+            sub,
+            x1: cl(cur.0),
+            y1: cl(cur.1),
+            x2,
+            y2,
+        },
+        (MaskGrab::LinearEnd, MaskShape::Linear { sub, x1, y1, .. }) => MaskShape::Linear {
+            sub,
+            x1,
+            y1,
+            x2: cl(cur.0),
+            y2: cl(cur.1),
+        },
+        // Grab/shape mismatch can't happen (grab derived from the same shape).
+        (_, s) => s,
+    }
+}
+
+/// Draw a small grab handle (white dot, dark ring) at a screen point.
+fn handle(cr: &cairo::Context, x: f64, y: f64) {
+    cr.arc(x, y, 5.0, 0.0, std::f64::consts::TAU);
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    let _ = cr.fill_preserve();
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.7);
+    cr.set_line_width(1.0);
+    let _ = cr.stroke();
 }
 
 /// Stroke the current path twice (dark halo, then white) so it reads on any

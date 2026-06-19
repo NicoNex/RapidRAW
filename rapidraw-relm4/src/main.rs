@@ -203,6 +203,9 @@ enum AppMsg {
         sub: usize,
         mode: u32,
     },
+    /// A mask handle was dragged on the canvas: write the edited geometry back to
+    /// the selected mask's sub-mask (`shape.sub`).
+    EditMaskGeom(editor::MaskShape),
     /// Add another sub-mask of `ty` to container `mask`.
     AddSubMask(usize, &'static str),
     DeleteSubMask {
@@ -1217,6 +1220,14 @@ impl Component for AppModel {
         paned.set_shrink_end_child(false);
         // No absolute position: the divider follows the end child's natural width
         // (370) regardless of window size, and the user can drag to override.
+
+        // Canvas mask-handle drags feed back into the model as geometry edits.
+        {
+            let sender = sender.clone();
+            model
+                .canvas
+                .set_mask_editor(move |shape| sender.input(AppMsg::EditMaskGeom(shape)));
+        }
         ComponentParts { model, widgets }
     }
 
@@ -1461,6 +1472,57 @@ impl Component for AppModel {
                     .and_then(|m| m.sub_masks.get_mut(sub))
                 {
                     sm.mode = masks::mode_from_index(mode);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::EditMaskGeom(shape) => {
+                use image::GenericImageView;
+                let Some((w, h)) = self
+                    .session
+                    .base_image
+                    .as_ref()
+                    .map(|b| b.dimensions())
+                    .map(|(w, h)| (w as f64, h as f64))
+                else {
+                    return;
+                };
+                // Denormalize into full-res pixels and write only the dragged
+                // keys (feather/rotation/range stay as set in the spin rows).
+                let (sub, keys): (usize, Vec<(&str, f64)>) = match shape {
+                    editor::MaskShape::Radial { sub, cx, cy, rx, ry, .. } => (
+                        sub,
+                        vec![
+                            ("centerX", cx * w),
+                            ("centerY", cy * h),
+                            ("radiusX", rx * w),
+                            ("radiusY", ry * h),
+                        ],
+                    ),
+                    editor::MaskShape::Linear { sub, x1, y1, x2, y2, .. } => (
+                        sub,
+                        vec![
+                            ("startX", x1 * w),
+                            ("startY", y1 * h),
+                            ("endX", x2 * w),
+                            ("endY", y2 * h),
+                        ],
+                    ),
+                };
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(self.selected_mask.unwrap_or(usize::MAX))
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    if let Some(obj) = sm.parameters.as_object_mut() {
+                        for (k, v) in keys {
+                            obj.insert(k.to_string(), serde_json::json!(v));
+                        }
+                    }
+                    // ponytail: spin rows stay stale until the panel rebuilds
+                    // (reselect); the overlay updates live. Rebuild on every drag
+                    // tick would thrash the panel.
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }

@@ -202,11 +202,13 @@ pub fn overlay_shapes(m: &MaskDefinition, w: f64, h: f64) -> Vec<crate::editor::
     let g = |p: &Value, k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     m.sub_masks
         .iter()
-        .filter(|sm| sm.visible)
-        .filter_map(|sm| {
+        .enumerate()
+        .filter(|(_, sm)| sm.visible)
+        .filter_map(|(sub, sm)| {
             let p = &sm.parameters;
             match sm.mask_type.as_str() {
                 "radial" => Some(MaskShape::Radial {
+                    sub,
                     cx: g(p, "centerX") / w,
                     cy: g(p, "centerY") / h,
                     rx: g(p, "radiusX") / w,
@@ -214,6 +216,7 @@ pub fn overlay_shapes(m: &MaskDefinition, w: f64, h: f64) -> Vec<crate::editor::
                     rot: g(p, "rotation"),
                 }),
                 "linear" => Some(MaskShape::Linear {
+                    sub,
                     x1: g(p, "startX") / w,
                     y1: g(p, "startY") / h,
                     x2: g(p, "endX") / w,
