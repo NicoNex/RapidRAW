@@ -944,3 +944,143 @@ fn generate_luminance_bitmap(
 fn generate_all_bitmap(width: u32, height: u32) -> GrayImage {
     GrayImage::from_pixel(width, height, Luma([255]))
 }
+
+fn generate_sub_mask_bitmap(
+    sub_mask: &SubMask,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+    warped_image: Option<&DynamicImage>,
+    ai: Option<AiResolver>,
+) -> Option<GrayImage> {
+    if !sub_mask.visible {
+        return None;
+    }
+    match sub_mask.mask_type.as_str() {
+        "radial" => Some(generate_radial_bitmap(&sub_mask.parameters, width, height, scale, crop_offset)),
+        "linear" => Some(generate_linear_bitmap(&sub_mask.parameters, width, height, scale, crop_offset)),
+        "brush" => Some(generate_brush_bitmap(&sub_mask.parameters, width, height, scale, crop_offset)),
+        "flow" => Some(generate_flow_bitmap(&sub_mask.parameters, width, height, scale, crop_offset)),
+        "color" => generate_color_bitmap(&sub_mask.parameters, width, height, scale, crop_offset, warped_image),
+        "luminance" => generate_luminance_bitmap(&sub_mask.parameters, width, height, scale, crop_offset, warped_image),
+        "all" => Some(generate_all_bitmap(width, height)),
+        // ai-subject / ai-foreground / ai-sky / ai-depth / quick-eraser / unknown
+        _ => ai.and_then(|f| f(sub_mask, width, height, scale, crop_offset)),
+    }
+}
+
+pub fn generate_mask_bitmap(
+    mask_def: &MaskDefinition,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+    warped_image: Option<&DynamicImage>,
+    ai: Option<AiResolver>,
+) -> Option<GrayImage> {
+    if !mask_def.visible || mask_def.sub_masks.is_empty() {
+        return None;
+    }
+
+    let mut final_mask = GrayImage::new(width, height);
+
+    for sub_mask in &mask_def.sub_masks {
+        if let Some(mut sub_bitmap) =
+            generate_sub_mask_bitmap(sub_mask, width, height, scale, crop_offset, warped_image, ai)
+        {
+            if sub_mask.invert {
+                for p in sub_bitmap.pixels_mut() {
+                    p[0] = 255 - p[0];
+                }
+            }
+
+            let opacity_multiplier = (sub_mask.opacity / 100.0).clamp(0.0, 1.0);
+            if opacity_multiplier < 1.0 {
+                for pixel in sub_bitmap.pixels_mut() {
+                    pixel[0] = (pixel[0] as f32 * opacity_multiplier) as u8;
+                }
+            }
+
+            match sub_mask.mode {
+                SubMaskMode::Additive => {
+                    for (x, y, pixel) in final_mask.enumerate_pixels_mut() {
+                        let sub_pixel = sub_bitmap.get_pixel(x, y);
+                        pixel[0] = pixel[0].max(sub_pixel[0]);
+                    }
+                }
+                SubMaskMode::Subtractive => {
+                    for (x, y, pixel) in final_mask.enumerate_pixels_mut() {
+                        let sub_pixel = sub_bitmap.get_pixel(x, y);
+                        pixel[0] = pixel[0].saturating_sub(sub_pixel[0]);
+                    }
+                }
+                SubMaskMode::Intersect => {
+                    for (x, y, pixel) in final_mask.enumerate_pixels_mut() {
+                        let sub_pixel = sub_bitmap.get_pixel(x, y);
+                        pixel[0] = pixel[0].min(sub_pixel[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    if mask_def.invert {
+        for pixel in final_mask.pixels_mut() {
+            pixel[0] = 255 - pixel[0];
+        }
+    }
+
+    let opacity_multiplier = (mask_def.opacity / 100.0).clamp(0.0, 1.0);
+    if opacity_multiplier < 1.0 {
+        for pixel in final_mask.pixels_mut() {
+            pixel[0] = (pixel[0] as f32 * opacity_multiplier) as u8;
+        }
+    }
+
+    Some(final_mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn radial_mask() -> MaskDefinition {
+        MaskDefinition {
+            id: "m1".into(),
+            name: "Radial".into(),
+            visible: true,
+            invert: false,
+            opacity: 100.0,
+            adjustments: json!({}),
+            sub_masks: vec![SubMask {
+                id: "s1".into(),
+                mask_type: "radial".into(),
+                visible: true,
+                invert: false,
+                opacity: 100.0,
+                mode: SubMaskMode::Additive,
+                parameters: json!({
+                    "centerX": 50.0, "centerY": 50.0,
+                    "radiusX": 40.0, "radiusY": 40.0,
+                    "rotation": 0.0, "feather": 0.5
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn radial_is_bright_center_dark_corner() {
+        let bmp = generate_mask_bitmap(&radial_mask(), 100, 100, 1.0, (0.0, 0.0), None, None).unwrap();
+        assert_eq!(bmp.get_pixel(50, 50)[0], 255, "center should be fully masked");
+        assert_eq!(bmp.get_pixel(0, 0)[0], 0, "far corner should be unmasked");
+    }
+
+    #[test]
+    fn invisible_mask_returns_none() {
+        let mut m = radial_mask();
+        m.visible = false;
+        assert!(generate_mask_bitmap(&m, 100, 100, 1.0, (0.0, 0.0), None, None).is_none());
+    }
+}
