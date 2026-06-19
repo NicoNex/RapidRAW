@@ -76,13 +76,25 @@ Implemented in `masks.rs::submask_editor` (AdwPreferencesGroup per sub-mask):
 - Brush/Flow: canvas-driven — hint shown, editor deferred to P4.
 - Defaults verified against React `SUB_MASK_CONFIG` (display/stored multiplier).
 
-### P4 — Canvas interaction + persistence
+### P4 — Canvas interaction + persistence (partial)
 
-- Overlay drawing on the image canvas: drag to place/resize radial & linear,
-  brush/flow stroke capture. (relm4 `gtk::DrawingArea` over the preview.)
-- Live mask overlay preview (show the grayscale mask tinted).
-- Sidecar persistence: masks already serialize (camelCase JSON contract matches
-  Tauri sidecars). Verify round-trip load/save in relm4 `sidecar` module.
+- ✅ **Sidecar persistence**: `Edits.masks` (camelCase, Tauri-compatible) — masks
+  survive reopen.
+- ✅ **Undo/redo**: `HistEntry.masks`; mask mutations record + autosave.
+- ✅ **Multi sub-mask management**: add/delete/visibility/invert per sub-mask.
+- ✅ **Read-only canvas overlay**: draws selected radial/linear shapes, glued to
+  the photo under zoom/pan (`editor.rs` mask overlay layer).
+- ⬜ **Interactive canvas drag**: place/resize radial & linear, brush/flow stroke
+  capture (make the overlay targetable + gesture handlers, like crop mode).
+- ⬜ Live grayscale mask preview (tinted bitmap) — optional.
+
+### P4b — Per-mask non-scalar adjustments
+
+Scalar Basic/Color/Details/Effects done (P2). Still missing per-mask:
+- ⬜ Curves (reuse `CurveEditor`, write to the mask `adjustments.curves` JSON).
+- ⬜ HSL mixer (reuse `controls.rs` HSL builder).
+- ⬜ Color grading wheels (reuse `ColorWheel`).
+Verify defaults against React `INITIAL_MASK_ADJUSTMENTS` when added.
 
 ### P5 — AI masks: extract inference to core
 
