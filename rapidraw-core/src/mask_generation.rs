@@ -1083,4 +1083,26 @@ mod tests {
         m.visible = false;
         assert!(generate_mask_bitmap(&m, 100, 100, 1.0, (0.0, 0.0), None, None).is_none());
     }
+
+    #[test]
+    fn unknown_type_calls_ai_resolver() {
+        let mut m = radial_mask();
+        m.sub_masks[0].mask_type = "ai-subject".into();
+        let called = std::cell::Cell::new(false);
+        let resolver = |_: &SubMask, w, h, _: f32, _: (f32, f32)| {
+            called.set(true);
+            Some(GrayImage::from_pixel(w, h, Luma([128])))
+        };
+        let bmp = generate_mask_bitmap(&m, 10, 10, 1.0, (0.0, 0.0), None, Some(&resolver));
+        assert!(called.get(), "resolver should be called for ai-subject");
+        assert!(bmp.is_some());
+    }
+
+    #[test]
+    fn unknown_type_without_resolver_yields_empty_mask() {
+        let mut m = radial_mask();
+        m.sub_masks[0].mask_type = "ai-subject".into();
+        let bmp = generate_mask_bitmap(&m, 10, 10, 1.0, (0.0, 0.0), None, None);
+        assert_eq!(bmp.unwrap().get_pixel(5, 5)[0], 0, "no resolver: ai sub-mask contributes nothing");
+    }
 }
