@@ -122,7 +122,7 @@ const CALIBRATION: &[Row] = &[
 ];
 
 const GRADING_EXTRA: &[Row] = &[
-    ("Blending", 0.0, 100.0, 1.0, 100.0, 0.0, |g, v| {
+    ("Blending", 0.0, 100.0, 1.0, 100.0, 50.0, |g, v| {
         g.color_grading_blending = v
     }),
     ("Balance", -100.0, 100.0, 1.0, 200.0, 0.0, |g, v| {
