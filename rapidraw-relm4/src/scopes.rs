@@ -14,18 +14,26 @@ use image::RgbaImage;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Histogram,
-    Waveform,
+    /// Luma waveform (white).
+    WaveLuma,
+    /// R/G/B waveforms overlaid (additive, tinted).
+    WaveRgb,
+    /// R/G/B waveforms side by side (parade).
+    WaveParade,
     Vectorscope,
 }
 
 const WF_W: usize = 256;
 const WF_H: usize = 128;
 const VS: usize = 160;
+/// Waveform channels: 0 = luma, 1 = R, 2 = G, 3 = B.
+const WF_CH: usize = 4;
 
 struct Data {
     hist: [[u32; 256]; 3],
-    wf: Vec<u32>, // WF_W * WF_H
-    wf_max: u32,
+    /// Per-channel waveforms, each `WF_W * WF_H`.
+    wf: [Vec<u32>; WF_CH],
+    wf_max: [u32; WF_CH],
     vs: Vec<u32>, // VS * VS
     vs_max: u32,
 }
@@ -34,8 +42,8 @@ impl Data {
     fn empty() -> Self {
         Self {
             hist: [[0; 256]; 3],
-            wf: vec![0; WF_W * WF_H],
-            wf_max: 1,
+            wf: std::array::from_fn(|_| vec![0; WF_W * WF_H]),
+            wf_max: [1; WF_CH],
             vs: vec![0; VS * VS],
             vs_max: 1,
         }
@@ -78,13 +86,16 @@ impl Scopes {
         toggles.add_css_class("linked");
         toggles.set_halign(gtk::Align::Center);
         let mut group: Option<gtk::ToggleButton> = None;
-        for (label, m) in [
-            ("Histogram", Mode::Histogram),
-            ("Waveform", Mode::Waveform),
-            ("Vectorscope", Mode::Vectorscope),
+        for (label, tip, m) in [
+            ("L", "Luma waveform", Mode::WaveLuma),
+            ("RGB", "RGB waveform (overlay)", Mode::WaveRgb),
+            ("P", "Parade (R/G/B side by side)", Mode::WaveParade),
+            ("V", "Vectorscope", Mode::Vectorscope),
+            ("H", "Histogram", Mode::Histogram),
         ] {
             let b = gtk::ToggleButton::with_label(label);
             b.add_css_class("caption");
+            b.set_tooltip_text(Some(tip));
             match &group {
                 Some(g) => b.set_group(Some(g)),
                 None => group = Some(b.clone()),
@@ -129,13 +140,16 @@ impl Scopes {
             let (rf, gf, bf) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
             let luma = 0.299 * rf + 0.587 * gf + 0.114 * bf;
 
-            // Waveform: column = x position, row = luma.
+            // Waveform: column = x position, row = value. One grid per channel
+            // (luma, R, G, B) so the draw step can do luma / RGB-overlay / parade.
             let x = i % (w as usize);
-            let col = x * WF_W / (w as usize);
-            let row = ((1.0 - luma) * (WF_H as f32 - 1.0)) as usize;
-            let wi = row * WF_W + col.min(WF_W - 1);
-            d.wf[wi] += 1;
-            d.wf_max = d.wf_max.max(d.wf[wi]);
+            let col = (x * WF_W / (w as usize)).min(WF_W - 1);
+            for (ch, val) in [luma, rf, gf, bf].into_iter().enumerate() {
+                let row = ((1.0 - val) * (WF_H as f32 - 1.0)) as usize;
+                let wi = row.min(WF_H - 1) * WF_W + col;
+                d.wf[ch][wi] += 1;
+                d.wf_max[ch] = d.wf_max[ch].max(d.wf[ch][wi]);
+            }
 
             // Vectorscope: chroma (Cb, Cr) around centre.
             let cb = -0.168 * rf - 0.331 * gf + 0.5 * bf;
@@ -182,10 +196,27 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, d: &Data, mode: Mode) {
     }
     cr.set_source_rgb(0.10, 0.10, 0.11);
     let _ = cr.paint();
+    // Channel tints (R, G, B) for the waveform overlay/parade.
+    let rgb_tints = [(0.95, 0.30, 0.30), (0.35, 0.90, 0.40), (0.40, 0.60, 1.0)];
     match mode {
         Mode::Histogram => draw_histogram(cr, w as f64, h as f64, &d.hist),
-        Mode::Waveform => draw_grid(cr, w, h, &d.wf, d.wf_max, WF_W, WF_H, (0.9, 0.9, 0.9)),
-        Mode::Vectorscope => draw_grid(cr, w, h, &d.vs, d.vs_max, VS, VS, (0.4, 0.9, 0.4)),
+        Mode::WaveLuma => draw_grid(cr, 0.0, 0.0, w as f64, h as f64, &d.wf[0], d.wf_max[0], WF_W, WF_H, (0.9, 0.9, 0.9)),
+        Mode::WaveRgb => {
+            // Overlay the three channels additively so coincident traces brighten.
+            cr.set_operator(cairo::Operator::Add);
+            for (ch, tint) in rgb_tints.iter().enumerate() {
+                draw_grid(cr, 0.0, 0.0, w as f64, h as f64, &d.wf[ch + 1], d.wf_max[ch + 1], WF_W, WF_H, *tint);
+            }
+            cr.set_operator(cairo::Operator::Over);
+        }
+        Mode::WaveParade => {
+            // R | G | B side by side, each in a horizontal third.
+            let tw = w as f64 / 3.0;
+            for (ch, tint) in rgb_tints.iter().enumerate() {
+                draw_grid(cr, ch as f64 * tw, 0.0, tw, h as f64, &d.wf[ch + 1], d.wf_max[ch + 1], WF_W, WF_H, *tint);
+            }
+        }
+        Mode::Vectorscope => draw_grid(cr, 0.0, 0.0, w as f64, h as f64, &d.vs, d.vs_max, VS, VS, (0.4, 0.9, 0.4)),
     }
 }
 
@@ -212,11 +243,14 @@ fn draw_histogram(cr: &cairo::Context, wf: f64, hf: f64, hist: &[[u32; 256]; 3])
     }
 }
 
-/// Draw an intensity grid (waveform/vectorscope) scaled to the widget.
+/// Draw an intensity grid (waveform/vectorscope) into the widget rect `(x,y,w,h)`.
+#[allow(clippy::too_many_arguments)]
 fn draw_grid(
     cr: &cairo::Context,
-    w: i32,
-    h: i32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
     grid: &[u32],
     max: u32,
     gw: usize,
@@ -231,11 +265,11 @@ fn draw_grid(
     {
         let stride = surface.stride() as usize;
         let mut buf = surface.data().expect("surface data");
-        for y in 0..gh {
-            for x in 0..gw {
-                let v = (grid[y * gw + x] as f64).sqrt() / maxf;
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let v = (grid[gy * gw + gx] as f64).sqrt() / maxf;
                 let a = (v.min(1.0) * 255.0) as u8;
-                let i = y * stride + x * 4;
+                let i = gy * stride + gx * 4;
                 // Premultiplied ARGB (native-endian -> B,G,R,A).
                 buf[i] = (tint.2 * a as f64) as u8;
                 buf[i + 1] = (tint.1 * a as f64) as u8;
@@ -245,7 +279,11 @@ fn draw_grid(
         }
     }
     surface.mark_dirty();
-    cr.scale(w as f64 / gw as f64, h as f64 / gh as f64);
+    // Scale into the target rect without disturbing the caller's transform/operator.
+    cr.save().ok();
+    cr.translate(x, y);
+    cr.scale(w / gw as f64, h / gh as f64);
     let _ = cr.set_source_surface(&surface, 0.0, 0.0);
     let _ = cr.paint();
+    cr.restore().ok();
 }
