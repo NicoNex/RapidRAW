@@ -1787,6 +1787,18 @@ fn generate_ai_subject_bitmap(
     Some(mask)
 }
 
+/// Encode a grayscale mask as a base64 PNG data URL — the form stored in an AI
+/// sub-mask's `mask_data_base64` and later decoded by `ai_sub_mask_resolver`.
+pub fn encode_mask_png_base64(image: &GrayImage) -> anyhow::Result<String> {
+    use std::io::Cursor;
+    let mut buf = Cursor::new(Vec::new());
+    image.write_to(&mut buf, image::ImageFormat::Png)?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(buf.get_ref())
+    ))
+}
+
 /// `AiResolver` impl: rasterize an AI sub-mask from its stored base64 mask.
 /// Pass `Some(&ai_sub_mask_resolver)` to `render`/`generate_mask_bitmap` so
 /// `ai-*` and `quick-eraser` sub-masks contribute; without it they're skipped.
