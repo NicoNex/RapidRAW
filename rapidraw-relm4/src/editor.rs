@@ -508,13 +508,24 @@ impl EditorCanvas {
     /// keeps zoom/pan, compensating if the preview resolution differs.
     pub fn update_texture(&self, texture: &gdk::MemoryTexture) {
         let (nw, nh) = (texture.width(), texture.height());
-        let (onw, _) = self.view.natural.get();
-        if onw > 0 && nw > 0 {
-            // Keep the on-screen size (natural*scale) constant.
-            self.view
-                .scale
-                .set(self.view.scale.get() * onw as f64 / nw as f64);
+        let old = self.view.natural.get();
+        // The "keep on-screen size" compensation below only holds when this is
+        // the same image at a different resolution. When the aspect changes the
+        // swap is to a different framing — entering/leaving crop swaps the
+        // cropped preview for the full image, a 90° rotation swaps w/h, before
+        // /after swaps the cropped edit for the full original — and the
+        // width-only scale factor would mis-scale (e.g. a 65:24 crop returning
+        // to the full image appeared massively zoomed with no way to zoom out).
+        // Re-fit instead.
+        if !aspect_preserved(old, (nw, nh)) {
+            self.set_texture(texture);
+            return;
         }
+        let (onw, _) = old;
+        // Keep the on-screen size (natural*scale) constant.
+        self.view
+            .scale
+            .set(self.view.scale.get() * onw as f64 / nw as f64);
         self.view.natural.set((nw, nh));
         self.picture.set_paintable(Some(texture));
         apply(&self.picture, &self.fixed, &self.overlay, &self.mask_overlay, &self.view);
@@ -622,6 +633,22 @@ fn install_bg_css() {
             );
         }
     });
+}
+
+/// Whether a texture swap from `old` to `new` natural size keeps the image's
+/// aspect ratio (within 1%). `update_texture`'s "preserve on-screen size" scale
+/// compensation is only valid when it does; a changed aspect means a different
+/// framing (crop toggle, 90° rotation, before/after on a cropped image) and we
+/// must re-fit instead of preserving zoom. A missing prior size also re-fits.
+fn aspect_preserved(old: (i32, i32), new: (i32, i32)) -> bool {
+    let (ow, oh) = old;
+    let (nw, nh) = new;
+    if ow <= 0 || oh <= 0 || nw <= 0 || nh <= 0 {
+        return false;
+    }
+    let oa = ow as f64 / oh as f64;
+    let na = nw as f64 / nh as f64;
+    (oa - na).abs() <= oa * 0.01
 }
 
 /// Compute and apply the fit-to-viewport scale, centered.
@@ -1079,5 +1106,24 @@ fn draw_crop(cr: &cairo::Context, w: i32, h: i32, view: &View, r: (f64, f64, f64
     for (hx, hy) in [(cx, cy), (cx + cw, cy), (cx, cy + ch), (cx + cw, cy + ch)] {
         cr.rectangle(hx - hs / 2.0, hy - hs / 2.0, hs, hs);
         let _ = cr.fill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aspect_preserved;
+
+    #[test]
+    fn aspect_change_forces_refit() {
+        // Same image, lower preview resolution -> preserve zoom.
+        assert!(aspect_preserved((4000, 3000), (2000, 1500)));
+        // 65:24 crop (~2.71) returning to the full 4:3 image -> re-fit (the bug).
+        assert!(!aspect_preserved((2600, 960), (4000, 3000)));
+        // 90° rotation swaps w/h -> re-fit.
+        assert!(!aspect_preserved((4000, 3000), (3000, 4000)));
+        // No prior image -> re-fit.
+        assert!(!aspect_preserved((0, 0), (4000, 3000)));
+        // 1px rounding on a proportional rescale stays within tolerance.
+        assert!(aspect_preserved((4000, 3000), (1333, 1000)));
     }
 }
