@@ -19,6 +19,7 @@ pub fn render(
     masks: &[MaskDefinition],
     lut: Option<Arc<Lut>>,
     max_dim: Option<u32>,
+    ai_resolver: Option<crate::mask_generation::AiResolver>,
 ) -> Result<DynamicImage, String> {
     // Capture full dimensions before any downscale.
     let base_full_dims = base.dimensions();
@@ -89,7 +90,7 @@ pub fn render(
         // for the foundation pass (relm4 masks are empty today); revisit both
         // when color/luminance mask wiring lands.
         if let Some(bmp) =
-            generate_mask_bitmap(m, width, height, scale, (0.0, 0.0), Some(&base), None)
+            generate_mask_bitmap(m, width, height, scale, (0.0, 0.0), Some(&base), ai_resolver)
         {
             adj.mask_adjustments[layer] =
                 crate::image_processing::get_mask_adjustments_from_json(&m.adjustments);

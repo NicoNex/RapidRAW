@@ -760,8 +760,16 @@ fn spawn_render_worker(
                         geom,
                     } => {
                         let base = apply_geometry(&base, geom);
-                        let res = rapidraw_core::render(&ctx, &base, &adj, &masks, lut, None)
-                            .and_then(|out| encode_image(&out, &path, opts))
+                        let res = rapidraw_core::render(
+                            &ctx,
+                            &base,
+                            &adj,
+                            &masks,
+                            lut,
+                            None,
+                            Some(&rapidraw_core::ai::ai_sub_mask_resolver),
+                        )
+                        .and_then(|out| encode_image(&out, &path, opts))
                             .map(|()| path);
                         let _ = cmd.send(CmdMsg::ExportDone(res));
                     }
@@ -781,7 +789,15 @@ fn spawn_render_worker(
             }) = latest_preview
             {
                 let base = apply_geometry(&base, geom);
-                match rapidraw_core::render(&ctx, &base, &adj, &masks, lut, Some(dim)) {
+                match rapidraw_core::render(
+                    &ctx,
+                    &base,
+                    &adj,
+                    &masks,
+                    lut,
+                    Some(dim),
+                    Some(&rapidraw_core::ai::ai_sub_mask_resolver),
+                ) {
                     Ok(out) => {
                         let _ = cmd.send(CmdMsg::RenderReady(out.to_rgba8()));
                     }
@@ -2689,7 +2705,7 @@ fn export_lut(
 ) -> Result<(), String> {
     const SIZE: u32 = 33;
     let identity = rapidraw_core::lut_processing::generate_identity_lut_image(SIZE);
-    let processed = rapidraw_core::render(ctx, &identity, adj, &[], lut, None)?;
+    let processed = rapidraw_core::render(ctx, &identity, adj, &[], lut, None, None)?;
     let cube = rapidraw_core::lut_processing::convert_image_to_cube_lut(&processed, SIZE)?;
     std::fs::write(path, cube).map_err(|e| e.to_string())
 }

@@ -8,6 +8,7 @@ use image::imageops::{self, FilterType};
 use image::{
     DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb, Rgb32FImage, Rgba, RgbaImage,
 };
+use base64::{Engine as _, engine::general_purpose};
 use ndarray::{Array, Array4, IxDyn};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -1507,4 +1508,304 @@ pub struct AiDepthMaskParameters {
     pub flip_vertical: Option<bool>,
     #[serde(default)]
     pub orientation_steps: Option<u8>,
+}
+
+// --- AI sub-mask resolver -------------------------------------------------
+//
+// Render-time decoding of AI masks. Inference (run earlier by the generate_*
+// commands) stores a base64 PNG in the sub-mask's parameters; here we decode it
+// and map it back through the image's rotate/flip/crop/scale transform so the
+// mask lines up with the displayed (possibly geometry-edited) photo. This is
+// pure (no ort) but lives in the `ai` module because it reads the AI parameter
+// structs above. Injected into core's mask generator via `AiResolver`.
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct GrowFeatherParameters {
+    #[serde(default)]
+    grow: f32,
+    #[serde(default)]
+    feather: f32,
+}
+
+struct TransformParams {
+    rotation: f32,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+    orientation_steps: u8,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+}
+
+fn generate_ai_bitmap_from_full_mask(full_mask_image: &GrayImage, tf: &TransformParams) -> GrayImage {
+    let (full_mask_w, full_mask_h) = full_mask_image.dimensions();
+    let mut final_mask = GrayImage::new(tf.width, tf.height);
+
+    let angle_rad = tf.rotation.to_radians();
+    let cos_a = angle_rad.cos();
+    let sin_a = angle_rad.sin();
+
+    let (coarse_rotated_w, coarse_rotated_h) = if tf.orientation_steps % 2 == 1 {
+        (full_mask_h, full_mask_w)
+    } else {
+        (full_mask_w, full_mask_h)
+    };
+
+    let scaled_coarse_rotated_w = coarse_rotated_w as f32 * tf.scale;
+    let scaled_coarse_rotated_h = coarse_rotated_h as f32 * tf.scale;
+    let center_x = scaled_coarse_rotated_w / 2.0;
+    let center_y = scaled_coarse_rotated_h / 2.0;
+
+    for y_out in 0..tf.height {
+        for x_out in 0..tf.width {
+            let x_uncrop = x_out as f32 + tf.crop_offset.0;
+            let y_uncrop = y_out as f32 + tf.crop_offset.1;
+
+            let x_centered = x_uncrop - center_x;
+            let y_centered = y_uncrop - center_y;
+
+            let x_unrotated = x_centered * cos_a + y_centered * sin_a + center_x;
+            let y_unrotated = -x_centered * sin_a + y_centered * cos_a + center_y;
+
+            let x_unflipped = if tf.flip_horizontal {
+                scaled_coarse_rotated_w - x_unrotated
+            } else {
+                x_unrotated
+            };
+            let y_unflipped = if tf.flip_vertical {
+                scaled_coarse_rotated_h - y_unrotated
+            } else {
+                y_unrotated
+            };
+
+            let (x_unrotated_coarse, y_unrotated_coarse) = match tf.orientation_steps {
+                0 => (x_unflipped, y_unflipped),
+                1 => (y_unflipped, scaled_coarse_rotated_w - x_unflipped),
+                2 => (
+                    scaled_coarse_rotated_w - x_unflipped,
+                    scaled_coarse_rotated_h - y_unflipped,
+                ),
+                3 => (scaled_coarse_rotated_h - y_unflipped, x_unflipped),
+                _ => (x_unflipped, y_unflipped),
+            };
+
+            let x_src = x_unrotated_coarse / tf.scale;
+            let y_src = y_unrotated_coarse / tf.scale;
+
+            if x_src >= 0.0 && x_src < full_mask_w as f32 && y_src >= 0.0 && y_src < full_mask_h as f32
+            {
+                let pixel = full_mask_image.get_pixel(x_src as u32, y_src as u32);
+                final_mask.put_pixel(x_out, y_out, *pixel);
+            }
+        }
+    }
+
+    final_mask
+}
+
+fn generate_ai_bitmap_from_base64(data_url: &str, tf: &TransformParams) -> Option<GrayImage> {
+    let b64_data = if let Some(idx) = data_url.find(',') {
+        &data_url[idx + 1..]
+    } else {
+        data_url
+    };
+
+    let decoded_bytes = general_purpose::STANDARD.decode(b64_data).ok()?;
+    let full_mask_image = image::load_from_memory(&decoded_bytes).ok()?.to_luma8();
+
+    Some(generate_ai_bitmap_from_full_mask(&full_mask_image, tf))
+}
+
+fn generate_ai_sky_bitmap(
+    params_value: &serde_json::Value,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+) -> Option<GrayImage> {
+    let params: AiSkyMaskParameters = serde_json::from_value(params_value.clone()).ok()?;
+    let grow_feather: GrowFeatherParameters =
+        serde_json::from_value(params_value.clone()).unwrap_or_default();
+    let data_url = params.mask_data_base64?;
+
+    let tf = TransformParams {
+        rotation: params.rotation.unwrap_or(0.0),
+        flip_horizontal: params.flip_horizontal.unwrap_or(false),
+        flip_vertical: params.flip_vertical.unwrap_or(false),
+        orientation_steps: params.orientation_steps.unwrap_or(0),
+        width,
+        height,
+        scale,
+        crop_offset,
+    };
+    let mut mask = generate_ai_bitmap_from_base64(&data_url, &tf)?;
+
+    crate::mask_generation::apply_grow_and_feather(
+        &mut mask,
+        grow_feather.grow,
+        grow_feather.feather,
+        width,
+        height,
+    );
+
+    Some(mask)
+}
+
+fn generate_ai_depth_bitmap(
+    params_value: &serde_json::Value,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+) -> Option<GrayImage> {
+    let params: AiDepthMaskParameters = serde_json::from_value(params_value.clone()).ok()?;
+    let grow_feather: GrowFeatherParameters =
+        serde_json::from_value(params_value.clone()).unwrap_or_default();
+    let data_url = params.mask_data_base64?;
+
+    let tf = TransformParams {
+        rotation: params.rotation.unwrap_or(0.0),
+        flip_horizontal: params.flip_horizontal.unwrap_or(false),
+        flip_vertical: params.flip_vertical.unwrap_or(false),
+        orientation_steps: params.orientation_steps.unwrap_or(0),
+        width,
+        height,
+        scale,
+        crop_offset,
+    };
+
+    let depth_map = generate_ai_bitmap_from_base64(&data_url, &tf)?;
+
+    let (w, h) = depth_map.dimensions();
+    let mut mask = GrayImage::new(w, h);
+
+    fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+        let t = ((x - edge0) / (edge1 - edge0).max(0.0001)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    let min_fade = params.min_fade;
+    let max_fade = params.max_fade;
+
+    for (x, y, p) in depth_map.enumerate_pixels() {
+        let val_pct = (p[0] as f32 / 255.0) * 100.0;
+
+        let lower_bound = smoothstep(params.min_depth - min_fade, params.min_depth, val_pct);
+        let upper_bound = 1.0 - smoothstep(params.max_depth, params.max_depth + max_fade, val_pct);
+        let bandpass_weight = lower_bound * upper_bound;
+
+        let depth_intensity = val_pct / 100.0;
+        let final_intensity = bandpass_weight * depth_intensity;
+
+        mask.put_pixel(x, y, Luma([(final_intensity * 255.0) as u8]));
+    }
+
+    if params.feather > 0.0 {
+        mask = image::imageops::blur(&mask, params.feather * 0.1);
+    }
+
+    crate::mask_generation::apply_grow_and_feather(
+        &mut mask,
+        grow_feather.grow,
+        grow_feather.feather,
+        width,
+        height,
+    );
+
+    Some(mask)
+}
+
+fn generate_ai_foreground_bitmap(
+    params_value: &serde_json::Value,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+) -> Option<GrayImage> {
+    let params: AiForegroundMaskParameters = serde_json::from_value(params_value.clone()).ok()?;
+    let grow_feather: GrowFeatherParameters =
+        serde_json::from_value(params_value.clone()).unwrap_or_default();
+    let data_url = params.mask_data_base64?;
+
+    let tf = TransformParams {
+        rotation: params.rotation.unwrap_or(0.0),
+        flip_horizontal: params.flip_horizontal.unwrap_or(false),
+        flip_vertical: params.flip_vertical.unwrap_or(false),
+        orientation_steps: params.orientation_steps.unwrap_or(0),
+        width,
+        height,
+        scale,
+        crop_offset,
+    };
+    let mut mask = generate_ai_bitmap_from_base64(&data_url, &tf)?;
+
+    crate::mask_generation::apply_grow_and_feather(
+        &mut mask,
+        grow_feather.grow,
+        grow_feather.feather,
+        width,
+        height,
+    );
+
+    Some(mask)
+}
+
+fn generate_ai_subject_bitmap(
+    params_value: &serde_json::Value,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+) -> Option<GrayImage> {
+    let params: AiSubjectMaskParameters = serde_json::from_value(params_value.clone()).ok()?;
+    let grow_feather: GrowFeatherParameters =
+        serde_json::from_value(params_value.clone()).unwrap_or_default();
+    let data_url = params.mask_data_base64?;
+
+    let tf = TransformParams {
+        rotation: params.rotation.unwrap_or(0.0),
+        flip_horizontal: params.flip_horizontal.unwrap_or(false),
+        flip_vertical: params.flip_vertical.unwrap_or(false),
+        orientation_steps: params.orientation_steps.unwrap_or(0),
+        width,
+        height,
+        scale,
+        crop_offset,
+    };
+    let mut mask = generate_ai_bitmap_from_base64(&data_url, &tf)?;
+
+    crate::mask_generation::apply_grow_and_feather(
+        &mut mask,
+        grow_feather.grow,
+        grow_feather.feather,
+        width,
+        height,
+    );
+
+    Some(mask)
+}
+
+/// `AiResolver` impl: rasterize an AI sub-mask from its stored base64 mask.
+/// Pass `Some(&ai_sub_mask_resolver)` to `render`/`generate_mask_bitmap` so
+/// `ai-*` and `quick-eraser` sub-masks contribute; without it they're skipped.
+pub fn ai_sub_mask_resolver(
+    sub: &crate::mask_generation::SubMask,
+    width: u32,
+    height: u32,
+    scale: f32,
+    crop_offset: (f32, f32),
+) -> Option<GrayImage> {
+    match sub.mask_type.as_str() {
+        "ai-subject" | "quick-eraser" => {
+            generate_ai_subject_bitmap(&sub.parameters, width, height, scale, crop_offset)
+        }
+        "ai-foreground" => {
+            generate_ai_foreground_bitmap(&sub.parameters, width, height, scale, crop_offset)
+        }
+        "ai-sky" => generate_ai_sky_bitmap(&sub.parameters, width, height, scale, crop_offset),
+        "ai-depth" => generate_ai_depth_bitmap(&sub.parameters, width, height, scale, crop_offset),
+        _ => None,
+    }
 }
