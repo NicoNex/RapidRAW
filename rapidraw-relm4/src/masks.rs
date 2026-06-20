@@ -463,7 +463,59 @@ fn mask_details(
 
     card.append(&build_mask_hsl(i, m, vadj, sender));
     card.append(&build_mask_grading(i, m, vadj, sender));
+    card.append(&build_mask_curves(i, m, vadj, sender));
     card
+}
+
+/// Manual control points for one curve channel, read from the mask's
+/// `adjustments.curves.<key>` JSON. Falls back to the identity line.
+fn curve_seed(curves: Option<&Value>, key: &str) -> Vec<(f64, f64)> {
+    let identity = || vec![(0.0, 0.0), (255.0, 255.0)];
+    let Some(arr) = curves.and_then(|c| c.get(key)).and_then(Value::as_array) else {
+        return identity();
+    };
+    let pts: Vec<(f64, f64)> = arr
+        .iter()
+        .filter_map(|p| Some((p.get("x")?.as_f64()?, p.get("y")?.as_f64()?)))
+        .collect();
+    if pts.len() < 2 {
+        identity()
+    } else {
+        pts
+    }
+}
+
+/// Per-mask tone curves: the shared `CurveEditor`, seeded from the mask's stored
+/// points and writing back to `adjustments.curves.<channel>` JSON.
+fn build_mask_curves(
+    i: usize,
+    m: &MaskDefinition,
+    vadj: &gtk::Adjustment,
+    sender: &ComponentSender<AppModel>,
+) -> gtk::Box {
+    use crate::curves::CurveEditor;
+
+    let wrap = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    wrap.set_margin_all(6);
+    let head = gtk::Label::new(Some("Curves"));
+    head.set_halign(gtk::Align::Start);
+    head.add_css_class("heading");
+    wrap.append(&head);
+
+    let curves = m.adjustments.get("curves");
+    // Channel order matches CurveEditor's: [luma, red, green, blue].
+    let seed = [
+        curve_seed(curves, "luma"),
+        curve_seed(curves, "red"),
+        curve_seed(curves, "green"),
+        curve_seed(curves, "blue"),
+    ];
+    let sender = sender.clone();
+    let editor = CurveEditor::with_sink(vadj, seed, move |channel, points| {
+        sender.input(AppMsg::MaskCurve { index: i, channel, points });
+    });
+    wrap.append(editor.root());
+    wrap
 }
 
 /// HSL bands: `(display, json key)`, in core's band order.
@@ -817,5 +869,20 @@ mod tests {
         // Parametric feather default 35 (core ParametricMaskParameters default).
         let pf = GEO_PARAMETRIC.iter().find(|r| r.1 == "feather").unwrap();
         assert_eq!(pf.7, 35.0);
+    }
+
+    #[test]
+    fn curve_seed_parses_and_falls_back() {
+        // Missing / no curves -> identity.
+        assert_eq!(curve_seed(None, "luma"), vec![(0.0, 0.0), (255.0, 255.0)]);
+        // Valid points round-trip.
+        let curves = json!({ "red": [{"x": 0.0, "y": 10.0}, {"x": 128.0, "y": 100.0}, {"x": 255.0, "y": 255.0}] });
+        assert_eq!(
+            curve_seed(Some(&curves), "red"),
+            vec![(0.0, 10.0), (128.0, 100.0), (255.0, 255.0)]
+        );
+        // Degenerate single point -> identity (engine needs >= 2 to be non-identity).
+        let bad = json!({ "blue": [{"x": 0.0, "y": 0.0}] });
+        assert_eq!(curve_seed(Some(&bad), "blue"), vec![(0.0, 0.0), (255.0, 255.0)]);
     }
 }

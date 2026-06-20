@@ -158,11 +158,40 @@ pub struct CurveEditor {
     root: gtk::Box,
 }
 
+/// Sink for curve changes: `(channel, points 0..255)`. Lets the same editor
+/// drive the global adjustments or a specific mask's `curves` JSON.
+type Sink = Rc<dyn Fn(Channel, Vec<(f32, f32)>)>;
+
 impl CurveEditor {
     pub fn new(sender: &ComponentSender<crate::AppModel>, vadj: &gtk::Adjustment) -> Self {
+        let s = sender.clone();
+        let sink: Sink = Rc::new(move |ch, pts| s.input(crate::AppMsg::CurveChanged(ch, pts)));
+        Self::build(vadj, None, sink, true)
+    }
+
+    /// Per-mask editor: seeded from stored points and emitting via `sink`.
+    /// `seed` is manual points per channel `[luma, red, green, blue]`.
+    pub fn with_sink(
+        vadj: &gtk::Adjustment,
+        seed: [Vec<(f64, f64)>; 4],
+        sink: impl Fn(Channel, Vec<(f32, f32)>) + 'static,
+    ) -> Self {
+        Self::build(vadj, Some(seed), Rc::new(sink), false)
+    }
+
+    fn build(
+        vadj: &gtk::Adjustment,
+        seed: Option<[Vec<(f64, f64)>; 4]>,
+        sink: Sink,
+        allow_reset: bool,
+    ) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
 
-        let state = Rc::new(RefCell::new(State::new()));
+        let mut st = State::new();
+        if let Some(seed) = seed {
+            st.points = seed;
+        }
+        let state = Rc::new(RefCell::new(st));
         let active = Rc::new(Cell::new(Channel::Luma));
         let dragging = Rc::new(Cell::new(None::<usize>));
         // false = manual point curve, true = parametric region sliders.
@@ -246,7 +275,7 @@ impl CurveEditor {
             let active = active.clone();
             let parametric = parametric.clone();
             let area = area.clone();
-            let sender = sender.clone();
+            let sink = sink.clone();
             let (row, _, handle) = crate::slider::slider_ex(
                 label, min, max, 1.0, default, crate::slider::Track::Plain, vadj,
                 move |v| {
@@ -254,7 +283,7 @@ impl CurveEditor {
                         let mut s = state.borrow_mut();
                         *field(&mut s.param[ch_idx(active.get())]) = v;
                     }
-                    emit_active(&sender, &state, active.get(), parametric.get());
+                    emit_active(&sink, &state, active.get(), parametric.get());
                     area.queue_draw();
                 },
             );
@@ -287,14 +316,14 @@ impl CurveEditor {
             let parametric = parametric.clone();
             let reload = reload.clone();
             let state = state.clone();
-            let sender = sender.clone();
+            let sink = sink.clone();
             let ch = *ch;
             btn.connect_toggled(move |b| {
                 if b.is_active() {
                     active.set(ch);
                     if parametric.get() {
                         reload();
-                        emit_active(&sender, &state, ch, true);
+                        emit_active(&sink, &state, ch, true);
                     }
                     area.queue_draw();
                 }
@@ -309,7 +338,7 @@ impl CurveEditor {
             let reload = reload.clone();
             let state = state.clone();
             let active = active.clone();
-            let sender = sender.clone();
+            let sink = sink.clone();
             param_btn.connect_toggled(move |b| {
                 let on = b.is_active();
                 parametric.set(on);
@@ -317,7 +346,7 @@ impl CurveEditor {
                 if on {
                     reload();
                 }
-                emit_active(&sender, &state, active.get(), on);
+                emit_active(&sink, &state, active.get(), on);
                 area.queue_draw();
             });
         }
@@ -352,7 +381,7 @@ impl CurveEditor {
             let parametric = parametric.clone();
             let area = area.clone();
             let reload = reload.clone();
-            let sender = sender.clone();
+            let sink = sink.clone();
             paste_btn.connect_clicked(move |_| {
                 let ch = active.get();
                 let pasted = CLIP.with(|c| c.borrow().clone());
@@ -365,7 +394,7 @@ impl CurveEditor {
                     if parametric.get() {
                         reload();
                     }
-                    emit_active(&sender, &state, ch, parametric.get());
+                    emit_active(&sink, &state, ch, parametric.get());
                     area.queue_draw();
                 }
             });
@@ -401,7 +430,7 @@ impl CurveEditor {
             let state = state.clone();
             let active = active.clone();
             let area = area.clone();
-            let sender = sender.clone();
+            let sink = sink.clone();
             drag.connect_drag_update(move |_, ox, oy| {
                 let Some(idx) = dragging.get() else { return };
                 let (sx, sy) = start.get();
@@ -427,7 +456,7 @@ impl CurveEditor {
                         pts[idx] = (nx, ny);
                     }
                 }
-                emit(&sender, &state, ch);
+                emit(&sink, &state, ch);
                 area.queue_draw();
             });
         }
@@ -443,7 +472,7 @@ impl CurveEditor {
             let state = state.clone();
             let active = active.clone();
             let area = area.clone();
-            let sender = sender.clone();
+            let sink = sink.clone();
             let parametric = parametric.clone();
             click.connect_pressed(move |_, n, x, y| {
                 if parametric.get() {
@@ -465,7 +494,7 @@ impl CurveEditor {
                         if idx != 0 && idx != last && pts.len() > 2 {
                             pts.remove(idx);
                             drop(s);
-                            emit(&sender, &state, ch);
+                            emit(&sink, &state, ch);
                             area.queue_draw();
                         }
                     }
@@ -487,7 +516,7 @@ impl CurveEditor {
                         None => pts.push((nx, ny)),
                     }
                     drop(s);
-                    emit(&sender, &state, ch);
+                    emit(&sink, &state, ch);
                     area.queue_draw();
                 }
             });
@@ -495,7 +524,9 @@ impl CurveEditor {
         area.add_controller(click);
 
         // Reset hook: identity curves + default parametric, back to Point mode.
-        {
+        // Only for the global editor: mask cards rebuild on select, so a per-mask
+        // editor would leak a stale closure into the global reset list each time.
+        if allow_reset {
             let state = state.clone();
             let area = area.clone();
             let point_btn = point_btn.clone();
@@ -518,29 +549,24 @@ impl CurveEditor {
     }
 }
 
-/// Forward the active channel's manual points (as f32 0..255) to the model.
-fn emit(sender: &ComponentSender<crate::AppModel>, state: &Rc<RefCell<State>>, ch: Channel) {
+/// Forward the active channel's manual points (as f32 0..255) to the sink.
+fn emit(sink: &Sink, state: &Rc<RefCell<State>>, ch: Channel) {
     let pts: Vec<(f32, f32)> = state
         .borrow()
         .points(ch)
         .iter()
         .map(|&(x, y)| (x as f32, y as f32))
         .collect();
-    sender.input(crate::AppMsg::CurveChanged(ch, pts));
+    sink(ch, pts);
 }
 
 /// Forward whichever curve is active (manual or parametric) for `ch`.
-fn emit_active(
-    sender: &ComponentSender<crate::AppModel>,
-    state: &Rc<RefCell<State>>,
-    ch: Channel,
-    parametric: bool,
-) {
+fn emit_active(sink: &Sink, state: &Rc<RefCell<State>>, ch: Channel, parametric: bool) {
     let pts: Vec<(f32, f32)> = active_curve(&state.borrow(), ch, parametric)
         .iter()
         .map(|&(x, y)| (x as f32, y as f32))
         .collect();
-    sender.input(crate::AppMsg::CurveChanged(ch, pts));
+    sink(ch, pts);
 }
 
 /// Allocated size, falling back to the configured content size.

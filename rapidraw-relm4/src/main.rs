@@ -215,6 +215,13 @@ enum AppMsg {
         comp: &'static str,
         value: f64,
     },
+    /// Replace a tone-curve channel's points for mask `index`, writing
+    /// `adjustments.curves.<channel>` JSON (points in 0..255).
+    MaskCurve {
+        index: usize,
+        channel: Channel,
+        points: Vec<(f32, f32)>,
+    },
     /// Set one geometry key in a sub-mask's parameters JSON.
     SetSubMaskParam {
         mask: usize,
@@ -1571,6 +1578,23 @@ impl Component for AppModel {
                 if let Some(m) = self.session.masks.get_mut(index) {
                     mask_nested(&mut m.adjustments, "hsl", band)
                         .insert(comp.to_string(), serde_json::json!(value));
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskCurve { index, channel, points } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    let key = match channel {
+                        Channel::Luma => "luma",
+                        Channel::Red => "red",
+                        Channel::Green => "green",
+                        Channel::Blue => "blue",
+                    };
+                    let arr: Vec<serde_json::Value> = points
+                        .iter()
+                        .map(|&(x, y)| serde_json::json!({ "x": x, "y": y }))
+                        .collect();
+                    mask_nested_1(&mut m.adjustments, "curves").insert(key.to_string(), arr.into());
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }

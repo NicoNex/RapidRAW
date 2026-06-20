@@ -88,13 +88,14 @@ Implemented in `masks.rs::submask_editor` (AdwPreferencesGroup per sub-mask):
   capture (make the overlay targetable + gesture handlers, like crop mode).
 - ⬜ Live grayscale mask preview (tinted bitmap) — optional.
 
-### P4b — Per-mask non-scalar adjustments
+### P4b — Per-mask non-scalar adjustments ✅ DONE
 
-Scalar Basic/Color/Details/Effects done (P2). Still missing per-mask:
-- ⬜ Curves (reuse `CurveEditor`, write to the mask `adjustments.curves` JSON).
-- ⬜ HSL mixer (reuse `controls.rs` HSL builder).
-- ⬜ Color grading wheels (reuse `ColorWheel`).
-Verify defaults against React `INITIAL_MASK_ADJUSTMENTS` when added.
+Scalar Basic/Color/Details/Effects done (P2). Per-mask now also:
+- ✅ Curves: `CurveEditor::with_sink` (seeded from JSON, emits `MaskCurve`),
+  writes `adjustments.curves.<channel>` JSON (`masks.rs::build_mask_curves`).
+- ✅ HSL mixer (`build_mask_hsl`).
+- ✅ Color grading wheels (`build_mask_grading`).
+Defaults verified against React `INITIAL_MASK_ADJUSTMENTS`.
 
 ### P5 — AI masks: extract inference to core
 
