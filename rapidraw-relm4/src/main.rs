@@ -18,6 +18,7 @@ mod crop;
 mod curves;
 mod editor;
 mod library;
+mod masks;
 mod meta;
 mod scopes;
 mod settings;
@@ -27,9 +28,11 @@ mod state;
 mod thumb;
 mod thumb_cache;
 use controls::AdjustPanel;
+use masks::MasksPanel;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
+use rapidraw_core::mask_generation::MaskDefinition;
 use rapidraw_core::lut_processing::{parse_lut_file, Lut};
 use scopes::Scopes;
 use settings::Settings;
@@ -175,6 +178,91 @@ enum AppMsg {
     /// Right-rail switcher: show the adjustments panel / the crop panel.
     ShowAdjustPanel,
     ShowCropPanel,
+    ShowMasksPanel,
+    /// Masks panel actions.
+    AddMask(&'static str),
+    SelectMask(Option<usize>),
+    DeleteMask(usize),
+    ToggleMaskVisible(usize),
+    ToggleMaskInvert(usize),
+    SetMaskOpacity(usize, f64),
+    /// Set one scalar key in mask `index`'s adjustments JSON.
+    MaskAdjust {
+        index: usize,
+        key: &'static str,
+        value: f64,
+    },
+    /// Set a color-grading wheel for mask `index`, zone `zone`
+    /// (shadows/midtones/highlights/global): hue°, sat 0..1, lum -100..100.
+    MaskGrade {
+        index: usize,
+        zone: &'static str,
+        hue: f64,
+        sat: f64,
+        lum: f64,
+    },
+    /// Set a color-grading scalar (blending/balance) for mask `index`.
+    MaskGradeScalar {
+        index: usize,
+        key: &'static str,
+        value: f64,
+    },
+    /// Set an HSL component for mask `index`: band (reds/oranges/...), comp
+    /// (hue/saturation/luminance), UI value -100..100.
+    MaskHsl {
+        index: usize,
+        band: &'static str,
+        comp: &'static str,
+        value: f64,
+    },
+    /// Replace a tone-curve channel's points for mask `index`, writing
+    /// `adjustments.curves.<channel>` JSON (points in 0..255).
+    MaskCurve {
+        index: usize,
+        channel: Channel,
+        points: Vec<(f32, f32)>,
+    },
+    /// Set one geometry key in a sub-mask's parameters JSON.
+    SetSubMaskParam {
+        mask: usize,
+        sub: usize,
+        key: &'static str,
+        value: f64,
+    },
+    /// Set a sub-mask's compositing mode (0=Additive,1=Subtractive,2=Intersect).
+    SetSubMaskMode {
+        mask: usize,
+        sub: usize,
+        mode: u32,
+    },
+    /// A mask handle was dragged on the canvas: write the edited geometry back to
+    /// the selected mask's sub-mask (`shape.sub`).
+    EditMaskGeom(editor::MaskShape),
+    /// Brush radius (image px) for painting brush/flow sub-masks.
+    SetBrushSize(f64),
+    /// Arm/disarm canvas painting into sub-mask index (within the selected mask).
+    ArmPaint(Option<usize>),
+    /// A finished brush stroke: normalized points to append to sub-mask `sub`.
+    AddBrushStroke {
+        sub: usize,
+        points: Vec<(f64, f64)>,
+    },
+    /// Clear all painted strokes from sub-mask `sub`.
+    ClearStrokes(usize),
+    /// Add another sub-mask of `ty` to container `mask`.
+    AddSubMask(usize, &'static str),
+    DeleteSubMask {
+        mask: usize,
+        sub: usize,
+    },
+    ToggleSubMaskVisible {
+        mask: usize,
+        sub: usize,
+    },
+    ToggleSubMaskInvert {
+        mask: usize,
+        sub: usize,
+    },
     /// Editor toolbar: copy the current edit settings, paste onto this image.
     CopySettings,
     PasteSettings,
@@ -270,6 +358,7 @@ struct HistEntry {
     adj: rapidraw_core::image_processing::AllAdjustments,
     lut: Option<Arc<Lut>>,
     vals: Vec<f64>,
+    masks: Vec<rapidraw_core::mask_generation::MaskDefinition>,
 }
 
 /// Work sent to the persistent render thread. Keeping a single long-lived
@@ -279,6 +368,7 @@ enum RenderJob {
     Preview {
         base: Arc<DynamicImage>,
         adj: Box<rapidraw_core::image_processing::AllAdjustments>,
+        masks: Vec<MaskDefinition>,
         lut: Option<Arc<Lut>>,
         dim: u32,
         geom: Geometry,
@@ -286,6 +376,7 @@ enum RenderJob {
     Export {
         base: Arc<DynamicImage>,
         adj: Box<rapidraw_core::image_processing::AllAdjustments>,
+        masks: Vec<MaskDefinition>,
         lut: Option<Arc<Lut>>,
         path: PathBuf,
         opts: ExportOpts,
@@ -392,7 +483,15 @@ struct AppModel {
     geom: Geometry,
     /// Crop panel (right-rail "Crop" section).
     crop: crop::CropPanel,
-    /// Switches the right column between the adjustments panel and crop panel.
+    /// Masks panel (right-rail "Masks" section).
+    masks_panel: MasksPanel,
+    /// Index of the mask whose adjustments are shown in the masks panel.
+    selected_mask: Option<usize>,
+    /// Brush radius (image px) for painting brush/flow sub-masks.
+    brush_size: f64,
+    /// Sub-mask index currently armed for canvas painting (within selected mask).
+    paint_sub: Option<usize>,
+    /// Switches the right column between adjustments / crop / masks panels.
     content_stack: gtk::Stack,
     /// True while the crop panel is active (canvas shows the crop overlay; the
     /// preview is rendered uncropped so the overlay can be adjusted).
@@ -460,8 +559,42 @@ impl AppModel {
                 .lut_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            masks: self.session.masks.clone(),
         };
         sidecar::save(&path, &e);
+    }
+
+    /// Push the selected mask's drawable shapes to the canvas overlay (only while
+    /// the Masks tab is active); hides it otherwise.
+    fn refresh_mask_overlay(&self) {
+        let on = self
+            .content_stack
+            .visible_child_name()
+            .map(|s| s == "masks")
+            .unwrap_or(false);
+        let shapes = match (on, self.selected_mask, self.session.base_image.as_ref()) {
+            (true, Some(i), Some(base)) => {
+                use image::GenericImageView;
+                let (w, h) = base.dimensions();
+                self.session
+                    .masks
+                    .get(i)
+                    .map(|m| masks::overlay_shapes(m, w as f64, h as f64))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        self.canvas.set_mask_overlay(shapes, on);
+    }
+
+    /// Full (pre-preview) image dimensions as f64, if an image is open.
+    fn image_dims(&self) -> Option<(f64, f64)> {
+        use image::GenericImageView;
+        self.session
+            .base_image
+            .as_ref()
+            .map(|b| b.dimensions())
+            .map(|(w, h)| (w as f64, h as f64))
     }
 
     /// Texture to display now: original (before/after) > clipping overlay > edited.
@@ -519,6 +652,12 @@ impl AppModel {
         let entry = self.history[self.hist_idx].clone();
         self.session.adjustments = entry.adj;
         self.session.lut = entry.lut;
+        self.session.masks = entry.masks;
+        self.selected_mask = self
+            .selected_mask
+            .filter(|&i| i < self.session.masks.len());
+        self.masks_panel
+            .rebuild(&self.session.masks, self.selected_mask, sender);
         self.suppress_history = true;
         self.panel.restore(&entry.vals);
         self.suppress_history = false;
@@ -614,13 +753,14 @@ fn spawn_render_worker(
                     RenderJob::Export {
                         base,
                         adj,
+                        masks,
                         lut,
                         path,
                         opts,
                         geom,
                     } => {
                         let base = apply_geometry(&base, geom);
-                        let res = rapidraw_core::render(&ctx, &base, &adj, lut, None)
+                        let res = rapidraw_core::render(&ctx, &base, &adj, &masks, lut, None)
                             .and_then(|out| encode_image(&out, &path, opts))
                             .map(|()| path);
                         let _ = cmd.send(CmdMsg::ExportDone(res));
@@ -634,13 +774,14 @@ fn spawn_render_worker(
             if let Some(RenderJob::Preview {
                 base,
                 adj,
+                masks,
                 lut,
                 dim,
                 geom,
             }) = latest_preview
             {
                 let base = apply_geometry(&base, geom);
-                match rapidraw_core::render(&ctx, &base, &adj, lut, Some(dim)) {
+                match rapidraw_core::render(&ctx, &base, &adj, &masks, lut, Some(dim)) {
                     Ok(out) => {
                         let _ = cmd.send(CmdMsg::RenderReady(out.to_rgba8()));
                     }
@@ -859,6 +1000,10 @@ impl Component for AppModel {
             last_folder: load_last_folder(),
             geom: Geometry::default(),
             crop: crop::CropPanel::new(&sender),
+            masks_panel: MasksPanel::new(&sender),
+            selected_mask: None,
+            brush_size: 50.0,
+            paint_sub: None,
             content_stack: gtk::Stack::new(),
             crop_active: false,
             crop_aspect: 0.0,
@@ -1091,6 +1236,9 @@ impl Component for AppModel {
         model
             .content_stack
             .add_named(model.crop.root(), Some("crop"));
+        model
+            .content_stack
+            .add_named(model.masks_panel.root(), Some("masks"));
         model.content_stack.set_visible_child_name("adjust");
         // Fixed, comfortable panel width. The Paned sizes the end child to this
         // natural width at any window size (the canvas absorbs the rest), so the
@@ -1111,6 +1259,9 @@ impl Component for AppModel {
         let crop_btn = gtk::ToggleButton::with_label("Crop");
         crop_btn.set_tooltip_text(Some("Crop & geometry"));
         crop_btn.set_group(Some(&adj_btn));
+        let masks_btn = gtk::ToggleButton::with_label("Masks");
+        masks_btn.set_tooltip_text(Some("Masks"));
+        masks_btn.set_group(Some(&adj_btn));
         {
             let sender = sender.clone();
             adj_btn.connect_toggled(move |b| {
@@ -1127,8 +1278,17 @@ impl Component for AppModel {
                 }
             });
         }
+        {
+            let sender = sender.clone();
+            masks_btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::ShowMasksPanel);
+                }
+            });
+        }
         tabs.append(&adj_btn);
         tabs.append(&crop_btn);
+        tabs.append(&masks_btn);
 
         model.right_col.append(&tabs);
         model.right_col.append(model.scopes.root());
@@ -1146,6 +1306,20 @@ impl Component for AppModel {
         // No absolute position: the divider follows the end child's natural width
         // (370) regardless of window size, and the user can drag to override.
 
+        // Canvas mask-handle drags feed back into the model as geometry edits.
+        {
+            let sender = sender.clone();
+            model
+                .canvas
+                .set_mask_editor(move |shape| sender.input(AppMsg::EditMaskGeom(shape)));
+        }
+        // Brush/flow strokes painted on the canvas append to the sub-mask.
+        {
+            let sender = sender.clone();
+            model.canvas.set_paint_sink(move |sub, points, _erase| {
+                sender.input(AppMsg::AddBrushStroke { sub, points })
+            });
+        }
         // Scopes clipping toggle feeds back into the model.
         {
             let sender = sender.clone();
@@ -1278,6 +1452,363 @@ impl Component for AppModel {
                 self.canvas.enter_crop(self.crop_aspect as f64);
                 sender.input(AppMsg::RequestRender);
             }
+            AppMsg::ShowMasksPanel => {
+                self.content_stack.set_visible_child_name("masks");
+                // Masks shows the scopes (like Edit; only Crop hides them).
+                self.scopes.root().set_visible(true);
+                // Leaving crop mode commits the interactive crop (mirror ShowAdjustPanel).
+                if self.crop_active {
+                    self.crop_active = false;
+                    let (x, y, w, h) = self.canvas.exit_crop();
+                    self.geom.crop = if w >= 0.999 && h >= 0.999 && x <= 0.001 && y <= 0.001 {
+                        None
+                    } else {
+                        Some([x as f32, y as f32, w as f32, h as f32])
+                    };
+                    sender.input(AppMsg::RequestRender);
+                }
+                self.masks_panel
+                    .rebuild(&self.session.masks, self.selected_mask, &sender);
+            }
+            AppMsg::AddMask(ty) => {
+                // Default sub-mask geometry needs the full image size.
+                let (w, h) = self
+                    .session
+                    .base_image
+                    .as_ref()
+                    .map(|b| {
+                        use image::GenericImageView;
+                        let (w, h) = b.dimensions();
+                        (w as f32, h as f32)
+                    })
+                    .unwrap_or((1000.0, 1000.0));
+                let label = masks::MASK_TYPES
+                    .iter()
+                    .find(|(_, t)| *t == ty)
+                    .map(|(l, _)| *l)
+                    .unwrap_or(ty);
+                self.session.masks.push(masks::new_mask(label, ty, w, h));
+                self.selected_mask = Some(self.session.masks.len() - 1);
+                self.masks_panel
+                    .rebuild(&self.session.masks, self.selected_mask, &sender);
+                self.schedule_history(&sender);
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::SelectMask(idx) => {
+                self.selected_mask = idx;
+                // Disarm painting (it targets a sub-mask of the prior selection).
+                if self.paint_sub.take().is_some() {
+                    self.canvas.set_paint(None);
+                }
+                self.masks_panel
+                    .rebuild(&self.session.masks, self.selected_mask, &sender);
+            }
+            AppMsg::DeleteMask(i) => {
+                if i < self.session.masks.len() {
+                    self.session.masks.remove(i);
+                    // Keep the selection valid after removal.
+                    self.selected_mask = match self.selected_mask {
+                        Some(s) if s == i => None,
+                        Some(s) if s > i => Some(s - 1),
+                        other => other,
+                    };
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::ToggleMaskVisible(i) => {
+                if let Some(m) = self.session.masks.get_mut(i) {
+                    m.visible = !m.visible;
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::ToggleMaskInvert(i) => {
+                if let Some(m) = self.session.masks.get_mut(i) {
+                    m.invert = !m.invert;
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetMaskOpacity(i, v) => {
+                if let Some(m) = self.session.masks.get_mut(i) {
+                    m.opacity = v as f32;
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskAdjust { index, key, value } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    if let Some(obj) = m.adjustments.as_object_mut() {
+                        obj.insert(key.to_string(), serde_json::json!(value));
+                    }
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskGrade { index, zone, hue, sat, lum } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    // adjustments.colorGrading.<zone> = { hue, saturation, luminance }
+                    // (UI units; the engine divides per SCALES.)
+                    let cg = mask_cg_obj(&mut m.adjustments);
+                    cg.insert(
+                        zone.to_string(),
+                        serde_json::json!({
+                            "hue": hue,
+                            "saturation": sat * 100.0,
+                            "luminance": lum,
+                        }),
+                    );
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskGradeScalar { index, key, value } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    mask_cg_obj(&mut m.adjustments).insert(key.to_string(), serde_json::json!(value));
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskHsl { index, band, comp, value } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    mask_nested(&mut m.adjustments, "hsl", band)
+                        .insert(comp.to_string(), serde_json::json!(value));
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::MaskCurve { index, channel, points } => {
+                if let Some(m) = self.session.masks.get_mut(index) {
+                    let key = match channel {
+                        Channel::Luma => "luma",
+                        Channel::Red => "red",
+                        Channel::Green => "green",
+                        Channel::Blue => "blue",
+                    };
+                    let arr: Vec<serde_json::Value> = points
+                        .iter()
+                        .map(|&(x, y)| serde_json::json!({ "x": x, "y": y }))
+                        .collect();
+                    mask_nested_1(&mut m.adjustments, "curves").insert(key.to_string(), arr.into());
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetSubMaskParam {
+                mask,
+                sub,
+                key,
+                value,
+            } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    if !sm.parameters.is_object() {
+                        sm.parameters = serde_json::json!({});
+                    }
+                    if let Some(obj) = sm.parameters.as_object_mut() {
+                        obj.insert(key.to_string(), serde_json::json!(value));
+                    }
+                    // No rebuild: the spin row already shows the value.
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetSubMaskMode { mask, sub, mode } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    sm.mode = masks::mode_from_index(mode);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::EditMaskGeom(shape) => {
+                use image::GenericImageView;
+                let Some((w, h)) = self
+                    .session
+                    .base_image
+                    .as_ref()
+                    .map(|b| b.dimensions())
+                    .map(|(w, h)| (w as f64, h as f64))
+                else {
+                    return;
+                };
+                // Denormalize into full-res pixels and write only the dragged
+                // keys (feather/rotation/range stay as set in the spin rows).
+                let (sub, keys): (usize, Vec<(&str, f64)>) = match shape {
+                    editor::MaskShape::Radial { sub, cx, cy, rx, ry, .. } => (
+                        sub,
+                        vec![
+                            ("centerX", cx * w),
+                            ("centerY", cy * h),
+                            ("radiusX", rx * w),
+                            ("radiusY", ry * h),
+                        ],
+                    ),
+                    editor::MaskShape::Linear { sub, x1, y1, x2, y2, .. } => (
+                        sub,
+                        vec![
+                            ("startX", x1 * w),
+                            ("startY", y1 * h),
+                            ("endX", x2 * w),
+                            ("endY", y2 * h),
+                        ],
+                    ),
+                };
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(self.selected_mask.unwrap_or(usize::MAX))
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    if let Some(obj) = sm.parameters.as_object_mut() {
+                        for (k, v) in keys {
+                            obj.insert(k.to_string(), serde_json::json!(v));
+                        }
+                    }
+                    // ponytail: spin rows stay stale until the panel rebuilds
+                    // (reselect); the overlay updates live. Rebuild on every drag
+                    // tick would thrash the panel.
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetBrushSize(px) => {
+                self.brush_size = px.max(1.0);
+                // Re-arm so the live brush preview tracks the new size.
+                if let Some(sub) = self.paint_sub {
+                    sender.input(AppMsg::ArmPaint(Some(sub)));
+                }
+            }
+            AppMsg::ArmPaint(sub) => {
+                self.paint_sub = sub;
+                let arm = sub.and_then(|s| {
+                    self.image_dims().map(|(w, _)| (s, self.brush_size / w, false))
+                });
+                self.canvas.set_paint(arm);
+            }
+            AppMsg::AddBrushStroke { sub, points } => {
+                let Some((w, h)) = self.image_dims() else { return };
+                if let Some(m) = self.session.masks.get_mut(self.selected_mask.unwrap_or(usize::MAX)) {
+                    if let Some(sm) = m.sub_masks.get_mut(sub) {
+                        let is_flow = sm.mask_type == "flow";
+                        let pts: Vec<serde_json::Value> = points
+                            .iter()
+                            .map(|(x, y)| serde_json::json!({ "x": x * w, "y": y * h }))
+                            .collect();
+                        let mut line = serde_json::json!({
+                            "tool": "brush",
+                            "brushSize": self.brush_size,
+                            "feather": 0.5,
+                            "points": pts,
+                        });
+                        if is_flow {
+                            // Flow lines carry a per-line flow (default matches core).
+                            line["flow"] = serde_json::json!(10.0);
+                        }
+                        let obj = sm.parameters.as_object_mut();
+                        if let Some(obj) = obj {
+                            obj.entry("lines")
+                                .or_insert_with(|| serde_json::json!([]));
+                            if let Some(arr) = obj["lines"].as_array_mut() {
+                                arr.push(line);
+                            }
+                        }
+                        self.schedule_history(&sender);
+                        sender.input(AppMsg::RequestRender);
+                    }
+                }
+            }
+            AppMsg::ClearStrokes(sub) => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(self.selected_mask.unwrap_or(usize::MAX))
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    if let Some(obj) = sm.parameters.as_object_mut() {
+                        obj.insert("lines".into(), serde_json::json!([]));
+                    }
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::AddSubMask(mask, ty) => {
+                let (w, h) = self
+                    .session
+                    .base_image
+                    .as_ref()
+                    .map(|b| {
+                        use image::GenericImageView;
+                        let (w, h) = b.dimensions();
+                        (w as f32, h as f32)
+                    })
+                    .unwrap_or((1000.0, 1000.0));
+                if let Some(m) = self.session.masks.get_mut(mask) {
+                    // Reuse new_mask's sub-mask seeding, then move it onto this
+                    // container (keeps default geometry/params in one place).
+                    let label = masks::MASK_TYPES
+                        .iter()
+                        .find(|(_, t)| *t == ty)
+                        .map(|(l, _)| *l)
+                        .unwrap_or(ty);
+                    let sub = masks::new_mask(label, ty, w, h).sub_masks.remove(0);
+                    m.sub_masks.push(sub);
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::DeleteSubMask { mask, sub } => {
+                if let Some(m) = self.session.masks.get_mut(mask) {
+                    if sub < m.sub_masks.len() {
+                        m.sub_masks.remove(sub);
+                        self.masks_panel
+                            .rebuild(&self.session.masks, self.selected_mask, &sender);
+                        self.schedule_history(&sender);
+                        sender.input(AppMsg::RequestRender);
+                    }
+                }
+            }
+            AppMsg::ToggleSubMaskVisible { mask, sub } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    sm.visible = !sm.visible;
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::ToggleSubMaskInvert { mask, sub } => {
+                if let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mask)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                {
+                    sm.invert = !sm.invert;
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
             AppMsg::CopySettings => {
                 self.settings_clip = Some(SettingsClip {
                     global: self.session.adjustments.global,
@@ -1370,6 +1901,9 @@ impl Component for AppModel {
                 controls::init_defaults(&mut self.session.adjustments.global);
                 self.session.lut = None;
                 self.lut_path = None;
+                self.session.masks.clear();
+                self.selected_mask = None;
+                self.masks_panel.rebuild(&self.session.masks, None, &sender);
                 self.panel.reset();
                 // Crop panel is small; rebuild so its toggles/straighten reset.
                 let fresh = crop::CropPanel::new(&sender);
@@ -1427,6 +1961,7 @@ impl Component for AppModel {
                 let _ = self.render_tx.send(RenderJob::Preview {
                     base,
                     adj: Box::new(self.session.adjustments),
+                    masks: self.session.masks.clone(),
                     lut: self.session.lut.clone(),
                     dim: self.settings.preview_dim,
                     geom,
@@ -1584,6 +2119,7 @@ impl Component for AppModel {
                 let _ = self.render_tx.send(RenderJob::Export {
                     base,
                     adj: Box::new(self.session.adjustments),
+                    masks: self.session.masks.clone(),
                     lut: self.session.lut.clone(),
                     path,
                     opts,
@@ -1710,12 +2246,15 @@ impl Component for AppModel {
                 }
                 let cur = self.session.adjustments;
                 let lut = self.session.lut.clone();
+                let masks = self.session.masks.clone();
+                let masks_json = serde_json::to_value(&masks).unwrap_or_default();
                 let same = self
                     .history
                     .get(self.hist_idx)
                     .map(|e| {
                         bytemuck::bytes_of(&e.adj.global) == bytemuck::bytes_of(&cur.global)
                             && lut_eq(&e.lut, &lut)
+                            && serde_json::to_value(&e.masks).unwrap_or_default() == masks_json
                     })
                     .unwrap_or(false);
                 if same {
@@ -1726,6 +2265,7 @@ impl Component for AppModel {
                     adj: cur,
                     lut,
                     vals: self.panel.snapshot(),
+                    masks,
                 });
                 self.hist_idx = self.history.len() - 1;
                 self.save_edits();
@@ -1763,6 +2303,9 @@ impl Component for AppModel {
                 self.show_active_tex();
             }
         }
+        // Keep the mask overlay in sync with selection/geometry/tab after any
+        // message (cheap no-op when the Masks tab isn't showing).
+        self.refresh_mask_overlay();
         self.update_view(widgets, sender);
     }
 
@@ -1817,6 +2360,9 @@ impl Component for AppModel {
                             }
                         }
                         self.panel.restore(&e.vals);
+                        self.session.masks = e.masks;
+                        self.selected_mask = None;
+                        self.masks_panel.rebuild(&self.session.masks, None, &sender);
                     }
                 }
                 // Show the un-adjusted base immediately. We're on the GTK main
@@ -1840,6 +2386,7 @@ impl Component for AppModel {
                     adj: self.session.adjustments,
                     lut: self.session.lut.clone(),
                     vals: self.panel.snapshot(),
+                    masks: self.session.masks.clone(),
                 }];
                 self.hist_idx = 0;
                 // Kick an initial engine render so the preview reflects the
@@ -1882,6 +2429,36 @@ impl Component for AppModel {
             }
         }
     }
+}
+
+/// Get (creating if needed) the `colorGrading` object inside a mask's
+/// `adjustments` JSON, so grading writes nest under it.
+fn mask_cg_obj(adj: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+    mask_nested_1(adj, "colorGrading")
+}
+
+/// Get (creating if needed) `adj[outer]` as an object.
+fn mask_nested_1<'a>(
+    adj: &'a mut serde_json::Value,
+    outer: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    if !adj.is_object() {
+        *adj = serde_json::json!({});
+    }
+    let obj = adj.as_object_mut().unwrap();
+    obj.entry(outer).or_insert_with(|| serde_json::json!({}));
+    obj[outer].as_object_mut().unwrap()
+}
+
+/// Get (creating if needed) `adj[outer][inner]` as an object (e.g. hsl.reds).
+fn mask_nested<'a>(
+    adj: &'a mut serde_json::Value,
+    outer: &str,
+    inner: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let om = mask_nested_1(adj, outer);
+    om.entry(inner).or_insert_with(|| serde_json::json!({}));
+    om[inner].as_object_mut().unwrap()
 }
 
 /// Build the clipping-indicator texture: blown pixels (any channel 255) tinted
@@ -2112,7 +2689,7 @@ fn export_lut(
 ) -> Result<(), String> {
     const SIZE: u32 = 33;
     let identity = rapidraw_core::lut_processing::generate_identity_lut_image(SIZE);
-    let processed = rapidraw_core::render(ctx, &identity, adj, lut, None)?;
+    let processed = rapidraw_core::render(ctx, &identity, adj, &[], lut, None)?;
     let cube = rapidraw_core::lut_processing::convert_image_to_cube_lut(&processed, SIZE)?;
     std::fs::write(path, cube).map_err(|e| e.to_string())
 }

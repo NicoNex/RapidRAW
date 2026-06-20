@@ -18,7 +18,7 @@
 //! // ponytail: no live re-fit on window resize (only on open); add a resize
 //! // hook if "fit" should track the window continuously.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::cairo;
@@ -27,6 +27,29 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::settings::Background;
+
+/// A selected mask's geometric sub-mask, in normalized image coords (0..1), for
+/// the canvas overlay. `sub` is the index into the mask's `sub_masks` (so a drag
+/// maps back to the right one). Brush/flow/color/luminance have no shape.
+#[derive(Clone, Copy, Debug)]
+pub enum MaskShape {
+    /// Centre + radii normalized; rotation in degrees.
+    Radial {
+        sub: usize,
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        rot: f64,
+    },
+    Linear {
+        sub: usize,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
+}
 
 /// Which part of the crop rectangle a drag is manipulating.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,6 +64,40 @@ enum Region {
     Ne,
     Sw,
     Se,
+}
+
+/// Callback invoked live during a mask-handle drag with the edited shape.
+type MaskEditCb = Rc<RefCell<Option<Box<dyn Fn(MaskShape)>>>>;
+
+/// Callback fired when a brush/flow stroke finishes: `(sub index, normalized
+/// points, erase)`. The model denormalizes and appends a line to the sub-mask.
+type PaintSink = Rc<RefCell<Option<Box<dyn Fn(usize, Vec<(f64, f64)>, bool)>>>>;
+
+/// Armed brush/flow painting: which sub-mask, the brush radius (normalized to
+/// image width, for the live preview), and whether it erases.
+#[derive(Clone, Copy)]
+struct PaintArm {
+    sub: usize,
+    size_norm: f64,
+    erase: bool,
+}
+
+/// What a mask drag manipulates.
+#[derive(Clone, Copy)]
+enum MaskGrab {
+    RadialMove,
+    RadialResize,
+    LinearStart,
+    LinearEnd,
+}
+
+/// In-progress mask drag: which grab, the shape at press, and the press point in
+/// normalized image coords.
+#[derive(Clone, Copy)]
+struct MaskDrag {
+    grab: MaskGrab,
+    orig: MaskShape,
+    press: (f64, f64),
 }
 
 /// Hit-test radius (px) for crop handles.
@@ -74,6 +131,17 @@ pub struct EditorCanvas {
     fixed: gtk::Fixed,
     picture: gtk::Picture,
     overlay: gtk::DrawingArea,
+    /// Overlay drawing (and hit-testing) the selected mask's geometric shapes.
+    mask_overlay: gtk::DrawingArea,
+    mask_shapes: Rc<RefCell<Vec<MaskShape>>>,
+    /// True while the Masks tab is active with a geometric mask selected — gates
+    /// whether canvas drags edit a mask handle (vs. pan).
+    mask_active: Rc<Cell<bool>>,
+    /// Callback to the model with an edited shape (live, during drag).
+    mask_edit: MaskEditCb,
+    /// Armed brush/flow painting (drag paints a stroke instead of panning).
+    paint: Rc<Cell<Option<PaintArm>>>,
+    paint_sink: PaintSink,
     view: View,
     /// Crop rectangle, normalized (x, y, w, h) in image space.
     crop_rect: Rc<Cell<(f64, f64, f64, f64)>>,
@@ -121,6 +189,27 @@ impl EditorCanvas {
         let crop_rect = Rc::new(Cell::new((0.0, 0.0, 1.0, 1.0)));
         let crop_aspect = Rc::new(Cell::new(0.0_f64));
 
+        // Read-only mask overlay: draws the selected mask's radial/linear shapes.
+        // `can_target(false)` so it never steals zoom/pan input (purely visual).
+        let mask_overlay = gtk::DrawingArea::new();
+        mask_overlay.set_visible(false);
+        mask_overlay.set_can_target(false);
+        let mask_shapes: Rc<RefCell<Vec<MaskShape>>> = Rc::new(RefCell::new(Vec::new()));
+        let mask_active = Rc::new(Cell::new(false));
+        let mask_edit: MaskEditCb = Rc::new(RefCell::new(None));
+        let paint: Rc<Cell<Option<PaintArm>>> = Rc::new(Cell::new(None));
+        let stroke: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let paint_sink: PaintSink = Rc::new(RefCell::new(None));
+        {
+            let view = view.clone();
+            let shapes = mask_shapes.clone();
+            let paint = paint.clone();
+            let stroke = stroke.clone();
+            mask_overlay.set_draw_func(move |_, cr, _w, _h| {
+                draw_masks(cr, &view, &shapes.borrow());
+                draw_stroke(cr, &view, &stroke.borrow(), paint.get());
+            });
+        }
         // Track the pointer so the wheel can zoom toward it.
         let motion = gtk::EventControllerMotion::new();
         {
@@ -137,6 +226,7 @@ impl EditorCanvas {
             let picture = picture.clone();
             let fixed_w = fixed.clone();
             let overlay_w = overlay.clone();
+            let mask_w = mask_overlay.clone();
             let view = view.clone();
             scroll.connect_scroll(move |_, _dx, dy| {
                 let (nw, nh) = view.natural.get();
@@ -152,36 +242,115 @@ impl EditorCanvas {
                         .set((cx - (cx - ox) * ratio, cy - (cy - oy) * ratio));
                     view.scale.set(new);
                     view.fit.set(false);
-                    apply(&picture, &fixed_w, &overlay_w, &view);
+                    apply(&picture, &fixed_w, &overlay_w, &mask_w, &view);
                 }
                 glib::Propagation::Stop
             });
         }
         fixed.add_controller(scroll);
 
-        // Drag = pan (disabled in crop mode, where the overlay handles drags).
+        // Drag = pan, except: in crop mode the crop overlay handles it, and in
+        // masks mode a press on a mask handle edits that handle instead of panning.
         let drag = gtk::GestureDrag::new();
         {
             let start = Rc::new(Cell::new((0.0, 0.0)));
+            let mask_drag: Rc<Cell<Option<MaskDrag>>> = Rc::new(Cell::new(None));
+            // Widget point where a paint stroke began (to rebuild absolute points
+            // from the gesture's offsets).
+            let paint_start = Rc::new(Cell::new((0.0, 0.0)));
             {
                 let view = view.clone();
                 let start = start.clone();
-                drag.connect_drag_begin(move |_, _x, _y| start.set(view.offset.get()));
+                let mask_drag = mask_drag.clone();
+                let mask_active = mask_active.clone();
+                let shapes = mask_shapes.clone();
+                let paint = paint.clone();
+                let stroke = stroke.clone();
+                let paint_start = paint_start.clone();
+                let mask_w = mask_overlay.clone();
+                drag.connect_drag_begin(move |_, x, y| {
+                    start.set(view.offset.get());
+                    // Painting takes precedence over handle-edit and pan.
+                    if paint.get().is_some() {
+                        paint_start.set((x, y));
+                        let mut s = stroke.borrow_mut();
+                        s.clear();
+                        if let Some(p) = to_norm(&view, x, y) {
+                            s.push(p);
+                        }
+                        mask_drag.set(None);
+                        mask_w.queue_draw();
+                        return;
+                    }
+                    mask_drag.set(if mask_active.get() {
+                        hit_mask(&view, &shapes.borrow(), x, y)
+                    } else {
+                        None
+                    });
+                });
             }
             {
                 let picture = picture.clone();
                 let fixed_w = fixed.clone();
                 let overlay_w = overlay.clone();
+                let mask_w = mask_overlay.clone();
                 let view = view.clone();
                 let start = start.clone();
+                let mask_drag = mask_drag.clone();
+                let mask_edit = mask_edit.clone();
+                let paint = paint.clone();
+                let stroke = stroke.clone();
+                let paint_start = paint_start.clone();
+                let mask_w2 = mask_overlay.clone();
                 drag.connect_drag_update(move |_, dx, dy| {
                     if overlay_w.is_visible() {
+                        return;
+                    }
+                    // Painting a brush/flow stroke takes precedence.
+                    if paint.get().is_some() {
+                        let (bx, by) = paint_start.get();
+                        if let Some(p) = to_norm(&view, bx + dx, by + dy) {
+                            stroke.borrow_mut().push(p);
+                            mask_w2.queue_draw();
+                        }
+                        return;
+                    }
+                    // Editing a mask handle takes precedence over panning.
+                    if let Some(md) = mask_drag.get() {
+                        let (_, _, iw, ih) = image_screen_rect(&view);
+                        if iw <= 0.0 || ih <= 0.0 {
+                            return;
+                        }
+                        let cur = (md.press.0 + dx / iw, md.press.1 + dy / ih);
+                        let shape = apply_mask_drag(md, cur);
+                        if let Some(cb) = mask_edit.borrow().as_ref() {
+                            cb(shape);
+                        }
                         return;
                     }
                     let (sx, sy) = start.get();
                     view.offset.set((sx + dx, sy + dy));
                     view.fit.set(false);
-                    apply(&picture, &fixed_w, &overlay_w, &view);
+                    apply(&picture, &fixed_w, &overlay_w, &mask_w, &view);
+                });
+            }
+            {
+                let mask_drag = mask_drag.clone();
+                let paint = paint.clone();
+                let stroke = stroke.clone();
+                let paint_sink = paint_sink.clone();
+                let mask_w = mask_overlay.clone();
+                drag.connect_drag_end(move |_, _, _| {
+                    if let Some(arm) = paint.get() {
+                        let pts = std::mem::take(&mut *stroke.borrow_mut());
+                        if !pts.is_empty() {
+                            if let Some(cb) = paint_sink.borrow().as_ref() {
+                                cb(arm.sub, pts, arm.erase);
+                            }
+                        }
+                        mask_w.queue_draw();
+                    }
+                    mask_drag.set(None);
                 });
             }
         }
@@ -248,10 +417,11 @@ impl EditorCanvas {
             let fixed = fixed.clone();
             let view = view.clone();
             let overlay_w = overlay.clone();
+            let mask_w = mask_overlay.clone();
             overlay.connect_resize(move |_, _, _| {
                 if overlay_w.is_visible() {
                     view.fit.set(true);
-                    fit_now(&picture, &fixed, &overlay_w, &view);
+                    fit_now(&picture, &fixed, &overlay_w, &mask_w, &view);
                 }
             });
         }
@@ -262,6 +432,7 @@ impl EditorCanvas {
         root.set_vexpand(true);
         root.set_child(Some(&sw));
         root.add_overlay(&overlay);
+        root.add_overlay(&mask_overlay);
 
         Self {
             root,
@@ -269,10 +440,53 @@ impl EditorCanvas {
             fixed,
             picture,
             overlay,
+            mask_overlay,
+            mask_shapes,
+            mask_active,
+            mask_edit,
+            paint,
+            paint_sink,
             view,
             crop_rect,
             crop_aspect,
         }
+    }
+
+    /// Show/update the mask overlay with `shapes` (normalized coords). `on` =
+    /// Masks tab active; drives both visibility and whether drags edit handles.
+    pub fn set_mask_overlay(&self, shapes: Vec<MaskShape>, on: bool) {
+        let show = on && !shapes.is_empty();
+        *self.mask_shapes.borrow_mut() = shapes;
+        self.mask_active.set(show);
+        self.mask_overlay.set_visible(show);
+        self.mask_overlay.queue_draw();
+    }
+
+    /// Set the callback invoked (live, during a handle drag) with the edited
+    /// shape; the model writes it back to the sub-mask's parameters.
+    pub fn set_mask_editor(&self, cb: impl Fn(MaskShape) + 'static) {
+        *self.mask_edit.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Arm brush/flow painting into sub-mask `sub` with brush radius `size_norm`
+    /// (normalized to image width) and `erase`; `None` disarms (drag pans again).
+    pub fn set_paint(&self, arm: Option<(usize, f64, bool)>) {
+        self.paint.set(arm.map(|(sub, size_norm, erase)| PaintArm {
+            sub,
+            size_norm,
+            erase,
+        }));
+        // The live stroke draws on the mask overlay; brush/flow masks have no
+        // radial/linear shape to keep it shown, so force it visible while armed.
+        if arm.is_some() {
+            self.mask_overlay.set_visible(true);
+        }
+        self.mask_overlay.queue_draw();
+    }
+
+    /// Set the callback fired when a brush/flow stroke finishes.
+    pub fn set_paint_sink(&self, cb: impl Fn(usize, Vec<(f64, f64)>, bool) + 'static) {
+        *self.paint_sink.borrow_mut() = Some(Box::new(cb));
     }
 
     pub fn root(&self) -> &gtk::Overlay {
@@ -303,7 +517,7 @@ impl EditorCanvas {
         }
         self.view.natural.set((nw, nh));
         self.picture.set_paintable(Some(texture));
-        apply(&self.picture, &self.fixed, &self.overlay, &self.view);
+        apply(&self.picture, &self.fixed, &self.overlay, &self.mask_overlay, &self.view);
     }
 
     /// Drop the current image (blank canvas) — e.g. while the next one decodes,
@@ -318,7 +532,7 @@ impl EditorCanvas {
         self.view.natural.set((texture.width(), texture.height()));
         self.picture.set_paintable(Some(texture));
         self.view.fit.set(true);
-        fit_now(&self.picture, &self.fixed, &self.overlay, &self.view);
+        fit_now(&self.picture, &self.fixed, &self.overlay, &self.mask_overlay, &self.view);
 
         // The Fixed may not be allocated yet on first open (size 0); re-fit once
         // its real size lands so the initial image is correctly centered (not
@@ -327,13 +541,14 @@ impl EditorCanvas {
         let picture = self.picture.clone();
         let fixed = self.fixed.clone();
         let overlay = self.overlay.clone();
+        let mask = self.mask_overlay.clone();
         let view = self.view.clone();
         self.fixed.add_tick_callback(move |w, _| {
             if !view.fit.get() {
                 return glib::ControlFlow::Break;
             }
             if w.width() > 0 && w.height() > 0 {
-                fit_now(&picture, &fixed, &overlay, &view);
+                fit_now(&picture, &fixed, &overlay, &mask, &view);
                 return glib::ControlFlow::Break;
             }
             glib::ControlFlow::Continue
@@ -349,7 +564,7 @@ impl EditorCanvas {
         }
         // Fit the whole image so the crop rectangle is fully reachable.
         self.view.fit.set(true);
-        fit_now(&self.picture, &self.fixed, &self.overlay, &self.view);
+        fit_now(&self.picture, &self.fixed, &self.overlay, &self.mask_overlay, &self.view);
         self.overlay.set_visible(true);
         self.overlay.queue_draw();
     }
@@ -410,7 +625,13 @@ fn install_bg_css() {
 }
 
 /// Compute and apply the fit-to-viewport scale, centered.
-fn fit_now(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingArea, view: &View) {
+fn fit_now(
+    picture: &gtk::Picture,
+    fixed: &gtk::Fixed,
+    overlay: &gtk::DrawingArea,
+    mask: &gtk::DrawingArea,
+    view: &View,
+) {
     let (nw, nh) = view.natural.get();
     if nw <= 0 || nh <= 0 {
         return;
@@ -420,7 +641,7 @@ fn fit_now(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingAre
     view.scale.set(s);
     view.offset
         .set(((vw - nw as f64 * s) / 2.0, (vh - nh as f64 * s) / 2.0));
-    apply(picture, fixed, overlay, view);
+    apply(picture, fixed, overlay, mask, view);
 }
 
 /// Viewport size = the ScrolledWindow's allocation (the Fixed is forced to match
@@ -444,7 +665,13 @@ fn viewport(fixed: &gtk::Fixed) -> (f64, f64) {
 /// Size and position the Picture from the current scale/offset. Pins the Fixed
 /// (and the crop overlay) to the viewport size so the wheel/cursor coordinate
 /// space matches.
-fn apply(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingArea, view: &View) {
+fn apply(
+    picture: &gtk::Picture,
+    fixed: &gtk::Fixed,
+    overlay: &gtk::DrawingArea,
+    mask: &gtk::DrawingArea,
+    view: &View,
+) {
     let (nw, nh) = view.natural.get();
     if nw <= 0 || nh <= 0 {
         return;
@@ -457,8 +684,191 @@ fn apply(picture: &gtk::Picture, fixed: &gtk::Fixed, overlay: &gtk::DrawingArea,
     picture.set_size_request(w.max(1), h.max(1));
     let (ox, oy) = view.offset.get();
     fixed.move_(picture, ox, oy);
-    // The crop overlay is a separate layer that auto-fills; just repaint it.
+    // Crop + mask overlays are separate auto-filling layers; repaint them so they
+    // track the new image position/scale.
     overlay.queue_draw();
+    mask.queue_draw();
+}
+
+/// Draw the selected mask's geometric shapes over the image (read-only). Coords
+/// are normalized (0..1) and mapped through the same image→screen transform the
+/// crop overlay uses, so shapes stay glued to the photo under zoom/pan.
+fn draw_masks(cr: &cairo::Context, view: &View, shapes: &[MaskShape]) {
+    let (nw, nh) = view.natural.get();
+    if nw <= 0 || nh <= 0 {
+        return;
+    }
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    cr.set_line_width(1.5);
+    for shape in shapes {
+        match *shape {
+            MaskShape::Radial { cx, cy, rx, ry, rot, .. } => {
+                let (scx, scy) = (ix + cx * iw, iy + cy * ih);
+                let (srx, sry) = (rx * iw, ry * ih);
+                let r = rot.to_radians();
+                let (cr_, sr_) = (r.cos(), r.sin());
+                // Sample the rotated ellipse as a polyline (transform-free, so the
+                // 1.5px stroke isn't distorted by a cairo scale).
+                for i in 0..=64 {
+                    let a = i as f64 / 64.0 * std::f64::consts::TAU;
+                    let (ex, ey) = (srx * a.cos(), sry * a.sin());
+                    let (px, py) = (scx + ex * cr_ - ey * sr_, scy + ex * sr_ + ey * cr_);
+                    if i == 0 {
+                        cr.move_to(px, py);
+                    } else {
+                        cr.line_to(px, py);
+                    }
+                }
+                stroke_outlined(cr);
+                handle(cr, scx, scy); // centre = move
+            }
+            MaskShape::Linear { x1, y1, x2, y2, .. } => {
+                let (a, b) = ((ix + x1 * iw, iy + y1 * ih), (ix + x2 * iw, iy + y2 * ih));
+                cr.move_to(a.0, a.1);
+                cr.line_to(b.0, b.1);
+                stroke_outlined(cr);
+                handle(cr, a.0, a.1);
+                handle(cr, b.0, b.1);
+            }
+        }
+    }
+}
+
+/// Hit-test mask handles at widget point `(x, y)`. Returns the grab + the shape
+/// at press + the press point in normalized image coords. Radial: centre =>
+/// move, near boundary => resize. Linear: nearest endpoint.
+fn hit_mask(view: &View, shapes: &[MaskShape], x: f64, y: f64) -> Option<MaskDrag> {
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 || ih <= 0.0 {
+        return None;
+    }
+    let press = ((x - ix) / iw, (y - iy) / ih);
+    let near = |px: f64, py: f64| (px - x).hypot(py - y) <= HANDLE;
+    for shape in shapes {
+        match *shape {
+            MaskShape::Radial { cx, cy, rx, ry, rot, .. } => {
+                let (scx, scy) = (ix + cx * iw, iy + cy * ih);
+                if near(scx, scy) {
+                    return Some(MaskDrag { grab: MaskGrab::RadialMove, orig: *shape, press });
+                }
+                // Boundary hit: rotate the press into the ellipse's local frame,
+                // measure radial distance d (==1 on the boundary), and check the
+                // pixel gap from press to the boundary along that ray.
+                let r = rot.to_radians();
+                let (lx, ly) = (x - scx, y - scy);
+                let (ux, uy) = (lx * r.cos() + ly * r.sin(), -lx * r.sin() + ly * r.cos());
+                let (srx, sry) = ((rx * iw).max(1.0), (ry * ih).max(1.0));
+                let d = (ux / srx).hypot(uy / sry);
+                let gap = ux.hypot(uy) * (1.0 - 1.0 / d.max(1e-6)).abs();
+                if d > 0.1 && gap <= HANDLE {
+                    return Some(MaskDrag { grab: MaskGrab::RadialResize, orig: *shape, press });
+                }
+            }
+            MaskShape::Linear { x1, y1, x2, y2, .. } => {
+                if near(ix + x1 * iw, iy + y1 * ih) {
+                    return Some(MaskDrag { grab: MaskGrab::LinearStart, orig: *shape, press });
+                }
+                if near(ix + x2 * iw, iy + y2 * ih) {
+                    return Some(MaskDrag { grab: MaskGrab::LinearEnd, orig: *shape, press });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Produce the edited shape for a drag whose pointer is at normalized `cur`.
+fn apply_mask_drag(md: MaskDrag, cur: (f64, f64)) -> MaskShape {
+    let cl = |v: f64| v.clamp(0.0, 1.0);
+    match (md.grab, md.orig) {
+        (MaskGrab::RadialMove, MaskShape::Radial { sub, cx, cy, rx, ry, rot }) => {
+            let dx = cur.0 - md.press.0;
+            let dy = cur.1 - md.press.1;
+            MaskShape::Radial { sub, cx: cl(cx + dx), cy: cl(cy + dy), rx, ry, rot }
+        }
+        (MaskGrab::RadialResize, MaskShape::Radial { sub, cx, cy, rot, .. }) => MaskShape::Radial {
+            sub,
+            cx,
+            cy,
+            rx: (cur.0 - cx).abs().max(0.005),
+            ry: (cur.1 - cy).abs().max(0.005),
+            rot,
+        },
+        (MaskGrab::LinearStart, MaskShape::Linear { sub, x2, y2, .. }) => MaskShape::Linear {
+            sub,
+            x1: cl(cur.0),
+            y1: cl(cur.1),
+            x2,
+            y2,
+        },
+        (MaskGrab::LinearEnd, MaskShape::Linear { sub, x1, y1, .. }) => MaskShape::Linear {
+            sub,
+            x1,
+            y1,
+            x2: cl(cur.0),
+            y2: cl(cur.1),
+        },
+        // Grab/shape mismatch can't happen (grab derived from the same shape).
+        (_, s) => s,
+    }
+}
+
+/// Widget point -> normalized image coords (0..1), clamped to the image.
+fn to_norm(view: &View, x: f64, y: f64) -> Option<(f64, f64)> {
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 || ih <= 0.0 {
+        return None;
+    }
+    Some((((x - ix) / iw).clamp(0.0, 1.0), ((y - iy) / ih).clamp(0.0, 1.0)))
+}
+
+/// Draw the in-progress brush/flow stroke as a thick translucent polyline.
+fn draw_stroke(cr: &cairo::Context, view: &View, pts: &[(f64, f64)], arm: Option<PaintArm>) {
+    let Some(arm) = arm else { return };
+    if pts.is_empty() {
+        return;
+    }
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 {
+        return;
+    }
+    // Brush diameter on screen = 2 * radius_norm * image_screen_width.
+    let width = (arm.size_norm * 2.0 * iw).max(2.0);
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.set_line_join(cairo::LineJoin::Round);
+    cr.set_line_width(width);
+    if arm.erase {
+        cr.set_source_rgba(1.0, 0.3, 0.3, 0.35);
+    } else {
+        cr.set_source_rgba(0.4, 0.7, 1.0, 0.35);
+    }
+    let (x0, y0) = pts[0];
+    cr.move_to(ix + x0 * iw, iy + y0 * ih);
+    for &(x, y) in &pts[1..] {
+        cr.line_to(ix + x * iw, iy + y * ih);
+    }
+    let _ = cr.stroke();
+}
+
+/// Draw a small grab handle (white dot, dark ring) at a screen point.
+fn handle(cr: &cairo::Context, x: f64, y: f64) {
+    cr.arc(x, y, 5.0, 0.0, std::f64::consts::TAU);
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    let _ = cr.fill_preserve();
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.7);
+    cr.set_line_width(1.0);
+    let _ = cr.stroke();
+}
+
+/// Stroke the current path twice (dark halo, then white) so it reads on any
+/// background. Consumes the path.
+fn stroke_outlined(cr: &cairo::Context) {
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+    cr.set_line_width(3.0);
+    let _ = cr.stroke_preserve();
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_line_width(1.25);
+    let _ = cr.stroke();
 }
 
 /// Image rect (full picture) on screen, in widget px: (x, y, w, h).

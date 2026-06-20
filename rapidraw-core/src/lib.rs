@@ -7,6 +7,7 @@ pub mod image_processing;
 pub mod gpu_processing;
 pub mod image_loader;
 pub use image_loader::load_base_image;
+pub mod mask_generation;
 
 mod context;
 pub use context::headless_context;
