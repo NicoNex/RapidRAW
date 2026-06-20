@@ -9,6 +9,11 @@ pub mod image_loader;
 pub use image_loader::load_base_image;
 pub mod mask_generation;
 
+/// ONNX inference (AI masks, inpaint, denoise, CLIP). Feature-gated so core
+/// stays lean for consumers that don't need `ort`.
+#[cfg(feature = "ai")]
+pub mod ai;
+
 mod context;
 pub use context::headless_context;
 
