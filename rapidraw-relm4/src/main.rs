@@ -967,18 +967,19 @@ impl Component for AppModel {
             set_content = &adw::ToastOverlay {
                 #[wrap(Some)]
                 #[name = "split"]
-                set_child = &adw::OverlaySplitView {
-                    set_min_sidebar_width: 240.0,
-                    set_max_sidebar_width: 360.0,
-                    set_show_sidebar: true,
+                set_child = &gtk::Paned {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_position: 220,
+                    set_resize_start_child: false,
+                    set_shrink_start_child: false,
                     #[wrap(Some)]
                     #[name = "sidebar_slot"]
-                    set_sidebar = &gtk::Box {
+                    set_start_child = &gtk::Box {
                         set_orientation: gtk::Orientation::Vertical,
                     },
                     #[wrap(Some)]
                     #[name = "nav"]
-                    set_content = &adw::NavigationView {
+                    set_end_child = &adw::NavigationView {
                     // ----- Library page -----
                     add = &adw::NavigationPage {
                         set_tag: Some("library"),
@@ -990,7 +991,7 @@ impl Component for AppModel {
                                 pack_start = &gtk::ToggleButton {
                                     set_icon_name: "sidebar-show-symbolic",
                                     set_tooltip_text: Some("Toggle sidebar"),
-                                    set_active: true,
+                                    set_active: false,
                                 },
                                 pack_start = &gtk::Button {
                                     set_label: "Open Folder",
@@ -1071,7 +1072,7 @@ impl Component for AppModel {
                                 pack_start = &gtk::ToggleButton {
                                     set_icon_name: "sidebar-show-symbolic",
                                     set_tooltip_text: Some("Toggle sidebar"),
-                                    set_active: true,
+                                    set_active: false,
                                 },
                                 pack_start = &gtk::Box {
                                     add_css_class: "linked",
@@ -1550,26 +1551,28 @@ impl Component for AppModel {
                 .set_clip_toggle(move |on| sender.input(AppMsg::ToggleClipping(on)));
         }
         {
-            let split = widgets.split.clone();
+            let sb = model.sidebar.widget().clone();
             let other = widgets.sidebar_toggle_ed.clone();
             widgets.sidebar_toggle_lib.connect_toggled(move |b| {
-                split.set_show_sidebar(b.is_active());
+                sb.set_visible(b.is_active());
                 if other.is_active() != b.is_active() {
                     other.set_active(b.is_active());
                 }
             });
         }
         {
-            let split = widgets.split.clone();
+            let sb = model.sidebar.widget().clone();
             let other = widgets.sidebar_toggle_lib.clone();
             widgets.sidebar_toggle_ed.connect_toggled(move |b| {
-                split.set_show_sidebar(b.is_active());
+                sb.set_visible(b.is_active());
                 if other.is_active() != b.is_active() {
                     other.set_active(b.is_active());
                 }
             });
         }
-        widgets.split.set_sidebar(Some(model.sidebar.widget()));
+        widgets.split.set_start_child(Some(model.sidebar.widget()));
+        // Hidden until a folder is opened (no sidebar on the welcome/splash screen).
+        model.sidebar.widget().set_visible(false);
         widgets.editor_stars_slot.append(model.editor_stars.widget());
         model.sidebar.emit(SidebarIn::SetAlbums(model.albums.clone()));
         ComponentParts { model, widgets }
@@ -1604,6 +1607,10 @@ impl Component for AppModel {
                 self.session.current_folder = Some(path);
                 self.sidebar.emit(SidebarIn::SetRoot(self.session.current_folder.clone()));
                 widgets.lib_stack.set_visible_child_name("grid");
+                // Reveal the sidebar now that there's a folder to navigate.
+                self.sidebar.widget().set_visible(true);
+                widgets.sidebar_toggle_lib.set_active(true);
+                widgets.sidebar_toggle_ed.set_active(true);
                 self.apply_library(&sender);
             }
             AppMsg::ContinueSession => {
@@ -2987,6 +2994,28 @@ fn install_app_css() {
                  font-size: 30px;
                  font-weight: 800;
                  text-shadow: 0 2px 8px alpha(black, 0.6);
+             }
+             .thumb-stars {
+                 margin: 4px;
+                 padding: 0 3px;
+                 border-radius: 7px;
+                 background: alpha(black, 0.3);
+             }
+             .thumb-stars button.star {
+                 min-width: 0;
+                 min-height: 0;
+                 padding: 0 1px;
+                 margin: 0;
+                 background: none;
+                 border: none;
+                 box-shadow: none;
+                 font-size: 11px;
+                 color: alpha(white, 0.85);
+                 text-shadow: 0 1px 2px alpha(black, 0.8);
+             }
+             .thumb-stars button.star:hover {
+                 color: white;
+                 background: none;
              }",
         );
         if let Some(display) = gdk::Display::default() {

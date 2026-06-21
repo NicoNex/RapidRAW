@@ -54,8 +54,7 @@ impl FactoryComponent for Thumb {
                     set_halign: gtk::Align::Center,
                     set_valign: gtk::Align::End,
                     set_spacing: 0,
-                    add_css_class: "osd",
-                    add_css_class: "stars",
+                    add_css_class: "thumb-stars",
                     #[name = "star_box"]
                     gtk::Box {},
                 },
@@ -95,7 +94,7 @@ impl FactoryComponent for Thumb {
         let widgets = view_output!();
         let path = self.path.clone();
         for i in 1..=5u8 {
-            let b = gtk::Button::builder().css_classes(["flat"]).build();
+            let b = gtk::Button::builder().css_classes(["flat", "star"]).build();
             b.set_label("☆");
             let s = sender.clone();
             let p = path.clone();
