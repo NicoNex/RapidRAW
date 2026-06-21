@@ -41,7 +41,7 @@ use rapidraw_core::lut_processing::{parse_lut_file, Lut};
 use scopes::Scopes;
 use settings::Settings;
 use state::{Engine, Session};
-use thumb::{Thumb, ThumbMsg};
+use thumb::{Thumb, ThumbMsg, ThumbOut};
 
 /// Debounce window (ms) for coalescing rapid slider drags into one render.
 /// Small: the render thread also coalesces, and the cached GpuProcessor makes
@@ -300,6 +300,8 @@ enum AppMsg {
     ToggleFullscreen,
     /// Set the active image's star rating (0..5).
     RateActive(u8),
+    /// A thumbnail's star strip was clicked: set (or toggle-off) that path's rating.
+    RateThumb(PathBuf, u8),
     /// Open the About window.
     ShowAbout,
 }
@@ -1121,7 +1123,9 @@ impl Component for AppModel {
     ) -> ComponentParts<Self> {
         let thumbs = FactoryVecDeque::builder()
             .launch(gtk::FlowBox::default())
-            .detach();
+            .forward(sender.input_sender(), |out| match out {
+                ThumbOut::Rate(path, n) => AppMsg::RateThumb(path, n),
+            });
 
         let render_tx = spawn_render_worker(engine.ctx.clone(), sender.clone());
 
@@ -2188,6 +2192,19 @@ impl Component for AppModel {
                 }
                 save_ratings(&self.ratings);
                 // Reflect on the matching grid thumbnail.
+                if let Some(i) = self.images.iter().position(|p| *p == path) {
+                    self.thumbs.send(i, ThumbMsg::SetRating(r));
+                }
+            }
+            AppMsg::RateThumb(path, n) => {
+                let cur = self.ratings.get(&path).copied().unwrap_or(0);
+                let r = if cur == n { 0 } else { n };
+                if r == 0 {
+                    self.ratings.remove(&path);
+                } else {
+                    self.ratings.insert(path.clone(), r);
+                }
+                save_ratings(&self.ratings);
                 if let Some(i) = self.images.iter().position(|p| *p == path) {
                     self.thumbs.send(i, ThumbMsg::SetRating(r));
                 }
