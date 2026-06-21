@@ -164,7 +164,7 @@ mod tests {
                 parameters: json!({ "centerX": 32.0, "centerY": 32.0, "radiusX": 16.0, "radiusY": 16.0, "rotation": 0.0, "feather": 0.2 }),
             }],
         };
-        let out = render(&ctx, &base, &adj, std::slice::from_ref(&mask), None, None)
+        let out = render(&ctx, &base, &adj, std::slice::from_ref(&mask), None, None, None)
             .unwrap()
             .to_rgba8();
         let center = out.get_pixel(32, 32)[0];
@@ -201,7 +201,7 @@ mod tests {
             }],
         };
         let masks = [hidden, visible];
-        let out = render(&ctx, &base, &adj, &masks, None, None).unwrap().to_rgba8();
+        let out = render(&ctx, &base, &adj, &masks, None, None, None).unwrap().to_rgba8();
         let center = out.get_pixel(32, 32)[0];
         let corner = out.get_pixel(1, 1)[0];
         assert!(center > corner + 5, "second mask's exposure must apply at layer 0 (center {center} vs corner {corner})");
