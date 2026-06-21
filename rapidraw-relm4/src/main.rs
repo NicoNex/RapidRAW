@@ -240,12 +240,17 @@ enum AppMsg {
     EditMaskGeom(editor::MaskShape),
     /// Brush radius (image px) for painting brush/flow sub-masks.
     SetBrushSize(f64),
+    /// Brush edge feather (UI 0..100) for painted strokes.
+    SetBrushFeather(f64),
+    /// Toggle the brush between paint and erase.
+    SetBrushErase(bool),
     /// Arm/disarm canvas painting into sub-mask index (within the selected mask).
     ArmPaint(Option<usize>),
     /// A finished brush stroke: normalized points to append to sub-mask `sub`.
     AddBrushStroke {
         sub: usize,
         points: Vec<(f64, f64)>,
+        erase: bool,
     },
     /// Clear all painted strokes from sub-mask `sub`.
     ClearStrokes(usize),
@@ -489,6 +494,10 @@ struct AppModel {
     selected_mask: Option<usize>,
     /// Brush radius (image px) for painting brush/flow sub-masks.
     brush_size: f64,
+    /// Brush edge feather (UI 0..100); stored as 0..1 per stroke.
+    brush_feather: f64,
+    /// Brush erases instead of painting when true.
+    brush_erase: bool,
     /// Sub-mask index currently armed for canvas painting (within selected mask).
     paint_sub: Option<usize>,
     /// Switches the right column between adjustments / crop / masks panels.
@@ -1019,6 +1028,8 @@ impl Component for AppModel {
             masks_panel: MasksPanel::new(&sender),
             selected_mask: None,
             brush_size: 50.0,
+            brush_feather: 50.0,
+            brush_erase: false,
             paint_sub: None,
             content_stack: gtk::Stack::new(),
             crop_active: false,
@@ -1332,8 +1343,8 @@ impl Component for AppModel {
         // Brush/flow strokes painted on the canvas append to the sub-mask.
         {
             let sender = sender.clone();
-            model.canvas.set_paint_sink(move |sub, points, _erase| {
-                sender.input(AppMsg::AddBrushStroke { sub, points })
+            model.canvas.set_paint_sink(move |sub, points, erase| {
+                sender.input(AppMsg::AddBrushStroke { sub, points, erase })
             });
         }
         // Scopes clipping toggle feeds back into the model.
@@ -1708,14 +1719,25 @@ impl Component for AppModel {
                     sender.input(AppMsg::ArmPaint(Some(sub)));
                 }
             }
+            AppMsg::SetBrushFeather(v) => {
+                self.brush_feather = v.clamp(0.0, 100.0);
+            }
+            AppMsg::SetBrushErase(on) => {
+                self.brush_erase = on;
+                // Re-arm so the live preview + stroke tool reflect the new mode.
+                if let Some(sub) = self.paint_sub {
+                    sender.input(AppMsg::ArmPaint(Some(sub)));
+                }
+            }
             AppMsg::ArmPaint(sub) => {
                 self.paint_sub = sub;
+                let erase = self.brush_erase;
                 let arm = sub.and_then(|s| {
-                    self.image_dims().map(|(w, _)| (s, self.brush_size / w, false))
+                    self.image_dims().map(|(w, _)| (s, self.brush_size / w, erase))
                 });
                 self.canvas.set_paint(arm);
             }
-            AppMsg::AddBrushStroke { sub, points } => {
+            AppMsg::AddBrushStroke { sub, points, erase } => {
                 let Some((w, h)) = self.image_dims() else { return };
                 if let Some(m) = self.session.masks.get_mut(self.selected_mask.unwrap_or(usize::MAX)) {
                     if let Some(sm) = m.sub_masks.get_mut(sub) {
@@ -1725,9 +1747,9 @@ impl Component for AppModel {
                             .map(|(x, y)| serde_json::json!({ "x": x * w, "y": y * h }))
                             .collect();
                         let mut line = serde_json::json!({
-                            "tool": "brush",
+                            "tool": if erase { "eraser" } else { "brush" },
                             "brushSize": self.brush_size,
-                            "feather": 0.5,
+                            "feather": self.brush_feather / 100.0,
                             "points": pts,
                         });
                         if is_flow {

@@ -798,6 +798,24 @@ fn brush_controls(
     }
     group.add(&size);
 
+    let feather = adw::SpinRow::with_range(0.0, 100.0, 1.0);
+    feather.set_title("Feather");
+    feather.set_value(50.0);
+    {
+        let sender = sender.clone();
+        feather.connect_changed(move |r| sender.input(AppMsg::SetBrushFeather(r.value())));
+    }
+    group.add(&feather);
+
+    let erase = adw::SwitchRow::new();
+    erase.set_title("Eraser");
+    erase.set_subtitle("Paint to subtract from this mask");
+    {
+        let sender = sender.clone();
+        erase.connect_active_notify(move |r| sender.input(AppMsg::SetBrushErase(r.is_active())));
+    }
+    group.add(&erase);
+
     let paint = adw::SwitchRow::new();
     paint.set_title("Paint");
     paint.set_subtitle("Drag on the image to paint this mask");
