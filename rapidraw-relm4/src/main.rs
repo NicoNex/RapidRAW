@@ -1605,8 +1605,8 @@ impl Component for AppModel {
                 log::info!("{} images", self.all_images.len());
                 save_last_folder(&path);
                 self.last_folder = Some(path.clone());
-                self.session.current_folder = Some(path);
-                self.sidebar.emit(SidebarIn::SetRoot(self.session.current_folder.clone()));
+                self.session.current_folder = Some(path.clone());
+                self.sidebar.emit(SidebarIn::AddRoot(path));
                 widgets.lib_stack.set_visible_child_name("grid");
                 // Reveal the sidebar now that there's a folder to navigate.
                 self.sidebar.widget().set_visible(true);

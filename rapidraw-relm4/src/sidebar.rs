@@ -19,8 +19,9 @@ pub enum SidebarOut {
 
 #[derive(Debug)]
 pub enum SidebarIn {
-    /// Current root folder changed; rebuild the tree (None = no folder open).
-    SetRoot(Option<PathBuf>),
+    /// Append a root folder to the tree (no-op if already present). Multiple roots are
+    /// shown stacked, matching the original UI's "Add folder" behavior.
+    AddRoot(PathBuf),
     ToggleFolder(PathBuf),
     SelectFolder(PathBuf),
     Search(String),
@@ -29,7 +30,7 @@ pub enum SidebarIn {
 }
 
 pub struct Sidebar {
-    root: Option<PathBuf>,
+    roots: Vec<PathBuf>,
     expanded: HashSet<PathBuf>,
     search: String,
     /// Container the folder rows are rebuilt into.
@@ -125,7 +126,7 @@ impl Component for Sidebar {
         let folders_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let albums_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let model = Sidebar {
-            root: None,
+            roots: Vec::new(),
             expanded: HashSet::new(),
             search: String::new(),
             folders_box: folders_box.clone(),
@@ -138,12 +139,11 @@ impl Component for Sidebar {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
-            SidebarIn::SetRoot(root) => {
-                self.root = root.clone();
-                self.expanded.clear();
-                if let Some(r) = &root {
-                    self.expanded.insert(r.clone());
+            SidebarIn::AddRoot(p) => {
+                if !self.roots.contains(&p) {
+                    self.roots.push(p.clone());
                 }
+                self.expanded.insert(p);
             }
             SidebarIn::ToggleFolder(p) => {
                 if !self.expanded.remove(&p) {
@@ -182,11 +182,12 @@ impl Sidebar {
         while let Some(child) = self.folders_box.first_child() {
             self.folders_box.remove(&child);
         }
-        let Some(root) = self.root.clone() else { return };
-        let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("/").to_string();
-        self.add_row(sender, &root, &name, 0, true, 0);
-        if self.expanded.contains(&root) {
-            self.add_children(sender, &root, 1);
+        for root in &self.roots {
+            let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("/").to_string();
+            self.add_row(sender, root, &name, 0, true, 0);
+            if self.expanded.contains(root) {
+                self.add_children(sender, root, 1);
+            }
         }
     }
 
