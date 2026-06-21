@@ -972,6 +972,7 @@ impl Component for AppModel {
                     set_position: 220,
                     set_resize_start_child: false,
                     set_shrink_start_child: false,
+                    set_shrink_end_child: false,
                     #[wrap(Some)]
                     #[name = "sidebar_slot"]
                     set_start_child = &gtk::Box {
