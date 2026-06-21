@@ -27,8 +27,10 @@ mod sidecar;
 mod slider;
 mod state;
 mod thumb;
+mod sidebar;
 mod thumb_cache;
 use controls::AdjustPanel;
+use sidebar::{Sidebar, SidebarIn, SidebarOut};
 use masks::MasksPanel;
 use curves::Channel;
 use editor::EditorCanvas;
@@ -163,6 +165,8 @@ enum AppMsg {
     ToggleClipping(bool),
     /// Reopen the last folder from a previous session.
     ContinueSession,
+    /// Sidebar picked a sub-folder to show in the grid (does NOT change the tree root).
+    ShowFolder(PathBuf),
     /// Library raw-status filter changed.
     FilterChanged(library::RawFilter),
     /// Library sort order changed.
@@ -591,6 +595,8 @@ struct AppModel {
     settings_clip: Option<SettingsClip>,
     /// Star ratings per image (0..5), persisted to config.
     ratings: HashMap<PathBuf, u8>,
+    /// Sidebar folder tree component.
+    sidebar: Controller<Sidebar>,
 }
 
 impl AppModel {
@@ -1118,6 +1124,13 @@ impl Component for AppModel {
 
         let render_tx = spawn_render_worker(engine.ctx.clone(), sender.clone());
 
+        let sidebar = Sidebar::builder()
+            .launch(())
+            .forward(sender.input_sender(), |out| match out {
+                SidebarOut::SelectFolder(p) => AppMsg::ShowFolder(p),
+                SidebarOut::AddRootFolder => AppMsg::OpenFolderDialog,
+            });
+
         let model = AppModel {
             session: Session::default(),
             images: Vec::new(),
@@ -1165,6 +1178,7 @@ impl Component for AppModel {
             lut_path: None,
             settings_clip: None,
             ratings: load_ratings(),
+            sidebar,
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -1511,6 +1525,7 @@ impl Component for AppModel {
                 }
             });
         }
+        widgets.split.set_sidebar(Some(model.sidebar.widget()));
         ComponentParts { model, widgets }
     }
 
@@ -1541,6 +1556,7 @@ impl Component for AppModel {
                 save_last_folder(&path);
                 self.last_folder = Some(path.clone());
                 self.session.current_folder = Some(path);
+                self.sidebar.emit(SidebarIn::SetRoot(self.session.current_folder.clone()));
                 widgets.lib_stack.set_visible_child_name("grid");
                 self.apply_library(&sender);
             }
@@ -1548,6 +1564,10 @@ impl Component for AppModel {
                 if let Some(p) = self.last_folder.clone() {
                     sender.input(AppMsg::FolderChosen(p));
                 }
+            }
+            AppMsg::ShowFolder(dir) => {
+                self.all_images = library::scan_dir(&dir);
+                self.apply_library(&sender);
             }
             AppMsg::FilterChanged(f) => {
                 self.raw_filter = f;
