@@ -45,6 +45,7 @@ impl ColorWheel {
         hue_set: Setter,
         sat_set: Setter,
         lum_set: Setter,
+        read: Read,
     ) -> Self {
         let sender = sender.clone();
         let emit: Emit3 = Rc::new(move |hue, sat, lum| {
@@ -58,7 +59,7 @@ impl ColorWheel {
                 value: (lum / CG_SCALE) as f32,
             }));
         });
-        let (root, sliders) = build(title, vadj, (0.0, 0.0, 0.0), emit, true);
+        let (root, sliders) = build(title, vadj, (0.0, 0.0, 0.0), emit, true, Some(read));
         Self { root, sliders }
     }
 
@@ -71,7 +72,7 @@ impl ColorWheel {
         initial: (f64, f64, f64),
         on_change: impl Fn(f64, f64, f64) + 'static,
     ) -> Self {
-        let (root, sliders) = build(title, vadj, initial, Rc::new(on_change), false);
+        let (root, sliders) = build(title, vadj, initial, Rc::new(on_change), false, None);
         Self { root, sliders }
     }
 
@@ -85,8 +86,13 @@ impl ColorWheel {
     }
 }
 
+/// Reads the wheel's live components `(hue°, sat 0..1, lum -100..100)` from engine
+/// state, for restoring the disc/sliders on undo/redo + sidecar load.
+type Read = fn(&GlobalAdjustments) -> (f64, f64, f64);
+
 /// Build the wheel. `emit(hue°, sat01, lum)` fires on any change; `register_reset`
-/// opts into the global panel's reset registry. Returns `(root, hue+sat box)`;
+/// opts into the global panel's reset registry; `read` (global only) registers a
+/// sync hook so the disc/sliders restore visually. Returns `(root, hue+sat box)`;
 /// the second is hidden by default and toggled by the panel.
 fn build(
     title: &str,
@@ -94,6 +100,7 @@ fn build(
     initial: (f64, f64, f64),
     emit: Emit3,
     register_reset: bool,
+    read: Option<Read>,
 ) -> (gtk::Box, gtk::Box) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 2);
     root.set_halign(gtk::Align::Center);
@@ -291,6 +298,12 @@ fn build(
         let handle = handle.clone();
         let area = area.clone();
         let lum_handle = lum_handle.clone();
+        let track_hue = track_hue.clone();
+        let track_sat = track_sat.clone();
+        let lum_area = lum_area.clone();
+        let sat_area = sat_area.clone();
+        let hue_handle = hue_handle.clone();
+        let sat_handle = sat_handle.clone();
         crate::slider::register_reset(Rc::new(move || {
             handle.set((0.0, 0.0));
             track_hue.set(0.0);
@@ -301,6 +314,23 @@ fn build(
             lum_area.queue_draw();
             sat_area.queue_draw();
             lum_handle.set_ui(0.0);
+        }));
+    }
+
+    // Sync hook: restore the disc + sliders from engine state on undo/sidecar.
+    if let Some(read) = read {
+        let area = area.clone();
+        crate::slider::register_sync(Rc::new(move |g: &GlobalAdjustments| {
+            let (hue, sat, lum) = read(g);
+            handle.set((hue, sat));
+            track_hue.set(hue);
+            track_sat.set(sat * 200.0 - 100.0);
+            hue_handle.set_ui(hue);
+            sat_handle.set_ui(sat * 100.0);
+            lum_handle.set_ui(lum);
+            area.queue_draw();
+            lum_area.queue_draw();
+            sat_area.queue_draw();
         }));
     }
 

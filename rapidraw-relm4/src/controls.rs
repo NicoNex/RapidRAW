@@ -164,6 +164,9 @@ pub struct AdjustPanel {
     defaults: Vec<f64>,
     /// Reset closures for non-slider widgets (curve editor, colour wheels).
     reset_hooks: Vec<std::rc::Rc<dyn Fn()>>,
+    /// "Sync from engine state" closures for non-slider widgets (colour-wheel
+    /// disc, tone-mapper toggle), for undo/redo + sidecar visual restore.
+    sync_hooks: Vec<std::rc::Rc<dyn Fn(&GlobalAdjustments)>>,
 }
 
 impl AdjustPanel {
@@ -190,6 +193,7 @@ impl AdjustPanel {
         list.append(&card(&build_lut_section(sender, &vadj)));
         let handles = crate::slider::reg_take();
         let reset_hooks = crate::slider::reset_take();
+        let sync_hooks = crate::slider::sync_take();
         let defaults = handles.iter().map(|h| h.get()).collect();
 
         Self {
@@ -197,6 +201,7 @@ impl AdjustPanel {
             handles,
             defaults,
             reset_hooks,
+            sync_hooks,
         }
     }
 
@@ -219,6 +224,14 @@ impl AdjustPanel {
     pub fn restore(&self, vals: &[f64]) {
         for (h, &v) in self.handles.iter().zip(vals) {
             h.set_ui(v);
+        }
+    }
+
+    /// Sync non-slider widgets (colour-wheel disc, tone-mapper toggle) from the
+    /// restored engine state, so undo/redo + sidecar load reflect them visually.
+    pub fn sync(&self, g: &GlobalAdjustments) {
+        for h in &self.sync_hooks {
+            h(g);
         }
     }
 
@@ -282,33 +295,38 @@ fn build_basic(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gt
 /// Tone Mapper sub-card: a Basic/AgX segmented selector plus the EV-shift slider
 /// (which is the exposure control), mirroring the original's inner card.
 fn tone_mapper_card(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Box {
+    install_tonemapper_css();
+    // Inset card: a distinct (darker) background so the slider track stays
+    // visible, with uniform internal padding via CSS so nothing touches the edge.
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    outer.add_css_class("card");
+    outer.add_css_class("tone-mapper-card");
     outer.set_margin_top(2);
-    outer.set_margin_bottom(4);
+    outer.set_margin_bottom(6);
 
     let title = gtk::Label::new(Some("Tone Mapper"));
     title.set_halign(gtk::Align::Start);
     title.add_css_class("caption");
-    title.set_margin_start(6);
-    title.set_margin_top(4);
     outer.append(&title);
 
     // Segmented Basic / AgX selector (linked toggle buttons in one group).
     let seg = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     seg.add_css_class("linked");
-    seg.set_margin_start(6);
-    seg.set_margin_end(6);
     let basic_btn = gtk::ToggleButton::with_label("Basic");
     let agx_btn = gtk::ToggleButton::with_label("AgX");
     agx_btn.set_group(Some(&basic_btn));
     basic_btn.set_active(true); // default mapper
     basic_btn.set_hexpand(true);
     agx_btn.set_hexpand(true);
+    // Suppresses the toggled->Adjust feedback while we set the button from state.
+    let syncing = std::rc::Rc::new(std::cell::Cell::new(false));
     {
         let sender = sender.clone();
+        let syncing = syncing.clone();
         // Send on the basic button's toggle (the group fires it for both).
         basic_btn.connect_toggled(move |b| {
+            if syncing.get() {
+                return;
+            }
             let mode = if b.is_active() { 0.0 } else { 1.0 };
             sender.input(AppMsg::Adjust(crate::Adjust {
                 set: |g, v| g.tonemapper_mode = v as u32,
@@ -325,6 +343,16 @@ fn tone_mapper_card(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) 
         let basic_btn = basic_btn.clone();
         crate::slider::register_reset(std::rc::Rc::new(move || basic_btn.set_active(true)));
     }
+    // Undo/redo + sidecar: reflect the restored tonemapper_mode on the selector.
+    {
+        let basic_btn = basic_btn.clone();
+        let syncing = syncing.clone();
+        crate::slider::register_sync(std::rc::Rc::new(move |g: &GlobalAdjustments| {
+            syncing.set(true);
+            basic_btn.set_active(g.tonemapper_mode == 0);
+            syncing.set(false);
+        }));
+    }
 
     // EV shift = exposure (-5..5), same as the original's card slider.
     outer.append(&build_row(
@@ -340,6 +368,27 @@ fn tone_mapper_card(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) 
         vadj,
     ));
     outer
+}
+
+fn install_tonemapper_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk::CssProvider::new();
+        // Darker than the surrounding card so the slider track contrasts; padding
+        // keeps the title/selector/slider off the edges (consistent with `card()`).
+        provider.load_from_data(
+            ".tone-mapper-card { background-color: alpha(black, 0.18); \
+             border-radius: 8px; padding: 8px; }",
+        );
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
 }
 
 fn append_rows(
@@ -400,36 +449,57 @@ fn build_grading(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> 
     flow.set_row_spacing(4);
     flow.set_homogeneous(true);
 
+    // Each wheel: name, hue/sat/lum setters, and a reader (inverse mapping) for
+    // restoring the disc/sliders from engine state. The wheel stores sat as
+    // sat01*100/CG_SCALE and lum as lum/CG_SCALE (CG_SCALE = 500), so reading back
+    // is `sat = stored*5`, `lum = stored*500`, hue is degrees.
+    type Read = fn(&GlobalAdjustments) -> (f64, f64, f64);
     let wheels = [
         (
             "Shadows",
             (|g: &mut GlobalAdjustments, v| g.color_grading_shadows.hue = v) as Setter,
             (|g: &mut GlobalAdjustments, v| g.color_grading_shadows.saturation = v) as Setter,
             (|g: &mut GlobalAdjustments, v| g.color_grading_shadows.luminance = v) as Setter,
+            (|g: &GlobalAdjustments| {
+                let c = &g.color_grading_shadows;
+                (c.hue as f64, c.saturation as f64 * 5.0, c.luminance as f64 * 500.0)
+            }) as Read,
         ),
         (
             "Midtones",
             (|g, v| g.color_grading_midtones.hue = v) as Setter,
             (|g, v| g.color_grading_midtones.saturation = v) as Setter,
             (|g, v| g.color_grading_midtones.luminance = v) as Setter,
+            (|g: &GlobalAdjustments| {
+                let c = &g.color_grading_midtones;
+                (c.hue as f64, c.saturation as f64 * 5.0, c.luminance as f64 * 500.0)
+            }) as Read,
         ),
         (
             "Highlights",
             (|g, v| g.color_grading_highlights.hue = v) as Setter,
             (|g, v| g.color_grading_highlights.saturation = v) as Setter,
             (|g, v| g.color_grading_highlights.luminance = v) as Setter,
+            (|g: &GlobalAdjustments| {
+                let c = &g.color_grading_highlights;
+                (c.hue as f64, c.saturation as f64 * 5.0, c.luminance as f64 * 500.0)
+            }) as Read,
         ),
         (
             "Global",
             (|g, v| g.color_grading_global.hue = v) as Setter,
             (|g, v| g.color_grading_global.saturation = v) as Setter,
             (|g, v| g.color_grading_global.luminance = v) as Setter,
+            (|g: &GlobalAdjustments| {
+                let c = &g.color_grading_global;
+                (c.hue as f64, c.saturation as f64 * 5.0, c.luminance as f64 * 500.0)
+            }) as Read,
         ),
     ];
     let built: Vec<ColorWheel> = wheels
         .into_iter()
-        .map(|(name, h, s, l)| {
-            let w = ColorWheel::new(name, sender, vadj, h, s, l);
+        .map(|(name, h, s, l, r)| {
+            let w = ColorWheel::new(name, sender, vadj, h, s, l, r);
             flow.append(w.root());
             w
         })

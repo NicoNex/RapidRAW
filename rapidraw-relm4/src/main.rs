@@ -661,6 +661,7 @@ impl AppModel {
             .rebuild(&self.session.masks, self.selected_mask, sender);
         self.suppress_history = true;
         self.panel.restore(&entry.vals);
+        self.panel.sync(&self.session.adjustments.global);
         self.suppress_history = false;
         if self.showing_original {
             self.showing_original = false;
@@ -1831,6 +1832,7 @@ impl Component for AppModel {
                         None => (0.0, 0.0, 1.0, 1.0),
                     });
                     self.panel.restore(&c.vals);
+                    self.panel.sync(&self.session.adjustments.global);
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                     self.toasts.add_toast(adw::Toast::new("Settings pasted"));
@@ -2376,6 +2378,7 @@ impl Component for AppModel {
                             }
                         }
                         self.panel.restore(&e.vals);
+                        self.panel.sync(&self.session.adjustments.global);
                         self.session.masks = e.masks;
                         self.selected_mask = None;
                         self.masks_panel.rebuild(&self.session.masks, None, &sender);
