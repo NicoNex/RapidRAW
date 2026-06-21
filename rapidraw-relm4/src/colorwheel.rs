@@ -27,8 +27,12 @@ const CG_SCALE: f64 = 500.0;
 /// `(hue degrees, saturation 0..1, luminance -100..100)`.
 type Emit3 = Rc<dyn Fn(f64, f64, f64)>;
 
+#[derive(Clone)]
 pub struct ColorWheel {
     root: gtk::Box,
+    /// Hue + Saturation sliders, hidden by default; the panel's "toggle sliders"
+    /// button reveals them (the disc always edits hue/sat too).
+    sliders: gtk::Box,
 }
 
 impl ColorWheel {
@@ -41,6 +45,7 @@ impl ColorWheel {
         hue_set: Setter,
         sat_set: Setter,
         lum_set: Setter,
+        read: Read,
     ) -> Self {
         let sender = sender.clone();
         let emit: Emit3 = Rc::new(move |hue, sat, lum| {
@@ -54,7 +59,8 @@ impl ColorWheel {
                 value: (lum / CG_SCALE) as f32,
             }));
         });
-        Self { root: build(title, vadj, (0.0, 0.0, 0.0), emit, true) }
+        let (root, sliders) = build(title, vadj, (0.0, 0.0, 0.0), emit, true, Some(read));
+        Self { root, sliders }
     }
 
     /// Generic wheel for non-global targets (e.g. per-mask color grading): seeded
@@ -66,23 +72,36 @@ impl ColorWheel {
         initial: (f64, f64, f64),
         on_change: impl Fn(f64, f64, f64) + 'static,
     ) -> Self {
-        Self { root: build(title, vadj, initial, Rc::new(on_change), false) }
+        let (root, sliders) = build(title, vadj, initial, Rc::new(on_change), false, None);
+        Self { root, sliders }
     }
 
     pub fn root(&self) -> &gtk::Box {
         &self.root
     }
+
+    /// Show/hide the Hue + Saturation sliders (the panel toggles all wheels).
+    pub fn set_sliders_visible(&self, visible: bool) {
+        self.sliders.set_visible(visible);
+    }
 }
 
+/// Reads the wheel's live components `(hue°, sat 0..1, lum -100..100)` from engine
+/// state, for restoring the disc/sliders on undo/redo + sidecar load.
+type Read = fn(&GlobalAdjustments) -> (f64, f64, f64);
+
 /// Build the wheel. `emit(hue°, sat01, lum)` fires on any change; `register_reset`
-/// opts into the global panel's reset registry.
+/// opts into the global panel's reset registry; `read` (global only) registers a
+/// sync hook so the disc/sliders restore visually. Returns `(root, hue+sat box)`;
+/// the second is hidden by default and toggled by the panel.
 fn build(
     title: &str,
     vadj: &gtk::Adjustment,
     initial: (f64, f64, f64),
     emit: Emit3,
     register_reset: bool,
-) -> gtk::Box {
+    read: Option<Read>,
+) -> (gtk::Box, gtk::Box) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 2);
     root.set_halign(gtk::Align::Center);
 
@@ -95,6 +114,13 @@ fn build(
     let handle = Rc::new(Cell::new((initial.0, initial.1)));
     let lum_val = Rc::new(Cell::new(initial.2));
 
+    // Live hue/sat for the luminance track gradient (matches the original's
+    // `cg-lum-gradient`, black->tint->white at the wheel's colour). `Track::HslLum`
+    // wants hue in degrees and sat as -100..100, so map sat 0..1 -> ±100
+    // (es = (sat+100)/200 then recovers 0..1).
+    let track_hue = Rc::new(Cell::new(initial.0));
+    let track_sat = Rc::new(Cell::new(initial.1 * 200.0 - 100.0));
+
     let area = gtk::DrawingArea::new();
     area.set_content_width(DISC);
     area.set_content_height(DISC);
@@ -103,7 +129,106 @@ fn build(
         area.set_draw_func(move |_, cr, w, h| draw_wheel(cr, w, h, handle.get()));
     }
 
-    // Drag the handle: set hue/sat from the pointer.
+    // Luminance uses the shared custom slider (centre-origin fill, double-click
+    // reset, value readout — matching the other panel sliders, exactly as the
+    // original UI, which reuses its `Slider` here too, with the same dynamic
+    // black->tint->white track). Built without panel registration so it doesn't
+    // shift the snapshot index mapping; the wheel handles its own reset.
+    let (lum_row, lum_area, lum_handle) = crate::slider::without_registration(|| {
+        let handle = handle.clone();
+        let lum_val = lum_val.clone();
+        let emit = emit.clone();
+        crate::slider::slider_ex(
+            "Luminance",
+            -100.0,
+            100.0,
+            1.0,
+            0.0,
+            crate::slider::Track::HslLum {
+                base: 0.0,
+                hue: track_hue.clone(),
+                sat: track_sat.clone(),
+            },
+            vadj,
+            move |v| {
+                lum_val.set(v);
+                let (hue, sat) = handle.get();
+                emit(hue, sat, v);
+            },
+        )
+    });
+    lum_handle.set_ui(initial.2); // seed display without firing the callback
+
+    // Saturation slider: grey -> saturated at the live hue (cg-sat-gradient).
+    let (sat_row, sat_area, sat_handle) = crate::slider::without_registration(|| {
+        let handle = handle.clone();
+        let lum_val = lum_val.clone();
+        let emit = emit.clone();
+        let track_sat = track_sat.clone();
+        let area = area.clone();
+        let lum_area = lum_area.clone();
+        crate::slider::slider_ex(
+            "Saturation",
+            0.0,
+            100.0,
+            1.0,
+            0.0,
+            crate::slider::Track::HslSat {
+                base: 0.0,
+                hue: track_hue.clone(),
+            },
+            vadj,
+            move |v| {
+                let sat = v / 100.0;
+                let (hue, _) = handle.get();
+                handle.set((hue, sat));
+                track_sat.set(sat * 200.0 - 100.0);
+                area.queue_draw();
+                lum_area.queue_draw();
+                emit(hue, sat, lum_val.get());
+            },
+        )
+    });
+    sat_handle.set_ui(initial.1 * 100.0);
+
+    // Hue slider: full spectrum (cg-hue-gradient).
+    let (hue_row, _hue_area, hue_handle) = crate::slider::without_registration(|| {
+        let handle = handle.clone();
+        let lum_val = lum_val.clone();
+        let emit = emit.clone();
+        let track_hue = track_hue.clone();
+        let area = area.clone();
+        let lum_area = lum_area.clone();
+        let sat_area = sat_area.clone();
+        crate::slider::slider_ex(
+            "Hue",
+            0.0,
+            360.0,
+            1.0,
+            0.0,
+            crate::slider::Track::Hue,
+            vadj,
+            move |v| {
+                let (_, sat) = handle.get();
+                handle.set((v, sat));
+                track_hue.set(v);
+                area.queue_draw();
+                lum_area.queue_draw();
+                sat_area.queue_draw(); // sat gradient follows hue
+                emit(v, sat, lum_val.get());
+            },
+        )
+    });
+    hue_handle.set_ui(initial.0);
+
+    // Hue + Saturation live in a collapsible box (hidden until the panel toggles
+    // it); the disc edits the same values, syncing these sliders on drag.
+    let sliders = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    sliders.set_visible(false);
+    sliders.append(&hue_row);
+    sliders.append(&sat_row);
+
+    // Drag the handle: set hue/sat from the pointer (and refresh the lum track).
     let drag = gtk::GestureDrag::new();
     let start = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
     {
@@ -116,55 +241,52 @@ fn build(
         let lum_val = lum_val.clone();
         let emit = emit.clone();
         let start = start.clone();
+        let track_hue = track_hue.clone();
+        let track_sat = track_sat.clone();
+        let lum_area = lum_area.clone();
+        let sat_area = sat_area.clone();
+        let hue_handle = hue_handle.clone();
+        let sat_handle = sat_handle.clone();
         drag.connect_drag_update(move |_, ox, oy| {
             let (sx, sy) = start.get();
             let (hue, sat) = point_to_hue_sat(&area_w, sx + ox, sy + oy);
             handle.set((hue, sat));
+            track_hue.set(hue);
+            track_sat.set(sat * 200.0 - 100.0);
+            hue_handle.set_ui(hue); // keep the H/S sliders in sync
+            sat_handle.set_ui(sat * 100.0);
             area_w.queue_draw();
+            lum_area.queue_draw();
+            sat_area.queue_draw();
             emit(hue, sat, lum_val.get());
         });
     }
     area.add_controller(drag);
 
-    let lum = gtk::Scale::with_range(gtk::Orientation::Horizontal, -100.0, 100.0, 1.0);
-    lum.set_hexpand(true);
-    lum.set_draw_value(true);
-    lum.set_value(initial.2);
-    crate::controls::forward_wheel(&lum, vadj); // wheel scrolls panel, not the slider
-    {
-        let handle = handle.clone();
-        let lum_val = lum_val.clone();
-        let emit = emit.clone();
-        lum.connect_value_changed(move |s| {
-            lum_val.set(s.value());
-            let (hue, sat) = handle.get();
-            emit(hue, sat, s.value());
-        });
-    }
-    // Double-click the luminance slider resets it to 0.
-    let lum_reset = gtk::GestureClick::new();
-    {
-        let lum = lum.clone();
-        lum_reset.connect_pressed(move |_, n, _, _| {
-            if n == 2 {
-                lum.set_value(0.0);
-            }
-        });
-    }
-    lum.add_controller(lum_reset);
-
-    // Double-click anywhere on the wheel resets all three components.
+    // Double-click anywhere on the wheel disc resets all three components.
     let reset = gtk::GestureClick::new();
     {
         let area_w = area.clone();
         let handle = handle.clone();
-        let lum = lum.clone();
+        let lum_handle = lum_handle.clone();
         let emit = emit.clone();
+        let track_hue = track_hue.clone();
+        let track_sat = track_sat.clone();
+        let lum_area = lum_area.clone();
+        let sat_area = sat_area.clone();
+        let hue_handle = hue_handle.clone();
+        let sat_handle = sat_handle.clone();
         reset.connect_pressed(move |_, n, _, _| {
             if n == 2 {
                 handle.set((0.0, 0.0));
+                track_hue.set(0.0);
+                track_sat.set(-100.0);
+                hue_handle.set_ui(0.0);
+                sat_handle.set_ui(0.0);
                 area_w.queue_draw();
-                lum.set_value(0.0); // fires lum change -> emit
+                lum_area.queue_draw();
+                sat_area.queue_draw();
+                lum_handle.set_ui(0.0); // update the slider display
                 emit(0.0, 0.0, 0.0);
             }
         });
@@ -175,17 +297,48 @@ fn build(
     if register_reset {
         let handle = handle.clone();
         let area = area.clone();
-        let lum = lum.clone();
+        let lum_handle = lum_handle.clone();
+        let track_hue = track_hue.clone();
+        let track_sat = track_sat.clone();
+        let lum_area = lum_area.clone();
+        let sat_area = sat_area.clone();
+        let hue_handle = hue_handle.clone();
+        let sat_handle = sat_handle.clone();
         crate::slider::register_reset(Rc::new(move || {
             handle.set((0.0, 0.0));
+            track_hue.set(0.0);
+            track_sat.set(-100.0);
+            hue_handle.set_ui(0.0);
+            sat_handle.set_ui(0.0);
             area.queue_draw();
-            lum.set_value(0.0);
+            lum_area.queue_draw();
+            sat_area.queue_draw();
+            lum_handle.set_ui(0.0);
         }));
     }
 
+    // Sync hook: restore the disc + sliders from engine state on undo/sidecar.
+    if let Some(read) = read {
+        let area = area.clone();
+        crate::slider::register_sync(Rc::new(move |g: &GlobalAdjustments| {
+            let (hue, sat, lum) = read(g);
+            handle.set((hue, sat));
+            track_hue.set(hue);
+            track_sat.set(sat * 200.0 - 100.0);
+            hue_handle.set_ui(hue);
+            sat_handle.set_ui(sat * 100.0);
+            lum_handle.set_ui(lum);
+            area.queue_draw();
+            lum_area.queue_draw();
+            sat_area.queue_draw();
+        }));
+    }
+
+    // Order matches the original: hue + sat (collapsible) above, luminance below.
     root.append(&area);
-    root.append(&lum);
-    root
+    root.append(&sliders);
+    root.append(&lum_row);
+    (root, sliders)
 }
 
 /// Map a pointer position within `area` to (hue degrees [0,360), saturation [0,1]).

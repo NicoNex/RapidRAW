@@ -6,15 +6,17 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Background {
     Default,
     White,
     Black,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     /// Editor preview max edge in px.
     pub preview_dim: u32,

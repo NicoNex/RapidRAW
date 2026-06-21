@@ -45,11 +45,23 @@ thread_local! {
 pub fn reg_begin() {
     REG.with(|r| *r.borrow_mut() = Some(Vec::new()));
     RESET.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    SYNC.with(|r| *r.borrow_mut() = Some(Vec::new()));
 }
 
 /// Take the collected slider handles (call after building a panel).
 pub fn reg_take() -> Vec<SliderHandle> {
     REG.with(|r| r.borrow_mut().take().unwrap_or_default())
+}
+
+/// Build sliders inside `f` WITHOUT registering them in the panel snapshot
+/// buffer (the collected `vals` layout stays stable). Used by the colour wheels'
+/// luminance slider, which manages its own reset and must not shift the index
+/// mapping of the surrounding panel sliders.
+pub fn without_registration<R>(f: impl FnOnce() -> R) -> R {
+    let saved = REG.with(|r| r.borrow_mut().take());
+    let out = f();
+    REG.with(|r| *r.borrow_mut() = saved);
+    out
 }
 
 thread_local! {
@@ -70,6 +82,29 @@ pub fn register_reset(f: Rc<dyn Fn()>) {
 /// Take the collected reset closures (call after building a panel).
 pub fn reset_take() -> Vec<Rc<dyn Fn()>> {
     RESET.with(|r| r.borrow_mut().take().unwrap_or_default())
+}
+
+type SyncHook = Rc<dyn Fn(&rapidraw_core::image_processing::GlobalAdjustments)>;
+
+thread_local! {
+    /// "Sync from engine state" closures for non-slider widgets (colour-wheel
+    /// disc, tone-mapper toggle): read the restored `GlobalAdjustments` and update
+    /// their widgets so undo/redo and sidecar load reflect visually, like sliders.
+    static SYNC: RefCell<Option<Vec<SyncHook>>> = const { RefCell::new(None) };
+}
+
+/// Register a closure that updates a component's widgets from engine state.
+pub fn register_sync(f: SyncHook) {
+    SYNC.with(|r| {
+        if let Some(list) = r.borrow_mut().as_mut() {
+            list.push(f);
+        }
+    });
+}
+
+/// Take the collected sync closures (call after building a panel).
+pub fn sync_take() -> Vec<SyncHook> {
+    SYNC.with(|r| r.borrow_mut().take().unwrap_or_default())
 }
 
 #[derive(Clone)]
