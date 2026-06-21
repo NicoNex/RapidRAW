@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use adw::prelude::*;
+use gtk::prelude::IsA;
+use rapidraw_core::albums::AlbumItem;
 use rapidraw_core::folders::list_subdirs;
 use relm4::prelude::*;
 
@@ -9,6 +11,10 @@ use relm4::prelude::*;
 pub enum SidebarOut {
     SelectFolder(PathBuf),
     AddRootFolder,
+    SelectAlbum { id: String, name: String, images: Vec<String> },
+    NewAlbum(String),
+    RenameAlbum { id: String, name: String },
+    DeleteAlbum(String),
 }
 
 #[derive(Debug)]
@@ -18,6 +24,8 @@ pub enum SidebarIn {
     ToggleFolder(PathBuf),
     SelectFolder(PathBuf),
     Search(String),
+    SetAlbums(Vec<AlbumItem>),
+    ActivateAlbum(String),
 }
 
 pub struct Sidebar {
@@ -26,6 +34,8 @@ pub struct Sidebar {
     search: String,
     /// Container the folder rows are rebuilt into.
     folders_box: gtk::Box,
+    albums: Vec<AlbumItem>,
+    albums_box: gtk::Box,
 }
 
 #[relm4::component(pub)]
@@ -73,6 +83,37 @@ impl Component for Sidebar {
                     let _ = sender.output(SidebarOut::AddRootFolder);
                 },
             },
+
+            gtk::Box {
+                set_orientation: gtk::Orientation::Horizontal,
+                gtk::Label {
+                    set_xalign: 0.0,
+                    set_hexpand: true,
+                    set_label: "ALBUMS",
+                    add_css_class: "caption-heading",
+                    add_css_class: "dim-label",
+                },
+                gtk::Button {
+                    add_css_class: "flat",
+                    set_icon_name: "list-add-symbolic",
+                    set_tooltip_text: Some("New album"),
+                    connect_clicked[sender] => move |b| {
+                        let s = sender.clone();
+                        ask_name(b, "New album", "", move |name| {
+                            let _ = s.output(SidebarOut::NewAlbum(name));
+                        });
+                    },
+                },
+            },
+            gtk::ScrolledWindow {
+                set_vexpand: true,
+                set_hscrollbar_policy: gtk::PolicyType::Never,
+                #[local_ref]
+                albums_box -> gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 2,
+                },
+            },
         }
     }
 
@@ -82,11 +123,14 @@ impl Component for Sidebar {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let folders_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let albums_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let model = Sidebar {
             root: None,
             expanded: HashSet::new(),
             search: String::new(),
             folders_box: folders_box.clone(),
+            albums: Vec::new(),
+            albums_box: albums_box.clone(),
         };
         let widgets = view_output!();
         ComponentParts { model, widgets }
@@ -112,6 +156,19 @@ impl Component for Sidebar {
             }
             SidebarIn::Search(q) => {
                 self.search = q.to_lowercase();
+            }
+            SidebarIn::SetAlbums(items) => {
+                self.albums = items;
+                self.rebuild_albums(&sender);
+                return;
+            }
+            SidebarIn::ActivateAlbum(id) => {
+                let name = album_name(&self.albums, &id).unwrap_or_default();
+                let images = rapidraw_core::albums::album_images(&self.albums, &id)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                let _ = sender.output(SidebarOut::SelectAlbum { id, name, images });
+                return;
             }
         }
         self.rebuild(&sender);
@@ -196,4 +253,118 @@ impl Sidebar {
 
         self.folders_box.append(&row);
     }
+
+    fn rebuild_albums(&self, sender: &ComponentSender<Self>) {
+        while let Some(child) = self.albums_box.first_child() {
+            self.albums_box.remove(&child);
+        }
+        for item in &self.albums {
+            self.add_album_row(sender, item);
+        }
+    }
+
+    fn add_album_row(&self, sender: &ComponentSender<Self>, item: &AlbumItem) {
+        match item {
+            AlbumItem::Album { id, name, .. } => {
+                let row = adw::ActionRow::builder().title(name).activatable(true).build();
+                row.add_prefix(&gtk::Image::from_icon_name("emblem-photos-symbolic"));
+                {
+                    let s = sender.clone();
+                    let id = id.clone();
+                    row.connect_activated(move |_| s.input(SidebarIn::ActivateAlbum(id.clone())));
+                }
+                // overflow menu: rename / delete
+                let menu_btn = gtk::MenuButton::builder()
+                    .icon_name("view-more-symbolic")
+                    .css_classes(["flat"])
+                    .valign(gtk::Align::Center)
+                    .build();
+                let pop = gtk::Popover::new();
+                let vb = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                let rename = gtk::Button::builder().label("Rename").css_classes(["flat"]).build();
+                let delete = gtk::Button::builder().label("Delete").css_classes(["flat"]).build();
+                vb.append(&rename);
+                vb.append(&delete);
+                pop.set_child(Some(&vb));
+                menu_btn.set_popover(Some(&pop));
+                {
+                    let s = sender.clone();
+                    let id = id.clone();
+                    let cur = name.clone();
+                    let pop = pop.clone();
+                    rename.connect_clicked(move |btn| {
+                        pop.popdown();
+                        let s2 = s.clone();
+                        let id2 = id.clone();
+                        ask_name(btn, "Rename album", &cur, move |name| {
+                            let _ = s2.output(SidebarOut::RenameAlbum { id: id2.clone(), name });
+                        });
+                    });
+                }
+                {
+                    let s = sender.clone();
+                    let id = id.clone();
+                    let pop = pop.clone();
+                    delete.connect_clicked(move |_| {
+                        pop.popdown();
+                        let _ = s.output(SidebarOut::DeleteAlbum(id.clone()));
+                    });
+                }
+                row.add_suffix(&menu_btn);
+                self.albums_box.append(&row);
+            }
+            AlbumItem::Group { name, children, .. } => {
+                let exp = adw::ExpanderRow::builder().title(name).build();
+                for child in children {
+                    if let AlbumItem::Album { id, name, .. } = child {
+                        let crow = adw::ActionRow::builder().title(name).activatable(true).build();
+                        let s = sender.clone();
+                        let id = id.clone();
+                        crow.connect_activated(move |_| s.input(SidebarIn::ActivateAlbum(id.clone())));
+                        exp.add_row(&crow);
+                    }
+                }
+                self.albums_box.append(&exp);
+            }
+        }
+    }
+}
+
+/// Find an album's display name by id (searches groups recursively).
+fn album_name(tree: &[AlbumItem], target: &str) -> Option<String> {
+    for item in tree {
+        match item {
+            AlbumItem::Album { id, name, .. } if id == target => return Some(name.clone()),
+            AlbumItem::Group { children, .. } => {
+                if let Some(n) = album_name(children, target) {
+                    return Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Show a libadwaita text-entry dialog; calls `on_ok` with the trimmed-nonempty name.
+/// Uses MessageDialog (adw v1_2+) because AlertDialog needs v1_5 which isn't enabled.
+fn ask_name(anchor: &impl IsA<gtk::Widget>, title: &str, initial: &str, on_ok: impl Fn(String) + 'static) {
+    let window = anchor.root().and_downcast::<gtk::Window>();
+    let dialog = adw::MessageDialog::new(window.as_ref(), Some(title), None);
+    let entry = gtk::Entry::builder().text(initial).build();
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", "OK");
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "ok" {
+            let name = entry.text().to_string();
+            if !name.trim().is_empty() {
+                on_ok(name);
+            }
+        }
+    });
+    dialog.present();
 }

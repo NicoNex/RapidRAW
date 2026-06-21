@@ -305,6 +305,14 @@ enum AppMsg {
     RateThumb(PathBuf, u8),
     /// Open the About window.
     ShowAbout,
+    /// Show images from an album in the grid.
+    ShowAlbum { id: String, name: String, images: Vec<String> },
+    /// Create a new album with the given name.
+    AlbumNew(String),
+    /// Rename an album.
+    AlbumRename { id: String, name: String },
+    /// Delete an album.
+    AlbumDelete(String),
 }
 
 /// Copied edit settings (toolbar copy/paste between photos).
@@ -599,6 +607,8 @@ struct AppModel {
     settings_clip: Option<SettingsClip>,
     /// Star ratings per image (0..5), persisted to config.
     ratings: HashMap<PathBuf, u8>,
+    /// Album tree (persisted to config).
+    albums: Vec<rapidraw_core::albums::AlbumItem>,
     /// Sidebar folder tree component.
     sidebar: Controller<Sidebar>,
     /// Star rating widget shown in the editor header bar.
@@ -766,6 +776,14 @@ impl AppModel {
             &self.images,
             0..self.images.len(),
         );
+    }
+
+    /// Persist albums to disk and push the updated list to the sidebar.
+    fn persist_albums(&mut self) {
+        if let Some(p) = albums_file() {
+            let _ = rapidraw_core::albums::save_albums(&p, &mut self.albums);
+        }
+        self.sidebar.emit(SidebarIn::SetAlbums(self.albums.clone()));
     }
 
     /// Apply the history entry at `hist_idx`: set engine state, restore the
@@ -1134,11 +1152,19 @@ impl Component for AppModel {
 
         let render_tx = spawn_render_worker(engine.ctx.clone(), sender.clone());
 
+        let albums = albums_file()
+            .map(|p| rapidraw_core::albums::load_albums(&p))
+            .unwrap_or_default();
+
         let sidebar = Sidebar::builder()
             .launch(())
             .forward(sender.input_sender(), |out| match out {
                 SidebarOut::SelectFolder(p) => AppMsg::ShowFolder(p),
                 SidebarOut::AddRootFolder => AppMsg::OpenFolderDialog,
+                SidebarOut::SelectAlbum { id, name, images } => AppMsg::ShowAlbum { id, name, images },
+                SidebarOut::NewAlbum(name) => AppMsg::AlbumNew(name),
+                SidebarOut::RenameAlbum { id, name } => AppMsg::AlbumRename { id, name },
+                SidebarOut::DeleteAlbum(id) => AppMsg::AlbumDelete(id),
             });
 
         let editor_stars = Stars::builder()
@@ -1194,6 +1220,7 @@ impl Component for AppModel {
             lut_path: None,
             settings_clip: None,
             ratings: load_ratings(),
+            albums,
             sidebar,
             editor_stars,
         };
@@ -1544,6 +1571,7 @@ impl Component for AppModel {
         }
         widgets.split.set_sidebar(Some(model.sidebar.widget()));
         widgets.editor_stars_slot.append(model.editor_stars.widget());
+        model.sidebar.emit(SidebarIn::SetAlbums(model.albums.clone()));
         ComponentParts { model, widgets }
     }
 
@@ -2674,6 +2702,39 @@ impl Component for AppModel {
                 };
                 self.show_active_tex();
             }
+            AppMsg::ShowAlbum { images, .. } => {
+                let paths: Vec<PathBuf> = images
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .filter(|p| p.exists())
+                    .collect();
+                self.all_images = paths;
+                self.apply_library(&sender);
+            }
+            AppMsg::AlbumNew(name) => {
+                let id = format!(
+                    "album-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                );
+                self.albums.push(rapidraw_core::albums::AlbumItem::Album {
+                    id,
+                    name,
+                    icon: None,
+                    images: vec![],
+                });
+                self.persist_albums();
+            }
+            AppMsg::AlbumRename { id, name } => {
+                rename_album(&mut self.albums, &id, &name);
+                self.persist_albums();
+            }
+            AppMsg::AlbumDelete(id) => {
+                delete_album(&mut self.albums, &id);
+                self.persist_albums();
+            }
         }
         // Keep the mask overlay in sync with selection/geometry/tab after any
         // message (cheap no-op when the Masks tab isn't showing).
@@ -2968,6 +3029,13 @@ fn ratings_file() -> Option<PathBuf> {
     Some(base.join("rapidraw-relm4").join("ratings.json"))
 }
 
+fn albums_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rapidraw-relm4").join("albums.json"))
+}
+
 fn settings_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -2990,6 +3058,30 @@ fn save_settings(s: &Settings) {
     }
     if let Ok(json) = serde_json::to_vec(s) {
         let _ = std::fs::write(f, json);
+    }
+}
+
+fn rename_album(tree: &mut [rapidraw_core::albums::AlbumItem], target: &str, new_name: &str) {
+    use rapidraw_core::albums::AlbumItem::*;
+    for item in tree.iter_mut() {
+        match item {
+            Album { id, name, .. } if id == target => {
+                *name = new_name.to_string();
+                return;
+            }
+            Group { children, .. } => rename_album(children, target, new_name),
+            _ => {}
+        }
+    }
+}
+
+fn delete_album(tree: &mut Vec<rapidraw_core::albums::AlbumItem>, target: &str) {
+    use rapidraw_core::albums::AlbumItem::*;
+    tree.retain(|i| !matches!(i, Album { id, .. } if id == target));
+    for item in tree.iter_mut() {
+        if let Group { children, .. } = item {
+            delete_album(children, target);
+        }
     }
 }
 
