@@ -1,6 +1,8 @@
 //! rapidraw-core: tauri-free image engine extracted from src-tauri.
 
 pub mod formats;
+pub mod albums;
+pub mod folders;
 pub mod raw_processing;
 pub mod lut_processing;
 pub mod image_processing;
