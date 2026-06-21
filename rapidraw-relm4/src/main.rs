@@ -32,6 +32,7 @@ mod stars;
 mod thumb_cache;
 use controls::AdjustPanel;
 use sidebar::{Sidebar, SidebarIn, SidebarOut};
+use stars::{Stars, StarsMsg, StarsOut};
 use masks::MasksPanel;
 use curves::Channel;
 use editor::EditorCanvas;
@@ -600,6 +601,8 @@ struct AppModel {
     ratings: HashMap<PathBuf, u8>,
     /// Sidebar folder tree component.
     sidebar: Controller<Sidebar>,
+    /// Star rating widget shown in the editor header bar.
+    editor_stars: Controller<Stars>,
 }
 
 impl AppModel {
@@ -1065,6 +1068,8 @@ impl Component for AppModel {
                                         connect_clicked => AppMsg::Redo,
                                     },
                                 },
+                                #[name = "editor_stars_slot"]
+                                pack_start = &gtk::Box {},
                                 #[name = "menu_ed"]
                                 pack_end = &gtk::MenuButton {
                                     set_icon_name: "open-menu-symbolic",
@@ -1136,6 +1141,12 @@ impl Component for AppModel {
                 SidebarOut::AddRootFolder => AppMsg::OpenFolderDialog,
             });
 
+        let editor_stars = Stars::builder()
+            .launch(0)
+            .forward(sender.input_sender(), |out| match out {
+                StarsOut::Changed(n) => AppMsg::RateActive(n),
+            });
+
         let model = AppModel {
             session: Session::default(),
             images: Vec::new(),
@@ -1184,6 +1195,7 @@ impl Component for AppModel {
             settings_clip: None,
             ratings: load_ratings(),
             sidebar,
+            editor_stars,
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -1531,6 +1543,7 @@ impl Component for AppModel {
             });
         }
         widgets.split.set_sidebar(Some(model.sidebar.widget()));
+        widgets.editor_stars_slot.append(model.editor_stars.widget());
         ComponentParts { model, widgets }
     }
 
@@ -2195,6 +2208,7 @@ impl Component for AppModel {
                 if let Some(i) = self.images.iter().position(|p| *p == path) {
                     self.thumbs.send(i, ThumbMsg::SetRating(r));
                 }
+                self.editor_stars.emit(StarsMsg::External(r));
             }
             AppMsg::RateThumb(path, n) => {
                 let cur = self.ratings.get(&path).copied().unwrap_or(0);
@@ -2207,6 +2221,9 @@ impl Component for AppModel {
                 save_ratings(&self.ratings);
                 if let Some(i) = self.images.iter().position(|p| *p == path) {
                     self.thumbs.send(i, ThumbMsg::SetRating(r));
+                }
+                if self.session.active_path.as_deref() == Some(path.as_path()) {
+                    self.editor_stars.emit(StarsMsg::External(r));
                 }
             }
             AppMsg::OpenInEditor(path) => {
@@ -2263,6 +2280,8 @@ impl Component for AppModel {
                 if !in_editor {
                     widgets.nav.push_by_tag("editor");
                 }
+                let r = self.ratings.get(&path).copied().unwrap_or(0);
+                self.editor_stars.emit(StarsMsg::External(r));
                 let p = path.clone();
                 spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {
                     Ok(img) => CmdMsg::BaseReady(p, img),
