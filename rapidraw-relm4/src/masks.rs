@@ -779,6 +779,19 @@ fn submask_editor(
         return group;
     }
 
+    // Color/luminance masks sample a point on the image; offer canvas picking
+    // alongside the numeric Target X/Y fallback.
+    if matches!(sm.mask_type.as_str(), "color" | "luminance") {
+        let pick = adw::SwitchRow::new();
+        pick.set_title("Pick target on image");
+        pick.set_subtitle("Click the colour/tone to sample");
+        let sender = sender.clone();
+        pick.connect_active_notify(move |r| {
+            sender.input(AppMsg::ArmPick(r.is_active().then_some(sub_i)));
+        });
+        group.add(&pick);
+    }
+
     for &(label, key, min, max, step, digits, mult, default) in rows {
         // `default`/ranges are display units; JSON stores `display / mult`.
         let stored_default = default / mult;
@@ -900,6 +913,19 @@ fn ai_controls(
     }
     gen.add_suffix(&gen_btn);
     group.add(&gen);
+
+    // ai-subject can be refined by drawing a box prompt on the canvas; the box
+    // re-runs SAM. Other AI types segment the whole frame, so no box needed.
+    if matches!(sm.mask_type.as_str(), "ai-subject" | "quick-eraser") {
+        let pick = adw::SwitchRow::new();
+        pick.set_title("Draw box on image");
+        pick.set_subtitle("Drag a rectangle around the subject");
+        let sender = sender.clone();
+        pick.connect_active_notify(move |r| {
+            sender.input(AppMsg::ArmPick(r.is_active().then_some(sub_i)));
+        });
+        group.add(&pick);
+    }
 
     // Depth range (0..100) before grow/feather.
     if sm.mask_type == "ai-depth" {

@@ -82,6 +82,18 @@ struct PaintArm {
     erase: bool,
 }
 
+/// Armed canvas picking: which sub-mask, and whether a box drag (ai-subject) vs
+/// a single point (color/luminance target).
+#[derive(Clone, Copy)]
+struct PickArm {
+    sub: usize,
+    is_box: bool,
+}
+
+/// Fired when a pick completes: `(sub, x1, y1, x2, y2)` in normalized image
+/// coords. Point picks send the same corner twice.
+type PickSink = Rc<RefCell<Option<Box<dyn Fn(usize, f64, f64, f64, f64)>>>>;
+
 /// What a mask drag manipulates.
 #[derive(Clone, Copy)]
 enum MaskGrab {
@@ -142,6 +154,9 @@ pub struct EditorCanvas {
     /// Armed brush/flow painting (drag paints a stroke instead of panning).
     paint: Rc<Cell<Option<PaintArm>>>,
     paint_sink: PaintSink,
+    /// Armed canvas picking (point/box) for parametric/AI masks.
+    pick: Rc<Cell<Option<PickArm>>>,
+    pick_sink: PickSink,
     view: View,
     /// Crop rectangle, normalized (x, y, w, h) in image space.
     crop_rect: Rc<Cell<(f64, f64, f64, f64)>>,
@@ -200,6 +215,10 @@ impl EditorCanvas {
         let paint: Rc<Cell<Option<PaintArm>>> = Rc::new(Cell::new(None));
         let stroke: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
         let paint_sink: PaintSink = Rc::new(RefCell::new(None));
+        let pick: Rc<Cell<Option<PickArm>>> = Rc::new(Cell::new(None));
+        let pick_sink: PickSink = Rc::new(RefCell::new(None));
+        // Widget point where a pick drag began (to rebuild the end point).
+        let pick_start = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
         {
             let view = view.clone();
             let shapes = mask_shapes.clone();
@@ -268,6 +287,8 @@ impl EditorCanvas {
                 let stroke = stroke.clone();
                 let paint_start = paint_start.clone();
                 let mask_w = mask_overlay.clone();
+                let pick = pick.clone();
+                let pick_start = pick_start.clone();
                 drag.connect_drag_begin(move |_, x, y| {
                     start.set(view.offset.get());
                     // Painting takes precedence over handle-edit and pan.
@@ -280,6 +301,12 @@ impl EditorCanvas {
                         }
                         mask_drag.set(None);
                         mask_w.queue_draw();
+                        return;
+                    }
+                    // Picking (point/box) likewise blocks pan/handle-edit.
+                    if pick.get().is_some() {
+                        pick_start.set((x, y));
+                        mask_drag.set(None);
                         return;
                     }
                     mask_drag.set(if mask_active.get() {
@@ -302,6 +329,7 @@ impl EditorCanvas {
                 let stroke = stroke.clone();
                 let paint_start = paint_start.clone();
                 let mask_w2 = mask_overlay.clone();
+                let pick = pick.clone();
                 drag.connect_drag_update(move |_, dx, dy| {
                     if overlay_w.is_visible() {
                         return;
@@ -313,6 +341,10 @@ impl EditorCanvas {
                             stroke.borrow_mut().push(p);
                             mask_w2.queue_draw();
                         }
+                        return;
+                    }
+                    // While picking, swallow the drag (no pan; emit on end).
+                    if pick.get().is_some() {
                         return;
                     }
                     // Editing a mask handle takes precedence over panning.
@@ -340,7 +372,11 @@ impl EditorCanvas {
                 let stroke = stroke.clone();
                 let paint_sink = paint_sink.clone();
                 let mask_w = mask_overlay.clone();
-                drag.connect_drag_end(move |_, _, _| {
+                let pick = pick.clone();
+                let pick_sink = pick_sink.clone();
+                let pick_start = pick_start.clone();
+                let view = view.clone();
+                drag.connect_drag_end(move |_, ox, oy| {
                     if let Some(arm) = paint.get() {
                         let pts = std::mem::take(&mut *stroke.borrow_mut());
                         if !pts.is_empty() {
@@ -349,6 +385,21 @@ impl EditorCanvas {
                             }
                         }
                         mask_w.queue_draw();
+                    }
+                    if let Some(arm) = pick.get() {
+                        let (bx, by) = pick_start.get();
+                        if let (Some(p1), Some(p2)) =
+                            (to_norm(&view, bx, by), to_norm(&view, bx + ox, by + oy))
+                        {
+                            let (x1, y1, x2, y2) = if arm.is_box {
+                                (p1.0, p1.1, p2.0, p2.1)
+                            } else {
+                                (p1.0, p1.1, p1.0, p1.1)
+                            };
+                            if let Some(cb) = pick_sink.borrow().as_ref() {
+                                cb(arm.sub, x1, y1, x2, y2);
+                            }
+                        }
                     }
                     mask_drag.set(None);
                 });
@@ -446,6 +497,8 @@ impl EditorCanvas {
             mask_edit,
             paint,
             paint_sink,
+            pick,
+            pick_sink,
             view,
             crop_rect,
             crop_aspect,
@@ -487,6 +540,18 @@ impl EditorCanvas {
     /// Set the callback fired when a brush/flow stroke finishes.
     pub fn set_paint_sink(&self, cb: impl Fn(usize, Vec<(f64, f64)>, bool) + 'static) {
         *self.paint_sink.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Arm canvas picking into sub-mask `sub`: `is_box` true drags a rectangle
+    /// (ai-subject), false picks a single point (color/luminance target). `None`
+    /// disarms (drag pans again).
+    pub fn set_pick(&self, arm: Option<(usize, bool)>) {
+        self.pick.set(arm.map(|(sub, is_box)| PickArm { sub, is_box }));
+    }
+
+    /// Set the callback fired when a pick completes (normalized image coords).
+    pub fn set_pick_sink(&self, cb: impl Fn(usize, f64, f64, f64, f64) + 'static) {
+        *self.pick_sink.borrow_mut() = Some(Box::new(cb));
     }
 
     pub fn root(&self) -> &gtk::Overlay {

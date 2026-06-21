@@ -258,6 +258,17 @@ enum AppMsg {
     /// Run AI inference for sub-mask `sub` (within the selected mask) and store
     /// the resulting mask. Type drives which model runs.
     GenerateAiMask(usize),
+    /// Arm/disarm canvas picking for sub-mask `sub` (point for color/luminance,
+    /// box for ai-subject).
+    ArmPick(Option<usize>),
+    /// A completed canvas pick (normalized image coords) for sub-mask `sub`.
+    PickResult {
+        sub: usize,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
     /// Add another sub-mask of `ty` to container `mask`.
     AddSubMask(usize, &'static str),
     DeleteSubMask {
@@ -1357,6 +1368,14 @@ impl Component for AppModel {
                 sender.input(AppMsg::AddBrushStroke { sub, points, erase })
             });
         }
+        // Canvas point/box picks feed parametric (color/luminance) and ai-subject
+        // masks.
+        {
+            let sender = sender.clone();
+            model.canvas.set_pick_sink(move |sub, x1, y1, x2, y2| {
+                sender.input(AppMsg::PickResult { sub, x1, y1, x2, y2 })
+            });
+        }
         // Scopes clipping toggle feeds back into the model.
         {
             let sender = sender.clone();
@@ -1533,10 +1552,11 @@ impl Component for AppModel {
             }
             AppMsg::SelectMask(idx) => {
                 self.selected_mask = idx;
-                // Disarm painting (it targets a sub-mask of the prior selection).
+                // Disarm painting/picking (they target the prior selection).
                 if self.paint_sub.take().is_some() {
                     self.canvas.set_paint(None);
                 }
+                self.canvas.set_pick(None);
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
             }
@@ -1824,6 +1844,50 @@ impl Component for AppModel {
                         result,
                     }
                 });
+            }
+            AppMsg::ArmPick(sub) => {
+                let arm = sub.and_then(|s| {
+                    let ty = self
+                        .session
+                        .masks
+                        .get(self.selected_mask.unwrap_or(usize::MAX))
+                        .and_then(|m| m.sub_masks.get(s))
+                        .map(|sm| sm.mask_type.as_str());
+                    ty.map(|t| (s, matches!(t, "ai-subject" | "quick-eraser")))
+                });
+                self.canvas.set_pick(arm);
+            }
+            AppMsg::PickResult { sub, x1, y1, x2, y2 } => {
+                let Some((w, h)) = self.image_dims() else { return };
+                let Some(mi) = self.selected_mask else { return };
+                let Some(sm) = self
+                    .session
+                    .masks
+                    .get_mut(mi)
+                    .and_then(|m| m.sub_masks.get_mut(sub))
+                else {
+                    return;
+                };
+                let is_subject = matches!(sm.mask_type.as_str(), "ai-subject" | "quick-eraser");
+                if let Some(obj) = sm.parameters.as_object_mut() {
+                    if is_subject {
+                        obj.insert("startX".into(), serde_json::json!(x1 * w));
+                        obj.insert("startY".into(), serde_json::json!(y1 * h));
+                        obj.insert("endX".into(), serde_json::json!(x2 * w));
+                        obj.insert("endY".into(), serde_json::json!(y2 * h));
+                    } else {
+                        obj.insert("targetX".into(), serde_json::json!(x1 * w));
+                        obj.insert("targetY".into(), serde_json::json!(y1 * h));
+                    }
+                }
+                if is_subject {
+                    // Box drawn -> re-run SAM with the new prompt.
+                    sender.input(AppMsg::GenerateAiMask(sub));
+                } else {
+                    self.schedule_history(&sender);
+                    self.refresh_mask_overlay();
+                    sender.input(AppMsg::RequestRender);
+                }
             }
             AppMsg::AddSubMask(mask, ty) => {
                 let (w, h) = self
