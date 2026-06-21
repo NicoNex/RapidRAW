@@ -306,7 +306,7 @@ enum AppMsg {
     /// Open the About window.
     ShowAbout,
     /// Show images from an album in the grid.
-    ShowAlbum { id: String, name: String, images: Vec<String> },
+    ShowAlbum(Vec<String>),
     /// Create a new album with the given name.
     AlbumNew(String),
     /// Rename an album.
@@ -1161,7 +1161,7 @@ impl Component for AppModel {
             .forward(sender.input_sender(), |out| match out {
                 SidebarOut::SelectFolder(p) => AppMsg::ShowFolder(p),
                 SidebarOut::AddRootFolder => AppMsg::OpenFolderDialog,
-                SidebarOut::SelectAlbum { id, name, images } => AppMsg::ShowAlbum { id, name, images },
+                SidebarOut::SelectAlbum(images) => AppMsg::ShowAlbum(images),
                 SidebarOut::NewAlbum(name) => AppMsg::AlbumNew(name),
                 SidebarOut::RenameAlbum { id, name } => AppMsg::AlbumRename { id, name },
                 SidebarOut::DeleteAlbum(id) => AppMsg::AlbumDelete(id),
@@ -2702,7 +2702,7 @@ impl Component for AppModel {
                 };
                 self.show_active_tex();
             }
-            AppMsg::ShowAlbum { images, .. } => {
+            AppMsg::ShowAlbum(images) => {
                 let paths: Vec<PathBuf> = images
                     .into_iter()
                     .map(PathBuf::from)

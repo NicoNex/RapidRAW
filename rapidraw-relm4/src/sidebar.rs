@@ -11,7 +11,7 @@ use relm4::prelude::*;
 pub enum SidebarOut {
     SelectFolder(PathBuf),
     AddRootFolder,
-    SelectAlbum { id: String, name: String, images: Vec<String> },
+    SelectAlbum(Vec<String>),
     NewAlbum(String),
     RenameAlbum { id: String, name: String },
     DeleteAlbum(String),
@@ -163,11 +163,10 @@ impl Component for Sidebar {
                 return;
             }
             SidebarIn::ActivateAlbum(id) => {
-                let name = album_name(&self.albums, &id).unwrap_or_default();
                 let images = rapidraw_core::albums::album_images(&self.albums, &id)
                     .map(|s| s.to_vec())
                     .unwrap_or_default();
-                let _ = sender.output(SidebarOut::SelectAlbum { id, name, images });
+                let _ = sender.output(SidebarOut::SelectAlbum(images));
                 return;
             }
         }
@@ -328,22 +327,6 @@ impl Sidebar {
             }
         }
     }
-}
-
-/// Find an album's display name by id (searches groups recursively).
-fn album_name(tree: &[AlbumItem], target: &str) -> Option<String> {
-    for item in tree {
-        match item {
-            AlbumItem::Album { id, name, .. } if id == target => return Some(name.clone()),
-            AlbumItem::Group { children, .. } => {
-                if let Some(n) = album_name(children, target) {
-                    return Some(n);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Show a libadwaita text-entry dialog; calls `on_ok` with the trimmed-nonempty name.
