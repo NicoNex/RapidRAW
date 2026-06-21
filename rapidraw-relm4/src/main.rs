@@ -28,6 +28,7 @@ mod slider;
 mod state;
 mod thumb;
 mod sidebar;
+mod stars;
 mod thumb_cache;
 use controls::AdjustPanel;
 use sidebar::{Sidebar, SidebarIn, SidebarOut};
