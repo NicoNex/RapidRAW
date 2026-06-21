@@ -9,8 +9,6 @@ pub struct Thumb {
     pub path: PathBuf,
     pub texture: Option<gdk::MemoryTexture>,
     pub rating: u8,
-    /// Star buttons cached so `update` can relabel them without widget access.
-    star_btns: Vec<gtk::Button>,
 }
 
 #[derive(Debug)]
@@ -27,6 +25,11 @@ pub enum ThumbOut {
     Rate(PathBuf, u8),
 }
 
+/// "★★★☆☆" for a 0..5 rating.
+fn stars(r: u8) -> String {
+    (1..=5).map(|i| if i <= r { '★' } else { '☆' }).collect()
+}
+
 #[relm4::factory(pub)]
 impl FactoryComponent for Thumb {
     type Init = (PathBuf, u8);
@@ -41,23 +44,12 @@ impl FactoryComponent for Thumb {
             set_spacing: 4,
             set_width_request: 160,
 
-            gtk::Overlay {
-                #[name = "picture"]
-                gtk::Picture {
-                    set_size_request: (150, 150),
-                    set_content_fit: gtk::ContentFit::Contain,
-                    #[watch]
-                    set_paintable: self.texture.as_ref().map(|t| t.upcast_ref::<gdk::Paintable>()),
-                },
-                add_overlay = &gtk::Box {
-                    set_orientation: gtk::Orientation::Horizontal,
-                    set_halign: gtk::Align::Center,
-                    set_valign: gtk::Align::End,
-                    set_spacing: 0,
-                    add_css_class: "thumb-stars",
-                    #[name = "star_box"]
-                    gtk::Box {},
-                },
+            #[name = "picture"]
+            gtk::Picture {
+                set_size_request: (150, 150),
+                set_content_fit: gtk::ContentFit::Contain,
+                #[watch]
+                set_paintable: self.texture.as_ref().map(|t| t.upcast_ref::<gdk::Paintable>()),
             },
 
             gtk::Label {
@@ -71,6 +63,16 @@ impl FactoryComponent for Thumb {
                     .unwrap_or("")
                     .to_string(),
             },
+
+            // Single lightweight label (one widget per cell) — click position picks the
+            // star. Far cheaper than 5 buttons per thumbnail, which made the grid lag.
+            #[name = "star_label"]
+            gtk::Label {
+                add_css_class: "thumb-stars",
+                set_halign: gtk::Align::Center,
+                #[watch]
+                set_label: &stars(self.rating),
+            },
         }
     }
 
@@ -80,7 +82,6 @@ impl FactoryComponent for Thumb {
             path,
             texture: None,
             rating,
-            star_btns: Vec::new(),
         }
     }
 
@@ -92,19 +93,16 @@ impl FactoryComponent for Thumb {
         sender: FactorySender<Self>,
     ) -> Self::Widgets {
         let widgets = view_output!();
-        let path = self.path.clone();
-        for i in 1..=5u8 {
-            let b = gtk::Button::builder().css_classes(["flat", "star"]).build();
-            b.set_label("☆");
-            let s = sender.clone();
-            let p = path.clone();
-            b.connect_clicked(move |_| {
-                s.output(ThumbOut::Rate(p.clone(), i)).ok();
-            });
-            widgets.star_box.append(&b);
-            self.star_btns.push(b);
-        }
-        render_stars(&self.star_btns, self.rating);
+        let click = gtk::GestureClick::new();
+        let s = sender.clone();
+        let p = self.path.clone();
+        let label = widgets.star_label.clone();
+        click.connect_released(move |_, _, x, _| {
+            let w = label.width().max(1) as f64;
+            let n = (((x / w) * 5.0).ceil() as i64).clamp(1, 5) as u8;
+            s.output(ThumbOut::Rate(p.clone(), n)).ok();
+        });
+        widgets.star_label.add_controller(click);
         widgets
     }
 
@@ -115,14 +113,7 @@ impl FactoryComponent for Thumb {
             }
             ThumbMsg::SetRating(r) => {
                 self.rating = r;
-                render_stars(&self.star_btns, r);
             }
         }
-    }
-}
-
-fn render_stars(btns: &[gtk::Button], rating: u8) {
-    for (i, btn) in btns.iter().enumerate() {
-        btn.set_label(if (i as u8) < rating { "★" } else { "☆" });
     }
 }

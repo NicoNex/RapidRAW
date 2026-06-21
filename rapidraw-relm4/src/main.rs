@@ -2997,26 +2997,9 @@ fn install_app_css() {
                  text-shadow: 0 2px 8px alpha(black, 0.6);
              }
              .thumb-stars {
-                 margin: 4px;
-                 padding: 0 3px;
-                 border-radius: 7px;
-                 background: alpha(black, 0.3);
-             }
-             .thumb-stars button.star {
-                 min-width: 0;
-                 min-height: 0;
-                 padding: 0 1px;
-                 margin: 0;
-                 background: none;
-                 border: none;
-                 box-shadow: none;
-                 font-size: 11px;
-                 color: alpha(white, 0.85);
-                 text-shadow: 0 1px 2px alpha(black, 0.8);
-             }
-             .thumb-stars button.star:hover {
-                 color: white;
-                 background: none;
+                 font-size: 12px;
+                 letter-spacing: 2px;
+                 opacity: 0.8;
              }",
         );
         if let Some(display) = gdk::Display::default() {
