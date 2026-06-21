@@ -94,6 +94,14 @@ struct PickArm {
 /// coords. Point picks send the same corner twice.
 type PickSink = Rc<RefCell<Option<Box<dyn Fn(usize, f64, f64, f64, f64)>>>>;
 
+/// Armed "draw to place" for a freshly-added geometric mask: which sub-mask and
+/// whether it's radial (else linear). The next canvas drag defines its geometry.
+#[derive(Clone, Copy)]
+struct DrawArm {
+    sub: usize,
+    is_radial: bool,
+}
+
 /// What a mask drag manipulates.
 #[derive(Clone, Copy)]
 enum MaskGrab {
@@ -162,6 +170,8 @@ pub struct EditorCanvas {
     /// Armed canvas picking (point/box) for parametric/AI masks.
     pick: Rc<Cell<Option<PickArm>>>,
     pick_sink: PickSink,
+    /// Armed "draw to place" for a just-added radial/linear mask.
+    draw: Rc<Cell<Option<DrawArm>>>,
     view: View,
     /// Crop rectangle, normalized (x, y, w, h) in image space.
     crop_rect: Rc<Cell<(f64, f64, f64, f64)>>,
@@ -225,6 +235,9 @@ impl EditorCanvas {
         let pick_sink: PickSink = Rc::new(RefCell::new(None));
         // Widget point where a pick drag began (to rebuild the end point).
         let pick_start = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+        // "Draw to place" a freshly-added radial/linear mask: arm + press point.
+        let draw: Rc<Cell<Option<DrawArm>>> = Rc::new(Cell::new(None));
+        let draw_start = Rc::new(Cell::new((0.0_f64, 0.0_f64))); // normalized
         {
             let view = view.clone();
             let shapes = mask_shapes.clone();
@@ -297,8 +310,18 @@ impl EditorCanvas {
                 let mask_w = mask_overlay.clone();
                 let pick = pick.clone();
                 let pick_start = pick_start.clone();
+                let draw = draw.clone();
+                let draw_start = draw_start.clone();
                 drag.connect_drag_begin(move |_, x, y| {
                     start.set(view.offset.get());
+                    // Drawing a freshly-added mask takes top precedence.
+                    if draw.get().is_some() {
+                        if let Some(p) = to_norm(&view, x, y) {
+                            draw_start.set(p);
+                        }
+                        mask_drag.set(None);
+                        return;
+                    }
                     // Painting takes precedence over handle-edit and pan.
                     if paint.get().is_some() {
                         paint_start.set((x, y));
@@ -338,8 +361,42 @@ impl EditorCanvas {
                 let paint_start = paint_start.clone();
                 let mask_w2 = mask_overlay.clone();
                 let pick = pick.clone();
+                let draw = draw.clone();
+                let draw_start = draw_start.clone();
                 drag.connect_drag_update(move |_, dx, dy| {
                     if overlay_w.is_visible() {
+                        return;
+                    }
+                    // Drawing a freshly-added mask: build its geometry from the
+                    // press point + current drag, live via the mask-edit callback.
+                    if let Some(arm) = draw.get() {
+                        let (_, _, iw, ih) = image_screen_rect(&view);
+                        if iw <= 0.0 || ih <= 0.0 {
+                            return;
+                        }
+                        let (px, py) = draw_start.get();
+                        let cur = (px + dx / iw, py + dy / ih);
+                        let shape = if arm.is_radial {
+                            MaskShape::Radial {
+                                sub: arm.sub,
+                                cx: px,
+                                cy: py,
+                                rx: (cur.0 - px).abs().max(0.005),
+                                ry: (cur.1 - py).abs().max(0.005),
+                                rot: 0.0,
+                            }
+                        } else {
+                            MaskShape::Linear {
+                                sub: arm.sub,
+                                x1: px,
+                                y1: py,
+                                x2: cur.0.clamp(0.0, 1.0),
+                                y2: cur.1.clamp(0.0, 1.0),
+                            }
+                        };
+                        if let Some(cb) = mask_edit.borrow().as_ref() {
+                            cb(shape);
+                        }
                         return;
                     }
                     // Painting a brush/flow stroke takes precedence.
@@ -384,7 +441,12 @@ impl EditorCanvas {
                 let pick_sink = pick_sink.clone();
                 let pick_start = pick_start.clone();
                 let view = view.clone();
+                let draw = draw.clone();
                 drag.connect_drag_end(move |_, ox, oy| {
+                    // Drawing a new mask is one-shot: disarm after the placement.
+                    if draw.take().is_some() {
+                        return;
+                    }
                     if let Some(arm) = paint.get() {
                         let pts = std::mem::take(&mut *stroke.borrow_mut());
                         if !pts.is_empty() {
@@ -508,6 +570,7 @@ impl EditorCanvas {
             paint_sink,
             pick,
             pick_sink,
+            draw,
             view,
             crop_rect,
             crop_aspect,
@@ -589,6 +652,13 @@ impl EditorCanvas {
     /// Set the callback fired when a pick completes (normalized image coords).
     pub fn set_pick_sink(&self, cb: impl Fn(usize, f64, f64, f64, f64) + 'static) {
         *self.pick_sink.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Arm "draw to place" for sub-mask `sub` (`is_radial` else linear): the next
+    /// canvas drag defines its geometry, then disarms. `None` disarms.
+    pub fn set_mask_draw(&self, arm: Option<(usize, bool)>) {
+        self.draw
+            .set(arm.map(|(sub, is_radial)| DrawArm { sub, is_radial }));
     }
 
     pub fn root(&self) -> &gtk::Overlay {

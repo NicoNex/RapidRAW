@@ -1627,6 +1627,11 @@ impl Component for AppModel {
                 self.selected_mask = Some(self.session.masks.len() - 1);
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
+                // Radial/linear: arm "draw to place" so a drag on the image
+                // defines the new mask's geometry (sub-mask 0 of the container).
+                if matches!(ty, "radial" | "linear") {
+                    self.canvas.set_mask_draw(Some((0, ty == "radial")));
+                }
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
             }
@@ -1637,6 +1642,7 @@ impl Component for AppModel {
                     self.canvas.set_paint(None);
                 }
                 self.canvas.set_pick(None);
+                self.canvas.set_mask_draw(None);
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
                 self.refresh_mask_preview(&sender);
@@ -1994,8 +2000,13 @@ impl Component for AppModel {
                         .unwrap_or(ty);
                     let sub = masks::new_mask(label, ty, w, h).sub_masks.remove(0);
                     m.sub_masks.push(sub);
+                    let new_sub = m.sub_masks.len() - 1;
                     self.masks_panel
                         .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    // Arm "draw to place" for a radial/linear sub-mask too.
+                    if matches!(ty, "radial" | "linear") {
+                        self.canvas.set_mask_draw(Some((new_sub, ty == "radial")));
+                    }
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
