@@ -936,8 +936,19 @@ impl Component for AppModel {
             #[name = "toast_overlay"]
             set_content = &adw::ToastOverlay {
                 #[wrap(Some)]
-                #[name = "nav"]
-                set_child = &adw::NavigationView {
+                #[name = "split"]
+                set_child = &adw::OverlaySplitView {
+                    set_min_sidebar_width: 240.0,
+                    set_max_sidebar_width: 360.0,
+                    set_show_sidebar: true,
+                    #[wrap(Some)]
+                    #[name = "sidebar_slot"]
+                    set_sidebar = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                    },
+                    #[wrap(Some)]
+                    #[name = "nav"]
+                    set_content = &adw::NavigationView {
                     // ----- Library page -----
                     add = &adw::NavigationPage {
                         set_tag: Some("library"),
@@ -945,6 +956,12 @@ impl Component for AppModel {
                         #[wrap(Some)]
                         set_child = &adw::ToolbarView {
                             add_top_bar = &adw::HeaderBar {
+                                #[name = "sidebar_toggle_lib"]
+                                pack_start = &gtk::ToggleButton {
+                                    set_icon_name: "sidebar-show-symbolic",
+                                    set_tooltip_text: Some("Toggle sidebar"),
+                                    set_active: true,
+                                },
                                 pack_start = &gtk::Button {
                                     set_label: "Open Folder",
                                     connect_clicked => AppMsg::OpenFolderDialog,
@@ -1020,6 +1037,12 @@ impl Component for AppModel {
                                 set_title_widget = &adw::WindowTitle {
                                     set_title: "RapidRAW",
                                 },
+                                #[name = "sidebar_toggle_ed"]
+                                pack_start = &gtk::ToggleButton {
+                                    set_icon_name: "sidebar-show-symbolic",
+                                    set_tooltip_text: Some("Toggle sidebar"),
+                                    set_active: true,
+                                },
                                 pack_start = &gtk::Box {
                                     add_css_class: "linked",
                                     gtk::Button {
@@ -1078,6 +1101,7 @@ impl Component for AppModel {
                             },
                         },
                     },
+                },
                 },
             },
         }
@@ -1466,6 +1490,26 @@ impl Component for AppModel {
             model
                 .scopes
                 .set_clip_toggle(move |on| sender.input(AppMsg::ToggleClipping(on)));
+        }
+        {
+            let split = widgets.split.clone();
+            let other = widgets.sidebar_toggle_ed.clone();
+            widgets.sidebar_toggle_lib.connect_toggled(move |b| {
+                split.set_show_sidebar(b.is_active());
+                if other.is_active() != b.is_active() {
+                    other.set_active(b.is_active());
+                }
+            });
+        }
+        {
+            let split = widgets.split.clone();
+            let other = widgets.sidebar_toggle_lib.clone();
+            widgets.sidebar_toggle_ed.connect_toggled(move |b| {
+                split.set_show_sidebar(b.is_active());
+                if other.is_active() != b.is_active() {
+                    other.set_active(b.is_active());
+                }
+            });
         }
         ComponentParts { model, widgets }
     }
