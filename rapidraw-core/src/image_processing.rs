@@ -1671,6 +1671,12 @@ fn calculate_agx_matrices() -> (GpuMat3, GpuMat3) {
     )
 }
 
+/// AGX tonemapper colour-space matrices `(pipe_to_rendering, rendering_to_pipe)`,
+/// for frontends that populate `GlobalAdjustments` directly instead of via JSON.
+pub fn agx_matrices() -> (GpuMat3, GpuMat3) {
+    calculate_agx_matrices()
+}
+
 // Coupling-cut: the original took `&AppSettings` (and a handle variant). Core takes
 // the already-resolved primitives instead so it has no AppSettings/tauri dependency.
 // `enabled` is the resolved `tonemapper_override_enabled`; `raw_tonemapper`/

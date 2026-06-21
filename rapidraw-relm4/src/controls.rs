@@ -20,8 +20,9 @@ type Setter = fn(&mut GlobalAdjustments, f32);
 /// `(label, min, max, step, scale, default, setter)`.
 type Row = (&'static str, f64, f64, f64, f64, f64, Setter);
 
+// Exposure lives in the Tone Mapper card (see `build_basic`), so it is not in
+// this table; the rest of the basic tones follow.
 const BASIC: &[Row] = &[
-    ("Exposure", -5.0, 5.0, 0.01, 0.8, 0.0, |g, v| g.exposure = v),
     ("Contrast", -100.0, 100.0, 1.0, 100.0, 0.0, |g, v| g.contrast = v),
     ("Highlights", -100.0, 100.0, 1.0, 120.0, 0.0, |g, v| g.highlights = v),
     ("Shadows", -100.0, 100.0, 1.0, 120.0, 0.0, |g, v| g.shadows = v),
@@ -146,6 +147,13 @@ pub fn init_defaults(g: &mut GlobalAdjustments) {
             set(g, (default / scale) as f32);
         }
     }
+    // Tone mapper: default to "basic" (0); seed the AGX matrices so switching to
+    // AgX works (the relm4 path builds GlobalAdjustments directly, not via JSON).
+    g.tonemapper_mode = 0;
+    let (pipe_to_rendering, rendering_to_pipe) =
+        rapidraw_core::image_processing::agx_matrices();
+    g.agx_pipe_to_rendering_matrix = pipe_to_rendering;
+    g.agx_rendering_to_pipe_matrix = rendering_to_pipe;
 }
 
 pub struct AdjustPanel {
@@ -175,7 +183,7 @@ impl AdjustPanel {
         crate::slider::reg_begin();
         let curves = CurveEditor::new(sender, &vadj);
         list.append(&card(&expander("Curves", curves.root(), true)));
-        list.append(&card(&section("Basic", BASIC, sender, &vadj)));
+        list.append(&card(&build_basic(sender, &vadj)));
         list.append(&card(&build_color(sender, &vadj)));
         list.append(&card(&section("Details", DETAILS, sender, &vadj)));
         list.append(&card(&section("Effects", EFFECTS, sender, &vadj)));
@@ -259,6 +267,79 @@ fn section(
     body.set_margin_all(4);
     append_rows(&body, rows, sender, vadj);
     expander(title, &body, true)
+}
+
+/// Basic section: the Tone Mapper card (mapper choice + EV shift) on top, then
+/// the remaining basic tone sliders.
+fn build_basic(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Expander {
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    body.set_margin_all(4);
+    body.append(&tone_mapper_card(sender, vadj));
+    append_rows(&body, BASIC, sender, vadj);
+    expander("Basic", &body, true)
+}
+
+/// Tone Mapper sub-card: a Basic/AgX segmented selector plus the EV-shift slider
+/// (which is the exposure control), mirroring the original's inner card.
+fn tone_mapper_card(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> gtk::Box {
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    outer.add_css_class("card");
+    outer.set_margin_top(2);
+    outer.set_margin_bottom(4);
+
+    let title = gtk::Label::new(Some("Tone Mapper"));
+    title.set_halign(gtk::Align::Start);
+    title.add_css_class("caption");
+    title.set_margin_start(6);
+    title.set_margin_top(4);
+    outer.append(&title);
+
+    // Segmented Basic / AgX selector (linked toggle buttons in one group).
+    let seg = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    seg.add_css_class("linked");
+    seg.set_margin_start(6);
+    seg.set_margin_end(6);
+    let basic_btn = gtk::ToggleButton::with_label("Basic");
+    let agx_btn = gtk::ToggleButton::with_label("AgX");
+    agx_btn.set_group(Some(&basic_btn));
+    basic_btn.set_active(true); // default mapper
+    basic_btn.set_hexpand(true);
+    agx_btn.set_hexpand(true);
+    {
+        let sender = sender.clone();
+        // Send on the basic button's toggle (the group fires it for both).
+        basic_btn.connect_toggled(move |b| {
+            let mode = if b.is_active() { 0.0 } else { 1.0 };
+            sender.input(AppMsg::Adjust(crate::Adjust {
+                set: |g, v| g.tonemapper_mode = v as u32,
+                value: mode,
+            }));
+        });
+    }
+    seg.append(&basic_btn);
+    seg.append(&agx_btn);
+    outer.append(&seg);
+
+    // New-image reset returns the selector to Basic (matches init_defaults).
+    {
+        let basic_btn = basic_btn.clone();
+        crate::slider::register_reset(std::rc::Rc::new(move || basic_btn.set_active(true)));
+    }
+
+    // EV shift = exposure (-5..5), same as the original's card slider.
+    outer.append(&build_row(
+        "EV Shift",
+        -5.0,
+        5.0,
+        0.01,
+        0.8,
+        0.0,
+        |g, v| g.exposure = v,
+        Track::Plain,
+        sender,
+        vadj,
+    ));
+    outer
 }
 
 fn append_rows(
