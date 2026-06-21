@@ -263,6 +263,9 @@ enum AppMsg {
     /// Arm/disarm canvas picking for sub-mask `sub` (point for color/luminance,
     /// box for ai-subject).
     ArmPick(Option<usize>),
+    /// Show/hide the mask coverage overlay (hidden while the pointer is over the
+    /// mask editing controls).
+    SetMaskOverlayShown(bool),
     /// A completed canvas pick (normalized image coords) for sub-mask `sub`.
     PickResult {
         sub: usize,
@@ -510,6 +513,8 @@ struct AppModel {
     /// The right column (scopes + panel); kept so the panel can be rebuilt
     /// (reset) when a new image opens.
     right_col: gtk::Box,
+    /// The "Edit" tab button, so opening an image can reset the switcher to it.
+    edit_btn: gtk::ToggleButton,
     /// Preview scopes (histogram/waveform/vectorscope) above the panel.
     scopes: Scopes,
     /// Overlay for transient status toasts (export done, LUT loaded, …).
@@ -1097,6 +1102,7 @@ impl Component for AppModel {
             canvas: EditorCanvas::new(),
             panel: AdjustPanel::new(&sender),
             right_col: gtk::Box::new(gtk::Orientation::Vertical, 4),
+            edit_btn: gtk::ToggleButton::new(), // replaced by the real tab below
             scopes: Scopes::new(),
             toasts: adw::ToastOverlay::new(), // replaced by the view's overlay below
             render_gen: 0,
@@ -1414,6 +1420,7 @@ impl Component for AppModel {
         tabs.append(&adj_btn);
         tabs.append(&crop_btn);
         tabs.append(&masks_btn);
+        model.edit_btn = adj_btn.clone();
 
         model.right_col.append(&tabs);
         model.right_col.append(model.scopes.root());
@@ -1935,6 +1942,9 @@ impl Component for AppModel {
                     }
                 });
             }
+            AppMsg::SetMaskOverlayShown(shown) => {
+                self.canvas.set_mask_preview_visible(shown);
+            }
             AppMsg::ArmPick(sub) => {
                 let arm = sub.and_then(|s| {
                     let ty = self
@@ -2151,6 +2161,9 @@ impl Component for AppModel {
                 self.content_stack.add_named(fresh.root(), Some("crop"));
                 self.crop = fresh;
                 self.content_stack.set_visible_child_name("adjust");
+                // Reset the tab switcher to Edit (opening from another tab, e.g.
+                // Masks, must not leave that button highlighted).
+                self.edit_btn.set_active(true);
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())

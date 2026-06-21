@@ -268,6 +268,24 @@ impl MasksPanel {
         root.set_width_request(320);
         let vadj = root.vadjustment();
 
+        // Hovering the editing controls hides the coverage overlay (so the value
+        // changes are visible); leaving the panel shows it again. Matches the
+        // original's behaviour.
+        let motion = gtk::EventControllerMotion::new();
+        {
+            let sender = sender.clone();
+            motion.connect_enter(move |_, _, _| {
+                sender.input(AppMsg::SetMaskOverlayShown(false));
+            });
+        }
+        {
+            let sender = sender.clone();
+            motion.connect_leave(move |_| {
+                sender.input(AppMsg::SetMaskOverlayShown(true));
+            });
+        }
+        root.add_controller(motion);
+
         let panel = Self { root, body, vadj };
         panel.rebuild(&[], None, sender);
         panel

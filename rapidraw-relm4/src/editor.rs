@@ -159,6 +159,9 @@ pub struct EditorCanvas {
     /// Red translucent bitmap of the selected mask's coverage (the "where it
     /// applies" overlay), drawn scaled to the image rect under the handles.
     mask_preview: Rc<RefCell<Option<cairo::ImageSurface>>>,
+    /// Whether the coverage preview is currently shown (hidden while the pointer
+    /// is over the mask editing controls, so you can see the adjustment effect).
+    mask_preview_shown: Rc<Cell<bool>>,
     /// True while the Masks tab is active with a geometric mask selected — gates
     /// whether canvas drags edit a mask handle (vs. pan).
     mask_active: Rc<Cell<bool>>,
@@ -226,6 +229,7 @@ impl EditorCanvas {
         mask_overlay.set_can_target(false);
         let mask_shapes: Rc<RefCell<Vec<MaskShape>>> = Rc::new(RefCell::new(Vec::new()));
         let mask_preview: Rc<RefCell<Option<cairo::ImageSurface>>> = Rc::new(RefCell::new(None));
+        let mask_preview_shown = Rc::new(Cell::new(true));
         let mask_active = Rc::new(Cell::new(false));
         let mask_edit: MaskEditCb = Rc::new(RefCell::new(None));
         let paint: Rc<Cell<Option<PaintArm>>> = Rc::new(Cell::new(None));
@@ -244,8 +248,11 @@ impl EditorCanvas {
             let paint = paint.clone();
             let stroke = stroke.clone();
             let preview = mask_preview.clone();
+            let preview_shown = mask_preview_shown.clone();
             mask_overlay.set_draw_func(move |_, cr, _w, _h| {
-                draw_mask_preview(cr, &view, preview.borrow().as_ref());
+                if preview_shown.get() {
+                    draw_mask_preview(cr, &view, preview.borrow().as_ref());
+                }
                 draw_masks(cr, &view, &shapes.borrow());
                 draw_stroke(cr, &view, &stroke.borrow(), paint.get());
             });
@@ -564,6 +571,7 @@ impl EditorCanvas {
             mask_overlay,
             mask_shapes,
             mask_preview,
+            mask_preview_shown,
             mask_active,
             mask_edit,
             paint,
@@ -613,6 +621,14 @@ impl EditorCanvas {
         });
         *self.mask_preview.borrow_mut() = surf;
         self.mask_overlay.queue_draw();
+    }
+
+    /// Show/hide the coverage preview without recomputing it (used to hide it
+    /// while the pointer is over the mask editing controls).
+    pub fn set_mask_preview_visible(&self, shown: bool) {
+        if self.mask_preview_shown.replace(shown) != shown {
+            self.mask_overlay.queue_draw();
+        }
     }
 
     /// Set the callback invoked (live, during a handle drag) with the edited
