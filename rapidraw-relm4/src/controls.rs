@@ -345,10 +345,32 @@ fn build_grading(sender: &ComponentSender<AppModel>, vadj: &gtk::Adjustment) -> 
             (|g, v| g.color_grading_global.luminance = v) as Setter,
         ),
     ];
-    for (name, h, s, l) in wheels {
-        let w = ColorWheel::new(name, sender, vadj, h, s, l);
-        flow.append(w.root());
+    let built: Vec<ColorWheel> = wheels
+        .into_iter()
+        .map(|(name, h, s, l)| {
+            let w = ColorWheel::new(name, sender, vadj, h, s, l);
+            flow.append(w.root());
+            w
+        })
+        .collect();
+
+    // "Toggle sliders": reveal the Hue/Saturation sliders on every wheel at once
+    // (mirrors the original's Sliders button; luminance is always shown).
+    let toggle = gtk::ToggleButton::new();
+    toggle.set_icon_name("view-list-symbolic");
+    toggle.add_css_class("flat");
+    toggle.set_halign(gtk::Align::End);
+    toggle.set_tooltip_text(Some("Toggle hue/saturation sliders"));
+    {
+        let built = built.clone();
+        toggle.connect_toggled(move |b| {
+            for w in &built {
+                w.set_sliders_visible(b.is_active());
+            }
+        });
     }
+
+    wrap.append(&toggle);
     wrap.append(&flow);
     append_rows(&wrap, GRADING_EXTRA, sender, vadj);
     wrap
