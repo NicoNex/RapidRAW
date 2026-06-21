@@ -146,6 +146,9 @@ pub struct EditorCanvas {
     /// Overlay drawing (and hit-testing) the selected mask's geometric shapes.
     mask_overlay: gtk::DrawingArea,
     mask_shapes: Rc<RefCell<Vec<MaskShape>>>,
+    /// Red translucent bitmap of the selected mask's coverage (the "where it
+    /// applies" overlay), drawn scaled to the image rect under the handles.
+    mask_preview: Rc<RefCell<Option<cairo::ImageSurface>>>,
     /// True while the Masks tab is active with a geometric mask selected — gates
     /// whether canvas drags edit a mask handle (vs. pan).
     mask_active: Rc<Cell<bool>>,
@@ -210,6 +213,7 @@ impl EditorCanvas {
         mask_overlay.set_visible(false);
         mask_overlay.set_can_target(false);
         let mask_shapes: Rc<RefCell<Vec<MaskShape>>> = Rc::new(RefCell::new(Vec::new()));
+        let mask_preview: Rc<RefCell<Option<cairo::ImageSurface>>> = Rc::new(RefCell::new(None));
         let mask_active = Rc::new(Cell::new(false));
         let mask_edit: MaskEditCb = Rc::new(RefCell::new(None));
         let paint: Rc<Cell<Option<PaintArm>>> = Rc::new(Cell::new(None));
@@ -224,7 +228,9 @@ impl EditorCanvas {
             let shapes = mask_shapes.clone();
             let paint = paint.clone();
             let stroke = stroke.clone();
+            let preview = mask_preview.clone();
             mask_overlay.set_draw_func(move |_, cr, _w, _h| {
+                draw_mask_preview(cr, &view, preview.borrow().as_ref());
                 draw_masks(cr, &view, &shapes.borrow());
                 draw_stroke(cr, &view, &stroke.borrow(), paint.get());
             });
@@ -493,6 +499,7 @@ impl EditorCanvas {
             overlay,
             mask_overlay,
             mask_shapes,
+            mask_preview,
             mask_active,
             mask_edit,
             paint,
@@ -508,10 +515,38 @@ impl EditorCanvas {
     /// Show/update the mask overlay with `shapes` (normalized coords). `on` =
     /// Masks tab active; drives both visibility and whether drags edit handles.
     pub fn set_mask_overlay(&self, shapes: Vec<MaskShape>, on: bool) {
-        let show = on && !shapes.is_empty();
+        // Handle-dragging only applies to geometric shapes; visibility tracks the
+        // tab so the red coverage preview also shows for AI/brush/colour masks.
+        self.mask_active.set(on && !shapes.is_empty());
         *self.mask_shapes.borrow_mut() = shapes;
-        self.mask_active.set(show);
-        self.mask_overlay.set_visible(show);
+        self.mask_overlay.set_visible(on);
+        if !on {
+            *self.mask_preview.borrow_mut() = None;
+        }
+        self.mask_overlay.queue_draw();
+    }
+
+    /// Set (or clear) the red coverage preview from premultiplied BGRA bytes
+    /// `(data, w, h)` — cairo ARGB32 native order.
+    pub fn set_mask_preview(&self, data: Option<(Vec<u8>, i32, i32)>) {
+        let surf = data.and_then(|(bytes, w, h)| {
+            if w <= 0 || h <= 0 {
+                return None;
+            }
+            let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).ok()?;
+            let stride = s.stride() as usize;
+            let row = w as usize * 4;
+            {
+                let mut sdata = s.data().ok()?;
+                for y in 0..h as usize {
+                    let src = &bytes[y * row..y * row + row];
+                    sdata[y * stride..y * stride + row].copy_from_slice(src);
+                }
+            }
+            s.mark_dirty();
+            Some(s)
+        });
+        *self.mask_preview.borrow_mut() = surf;
         self.mask_overlay.queue_draw();
     }
 
@@ -785,6 +820,26 @@ fn apply(
 /// Draw the selected mask's geometric shapes over the image (read-only). Coords
 /// are normalized (0..1) and mapped through the same image→screen transform the
 /// crop overlay uses, so shapes stay glued to the photo under zoom/pan.
+/// Paint the red coverage bitmap scaled to the on-screen image rectangle.
+fn draw_mask_preview(cr: &cairo::Context, view: &View, surf: Option<&cairo::ImageSurface>) {
+    let Some(surf) = surf else { return };
+    let (sw, sh) = (surf.width() as f64, surf.height() as f64);
+    if sw <= 0.0 || sh <= 0.0 {
+        return;
+    }
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 || ih <= 0.0 {
+        return;
+    }
+    cr.save().ok();
+    cr.translate(ix, iy);
+    cr.scale(iw / sw, ih / sh);
+    if cr.set_source_surface(surf, 0.0, 0.0).is_ok() {
+        cr.paint().ok();
+    }
+    cr.restore().ok();
+}
+
 fn draw_masks(cr: &cairo::Context, view: &View, shapes: &[MaskShape]) {
     let (nw, nh) = view.natural.get();
     if nw <= 0 || nh <= 0 {

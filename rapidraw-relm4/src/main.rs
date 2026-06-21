@@ -373,6 +373,47 @@ fn apply_geometry(base: &DynamicImage, g: Geometry) -> DynamicImage {
     img
 }
 
+/// Rasterize the mask's coverage as a red translucent overlay, mirroring the
+/// preview render path (geometry applied, downscaled to `preview_dim`, same
+/// `scale`/resolver as `core::render`). Returns premultiplied BGRA bytes (cairo
+/// ARGB32 native order) + dims, or None for an empty/invisible mask.
+fn compute_mask_overlay(
+    base: &DynamicImage,
+    geom: Geometry,
+    mask_def: &MaskDefinition,
+    preview_dim: u32,
+) -> Option<(Vec<u8>, i32, i32)> {
+    use image::GenericImageView;
+    let warped = apply_geometry(base, geom);
+    let full_w = warped.width().max(1);
+    let b = if warped.width().max(warped.height()) > preview_dim {
+        warped.resize(preview_dim, preview_dim, image::imageops::FilterType::Triangle)
+    } else {
+        warped.clone()
+    };
+    let (w, h) = b.dimensions();
+    let scale = w as f32 / full_w as f32;
+    let gray = rapidraw_core::mask_generation::generate_mask_bitmap(
+        mask_def,
+        w,
+        h,
+        scale,
+        (0.0, 0.0),
+        Some(&b),
+        Some(&rapidraw_core::ai::ai_sub_mask_resolver),
+    )?;
+    // Tint red at half the coverage intensity (matches the original overlay),
+    // premultiplied: red channel = alpha, so bytes are [B=0, G=0, R=a, A=a].
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for (i, px) in gray.pixels().enumerate() {
+        let a = (px[0] as f32 * 0.5) as u8;
+        let o = i * 4;
+        out[o + 2] = a; // R
+        out[o + 3] = a; // A
+    }
+    Some((out, w as i32, h as i32))
+}
+
 /// One undo/redo step: the full engine state plus the slider UI values needed to
 /// restore the panel.
 #[derive(Clone)]
@@ -432,6 +473,12 @@ enum CmdMsg {
         sub: usize,
         result: Result<String, String>,
     },
+    /// A mask-coverage overlay finished rasterizing. `gen` guards against stale
+    /// (superseded) jobs; `data` is `(premult BGRA, w, h)` or None to clear.
+    MaskPreviewReady {
+        gen: u64,
+        data: Option<(Vec<u8>, i32, i32)>,
+    },
 }
 
 /// Run `f` on a dedicated OS thread and deliver its `CmdMsg` to `update_cmd`.
@@ -486,6 +533,8 @@ struct AppModel {
     hist_idx: usize,
     /// History debounce generation (same scheme as `render_gen`).
     hist_gen: u64,
+    /// Mask-overlay rasterization generation (latest job wins; stale jobs drop).
+    mpreview_gen: u64,
     /// While true (during undo/redo restore), changes don't record history.
     suppress_history: bool,
     /// Last processed preview texture (for toggling back from "show original").
@@ -616,6 +665,31 @@ impl AppModel {
             _ => Vec::new(),
         };
         self.canvas.set_mask_overlay(shapes, on);
+    }
+
+    /// Recompute the selected mask's red coverage overlay on a worker (debounced
+    /// via a generation token). Clears it when the Masks tab is off or nothing is
+    /// selected. Called from the render debounce point + selection/tab changes.
+    fn refresh_mask_preview(&mut self, sender: &ComponentSender<AppModel>) {
+        let on = self
+            .content_stack
+            .visible_child_name()
+            .map(|s| s == "masks")
+            .unwrap_or(false);
+        let sel = self.selected_mask.filter(|&i| i < self.session.masks.len());
+        let (Some(i), Some(base), true) = (sel, self.session.base_image.clone(), on) else {
+            self.canvas.set_mask_preview(None);
+            return;
+        };
+        let mask_def = self.session.masks[i].clone();
+        let geom = self.geom;
+        let preview_dim = self.settings.preview_dim;
+        self.mpreview_gen = self.mpreview_gen.wrapping_add(1);
+        let gen = self.mpreview_gen;
+        spawn_bg(sender, move || {
+            let data = compute_mask_overlay(&base, geom, &mask_def, preview_dim);
+            CmdMsg::MaskPreviewReady { gen, data }
+        });
     }
 
     /// Full (pre-preview) image dimensions as f64, if an image is open.
@@ -1033,6 +1107,7 @@ impl Component for AppModel {
             history: Vec::new(),
             hist_idx: 0,
             hist_gen: 0,
+            mpreview_gen: 0,
             suppress_history: false,
             last_tex: None,
             original_tex: None,
@@ -1500,6 +1575,7 @@ impl Component for AppModel {
                     };
                     sender.input(AppMsg::RequestRender);
                 }
+                self.refresh_mask_preview(&sender); // clears (Masks tab off)
             }
             AppMsg::ShowCropPanel => {
                 self.content_stack.set_visible_child_name("crop");
@@ -1509,6 +1585,7 @@ impl Component for AppModel {
                 // Show the full (uncropped) image with the crop overlay.
                 self.canvas.enter_crop(self.crop_aspect as f64);
                 sender.input(AppMsg::RequestRender);
+                self.refresh_mask_preview(&sender); // clears (Masks tab off)
             }
             AppMsg::ShowMasksPanel => {
                 self.content_stack.set_visible_child_name("masks");
@@ -1527,6 +1604,7 @@ impl Component for AppModel {
                 }
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
+                self.refresh_mask_preview(&sender);
             }
             AppMsg::AddMask(ty) => {
                 // Default sub-mask geometry needs the full image size.
@@ -1561,6 +1639,7 @@ impl Component for AppModel {
                 self.canvas.set_pick(None);
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
+                self.refresh_mask_preview(&sender);
             }
             AppMsg::DeleteMask(i) => {
                 if i < self.session.masks.len() {
@@ -2127,6 +2206,9 @@ impl Component for AppModel {
                     dim: self.settings.preview_dim,
                     geom,
                 });
+                // Mask edits all funnel through here (they RequestRender), so this
+                // is the natural debounced point to refresh the coverage overlay.
+                self.refresh_mask_preview(&sender);
             }
             AppMsg::ExportDialog => {
                 if self.session.base_image.is_none() {
@@ -2634,6 +2716,11 @@ impl Component for AppModel {
                     self.toasts
                         .add_toast(adw::Toast::new(&format!("AI mask failed: {e}")));
                 }
+                }
+            }
+            CmdMsg::MaskPreviewReady { gen, data } => {
+                if gen == self.mpreview_gen {
+                    self.canvas.set_mask_preview(data);
                 }
             }
         }
