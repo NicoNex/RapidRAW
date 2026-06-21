@@ -1829,6 +1829,9 @@ impl Component for AppModel {
                 let mask_type = sm.mask_type.clone();
                 let params = sm.parameters.clone();
                 let geom = self.geom;
+                // Persistent status while inference runs (first run also downloads
+                // the models, which can take a while).
+                self.win_title.set_subtitle("Generating AI mask…");
                 spawn_bg(&sender, move || {
                     let img = apply_geometry(&base, geom);
                     let (w, h) = {
@@ -2594,7 +2597,16 @@ impl Component for AppModel {
                 mask,
                 sub,
                 result,
-            } => match result {
+            } => {
+                // Clear the "Generating…" status (back to the EXIF summary).
+                let subtitle = self
+                    .session
+                    .active_path
+                    .as_deref()
+                    .and_then(meta::read_summary)
+                    .unwrap_or_default();
+                self.win_title.set_subtitle(&subtitle);
+                match result {
                 Ok(b64) => {
                     if let Some(sm) = self
                         .session
@@ -2622,7 +2634,8 @@ impl Component for AppModel {
                     self.toasts
                         .add_toast(adw::Toast::new(&format!("AI mask failed: {e}")));
                 }
-            },
+                }
+            }
         }
     }
 }

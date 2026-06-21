@@ -63,15 +63,19 @@ fn models_dir() -> PathBuf {
 /// return a base64 PNG of the full-res mask. Blocks; call on a worker thread.
 pub fn generate(kind: Kind, image: &DynamicImage) -> Result<String, String> {
     let (st, lock) = state();
-    // ponytail: no download progress UI; first run silently fetches the models
-    // (hundreds of MB). Add a toast/progress bar when the wait draws complaints.
-    let noop = |_e: ai::DownloadEvent| {};
+    // First run downloads the models (hundreds of MB). Log each step so the
+    // terminal shows progress; the UI shows a persistent "Generating…" status.
+    let progress = |e: ai::DownloadEvent| match e {
+        ai::DownloadEvent::Start(name) => log::info!("AI model download: {name}…"),
+        ai::DownloadEvent::Finish(name) => log::info!("AI model ready: {name}"),
+        ai::DownloadEvent::Progress(msg) => log::info!("AI: {msg}"),
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
     let models = rt
-        .block_on(ai::get_or_init_ai_models(&models_dir(), &noop, st, lock))
+        .block_on(ai::get_or_init_ai_models(&models_dir(), &progress, st, lock))
         .map_err(|e| e.to_string())?;
 
     let gray = match kind {
