@@ -123,8 +123,9 @@ enum AppMsg {
     Adjust(Adjust),
     /// Ask for a (debounced) preview re-render.
     RequestRender,
-    /// Debounce timer fired: actually launch the background render.
-    DoRender,
+    /// Debounce timer fired: launch the render if `gen` is still current (stale
+    /// timers from superseded requests no-op).
+    DoRender(u64),
     /// Export button: open the export-options dialog.
     ExportDialog,
     /// Options were chosen: open the save dialog for them.
@@ -149,8 +150,9 @@ enum AppMsg {
     SettingsChanged(Settings),
     /// A tone curve changed: channel + points (x,y in 0..255).
     CurveChanged(Channel, Vec<(f32, f32)>),
-    /// Debounced: commit the current adjustment state to the undo history.
-    CommitHistory,
+    /// Debounced: commit the current adjustment state to the undo history if
+    /// `gen` is still current (stale timers no-op).
+    CommitHistory(u64),
     /// Undo / redo the adjustment history (Ctrl+Z / Ctrl+Shift+Z).
     Undo,
     Redo,
@@ -439,9 +441,10 @@ struct AppModel {
     scopes: Scopes,
     /// Overlay for transient status toasts (export done, LUT loaded, …).
     toasts: adw::ToastOverlay,
-    /// Pending debounce timer for the next render; replaced (restarting the
-    /// timer) on each `RequestRender` so rapid drags coalesce into one render.
-    render_timer: Option<glib::SourceId>,
+    /// Render debounce generation: bumped per `RequestRender`; a fired timer
+    /// only renders if its captured generation still matches (coalesces drags
+    /// without removing glib sources, which panics if already fired).
+    render_gen: u64,
     /// User settings (preview/thumbnail size, editor background).
     settings: Settings,
     /// Channel to the persistent render thread.
@@ -455,8 +458,8 @@ struct AppModel {
     /// Undo/redo stack of adjustment states; `hist_idx` points at the current one.
     history: Vec<HistEntry>,
     hist_idx: usize,
-    /// Debounce timer so a burst of slider changes records one history step.
-    hist_timer: Option<glib::SourceId>,
+    /// History debounce generation (same scheme as `render_gen`).
+    hist_gen: u64,
     /// While true (during undo/redo restore), changes don't record history.
     suppress_history: bool,
     /// Last processed preview texture (for toggling back from "show original").
@@ -512,14 +515,12 @@ impl AppModel {
         if self.suppress_history {
             return;
         }
-        if let Some(id) = self.hist_timer.take() {
-            id.remove();
-        }
+        self.hist_gen = self.hist_gen.wrapping_add(1);
+        let gen = self.hist_gen;
         let sender = sender.clone();
-        self.hist_timer = Some(glib::timeout_add_local_once(
-            Duration::from_millis(500),
-            move || sender.input(AppMsg::CommitHistory),
-        ));
+        glib::timeout_add_local_once(Duration::from_millis(500), move || {
+            sender.input(AppMsg::CommitHistory(gen))
+        });
     }
 
     /// Native aspect (w/h) of the current image, accounting for 90° rotation.
@@ -977,14 +978,14 @@ impl Component for AppModel {
             right_col: gtk::Box::new(gtk::Orientation::Vertical, 4),
             scopes: Scopes::new(),
             toasts: adw::ToastOverlay::new(), // replaced by the view's overlay below
-            render_timer: None,
+            render_gen: 0,
             settings: Settings::default(),
             render_tx,
             thumb_gen: Arc::new(AtomicUsize::new(0)),
             thumb_loaded: Vec::new(),
             history: Vec::new(),
             hist_idx: 0,
-            hist_timer: None,
+            hist_gen: 0,
             suppress_history: false,
             last_tex: None,
             original_tex: None,
@@ -1943,19 +1944,20 @@ impl Component for AppModel {
                 sender.input(AppMsg::RequestRender);
             }
             AppMsg::RequestRender => {
-                // Debounce: drop any pending timer and start a fresh one. Rapid
-                // slider drags thus collapse into a single DoRender.
-                if let Some(id) = self.render_timer.take() {
-                    id.remove();
-                }
+                // Debounce via generation token: bump it and let only the latest
+                // timer fire a render. Rapid slider drags thus collapse into one.
+                self.render_gen = self.render_gen.wrapping_add(1);
+                let gen = self.render_gen;
                 let sender = sender.clone();
-                self.render_timer = Some(glib::timeout_add_local_once(
-                    Duration::from_millis(RENDER_DEBOUNCE_MS),
-                    move || sender.input(AppMsg::DoRender),
-                ));
+                glib::timeout_add_local_once(Duration::from_millis(RENDER_DEBOUNCE_MS), move || {
+                    sender.input(AppMsg::DoRender(gen))
+                });
             }
-            AppMsg::DoRender => {
-                self.render_timer = None;
+            AppMsg::DoRender(gen) => {
+                // Stale timer from a superseded RequestRender: ignore.
+                if gen != self.render_gen {
+                    return;
+                }
                 // Guard: nothing to render until a base image is loaded.
                 let Some(base) = self.session.base_image.clone() else {
                     return;
@@ -2249,8 +2251,11 @@ impl Component for AppModel {
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
             }
-            AppMsg::CommitHistory => {
-                self.hist_timer = None;
+            AppMsg::CommitHistory(gen) => {
+                // Stale timer from a superseded schedule_history: ignore.
+                if gen != self.hist_gen {
+                    return;
+                }
                 if self.suppress_history {
                     return;
                 }
