@@ -578,6 +578,8 @@ struct AppModel {
     search: String,
     /// Last folder from a previous session (for "Continue session").
     last_folder: Option<PathBuf>,
+    /// Root folders shown in the sidebar (persisted across sessions).
+    roots: Vec<PathBuf>,
     /// Crop/geometry transforms applied before the GPU render.
     geom: Geometry,
     /// Crop panel (right-rail "Crop" section).
@@ -1208,6 +1210,7 @@ impl Component for AppModel {
             sort_by: library::SortBy::Name,
             search: String::new(),
             last_folder: load_last_folder(),
+            roots: load_roots(),
             geom: Geometry::default(),
             crop: crop::CropPanel::new(&sender),
             masks_panel: MasksPanel::new(&sender),
@@ -1606,7 +1609,11 @@ impl Component for AppModel {
                 save_last_folder(&path);
                 self.last_folder = Some(path.clone());
                 self.session.current_folder = Some(path.clone());
-                self.sidebar.emit(SidebarIn::AddRoot(path));
+                if !self.roots.contains(&path) {
+                    self.roots.push(path);
+                    save_roots(&self.roots);
+                }
+                self.sidebar.emit(SidebarIn::SetRoots(self.roots.clone()));
                 widgets.lib_stack.set_visible_child_name("grid");
                 // Reveal the sidebar now that there's a folder to navigate.
                 self.sidebar.widget().set_visible(true);
@@ -1615,7 +1622,10 @@ impl Component for AppModel {
                 self.apply_library(&sender);
             }
             AppMsg::ContinueSession => {
-                if let Some(p) = self.last_folder.clone() {
+                // Re-show every previously added root, not just the last one. Opening the
+                // folder for the grid (FolderChosen) re-emits the full root list.
+                let target = self.last_folder.clone().or_else(|| self.roots.first().cloned());
+                if let Some(p) = target {
                     sender.input(AppMsg::FolderChosen(p));
                 }
             }
@@ -3033,6 +3043,32 @@ fn load_last_folder() -> Option<PathBuf> {
     let s = std::fs::read_to_string(state_file()?).ok()?;
     let p = PathBuf::from(s.trim());
     p.is_dir().then_some(p)
+}
+
+/// File holding the list of root folders shown in the sidebar (across sessions).
+fn roots_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rapidraw-relm4").join("roots.json"))
+}
+
+fn save_roots(roots: &[PathBuf]) {
+    let Some(f) = roots_file() else { return };
+    if let Some(dir) = f.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let list: Vec<String> = roots.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    if let Ok(json) = serde_json::to_vec(&list) {
+        let _ = std::fs::write(f, json);
+    }
+}
+
+fn load_roots() -> Vec<PathBuf> {
+    let Some(f) = roots_file() else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(f) else { return Vec::new() };
+    let list: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
+    list.into_iter().map(PathBuf::from).filter(|p| p.is_dir()).collect()
 }
 
 fn ratings_file() -> Option<PathBuf> {

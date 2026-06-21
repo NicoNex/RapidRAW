@@ -94,10 +94,16 @@ impl FactoryComponent for Thumb {
     ) -> Self::Widgets {
         let widgets = view_output!();
         let click = gtk::GestureClick::new();
+        // Claim the press so the click doesn't also reach the FlowBox child (which would
+        // open the editor). Rating-on-click must not double as photo-open.
+        click.connect_pressed(|g, _, _, _| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+        });
         let s = sender.clone();
         let p = self.path.clone();
         let label = widgets.star_label.clone();
-        click.connect_released(move |_, _, x, _| {
+        click.connect_released(move |g, _, x, _| {
+            g.set_state(gtk::EventSequenceState::Claimed);
             let w = label.width().max(1) as f64;
             let n = (((x / w) * 5.0).ceil() as i64).clamp(1, 5) as u8;
             s.output(ThumbOut::Rate(p.clone(), n)).ok();

@@ -19,9 +19,9 @@ pub enum SidebarOut {
 
 #[derive(Debug)]
 pub enum SidebarIn {
-    /// Append a root folder to the tree (no-op if already present). Multiple roots are
-    /// shown stacked, matching the original UI's "Add folder" behavior.
-    AddRoot(PathBuf),
+    /// Replace the set of root folders shown (stacked). Newly-introduced roots are
+    /// expanded by default; collapse state of existing roots is preserved.
+    SetRoots(Vec<PathBuf>),
     ToggleFolder(PathBuf),
     SelectFolder(PathBuf),
     Search(String),
@@ -139,11 +139,13 @@ impl Component for Sidebar {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
-            SidebarIn::AddRoot(p) => {
-                if !self.roots.contains(&p) {
-                    self.roots.push(p.clone());
+            SidebarIn::SetRoots(roots) => {
+                for r in &roots {
+                    if !self.roots.contains(r) {
+                        self.expanded.insert(r.clone());
+                    }
                 }
-                self.expanded.insert(p);
+                self.roots = roots;
             }
             SidebarIn::ToggleFolder(p) => {
                 if !self.expanded.remove(&p) {
