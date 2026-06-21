@@ -52,6 +52,17 @@ pub fn reg_take() -> Vec<SliderHandle> {
     REG.with(|r| r.borrow_mut().take().unwrap_or_default())
 }
 
+/// Build sliders inside `f` WITHOUT registering them in the panel snapshot
+/// buffer (the collected `vals` layout stays stable). Used by the colour wheels'
+/// luminance slider, which manages its own reset and must not shift the index
+/// mapping of the surrounding panel sliders.
+pub fn without_registration<R>(f: impl FnOnce() -> R) -> R {
+    let saved = REG.with(|r| r.borrow_mut().take());
+    let out = f();
+    REG.with(|r| *r.borrow_mut() = saved);
+    out
+}
+
 thread_local! {
     /// Reset closures registered by non-slider components (curve editor, colour
     /// wheels) during panel build, so the panel can reset their widgets in place.

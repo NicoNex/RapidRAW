@@ -126,45 +126,43 @@ fn build(
     }
     area.add_controller(drag);
 
-    let lum = gtk::Scale::with_range(gtk::Orientation::Horizontal, -100.0, 100.0, 1.0);
-    lum.set_hexpand(true);
-    lum.set_draw_value(true);
-    lum.set_value(initial.2);
-    crate::controls::forward_wheel(&lum, vadj); // wheel scrolls panel, not the slider
-    {
+    // Luminance uses the shared custom slider (centre-origin fill, double-click
+    // reset, matching the other panel sliders — exactly as the original UI, which
+    // reuses its `Slider` here too). Built without panel registration so it doesn't
+    // shift the snapshot index mapping; the wheel handles its own reset.
+    let (lum_row, _lum_area, lum_handle) = crate::slider::without_registration(|| {
         let handle = handle.clone();
         let lum_val = lum_val.clone();
         let emit = emit.clone();
-        lum.connect_value_changed(move |s| {
-            lum_val.set(s.value());
-            let (hue, sat) = handle.get();
-            emit(hue, sat, s.value());
-        });
-    }
-    // Double-click the luminance slider resets it to 0.
-    let lum_reset = gtk::GestureClick::new();
-    {
-        let lum = lum.clone();
-        lum_reset.connect_pressed(move |_, n, _, _| {
-            if n == 2 {
-                lum.set_value(0.0);
-            }
-        });
-    }
-    lum.add_controller(lum_reset);
+        crate::slider::slider_ex(
+            "Luminance",
+            -100.0,
+            100.0,
+            1.0,
+            0.0,
+            crate::slider::Track::Plain,
+            vadj,
+            move |v| {
+                lum_val.set(v);
+                let (hue, sat) = handle.get();
+                emit(hue, sat, v);
+            },
+        )
+    });
+    lum_handle.set_ui(initial.2); // seed display without firing the callback
 
-    // Double-click anywhere on the wheel resets all three components.
+    // Double-click anywhere on the wheel disc resets all three components.
     let reset = gtk::GestureClick::new();
     {
         let area_w = area.clone();
         let handle = handle.clone();
-        let lum = lum.clone();
+        let lum_handle = lum_handle.clone();
         let emit = emit.clone();
         reset.connect_pressed(move |_, n, _, _| {
             if n == 2 {
                 handle.set((0.0, 0.0));
                 area_w.queue_draw();
-                lum.set_value(0.0); // fires lum change -> emit
+                lum_handle.set_ui(0.0); // update the slider display
                 emit(0.0, 0.0, 0.0);
             }
         });
@@ -175,16 +173,16 @@ fn build(
     if register_reset {
         let handle = handle.clone();
         let area = area.clone();
-        let lum = lum.clone();
+        let lum_handle = lum_handle.clone();
         crate::slider::register_reset(Rc::new(move || {
             handle.set((0.0, 0.0));
             area.queue_draw();
-            lum.set_value(0.0);
+            lum_handle.set_ui(0.0);
         }));
     }
 
     root.append(&area);
-    root.append(&lum);
+    root.append(&lum_row);
     root
 }
 
