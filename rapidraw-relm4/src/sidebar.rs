@@ -217,18 +217,20 @@ impl Sidebar {
 
         let expanded = self.expanded.contains(path);
         if has_subdirs {
-            let arrow = gtk::Button::builder()
-                .icon_name(if expanded { "pan-down-symbolic" } else { "pan-end-symbolic" })
+            // Folder icon doubles as the expand/collapse toggle (open vs closed).
+            let toggle = gtk::Button::builder()
+                .icon_name(if expanded { "folder-open-symbolic" } else { "folder-symbolic" })
                 .css_classes(["flat", "circular"])
                 .build();
             let s = sender.clone();
             let p = path.clone();
-            arrow.connect_clicked(move |_| s.input(SidebarIn::ToggleFolder(p.clone())));
-            row.append(&arrow);
+            toggle.connect_clicked(move |_| s.input(SidebarIn::ToggleFolder(p.clone())));
+            row.append(&toggle);
         } else {
-            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            spacer.set_width_request(24);
-            row.append(&spacer);
+            let icon = gtk::Image::from_icon_name("folder-symbolic");
+            icon.set_margin_start(6);
+            icon.set_margin_end(6);
+            row.append(&icon);
         }
 
         let label = if image_count > 0 {
