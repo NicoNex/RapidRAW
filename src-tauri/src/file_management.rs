@@ -31,6 +31,7 @@ use crate::app_settings::*;
 use crate::cache_utils::calculate_geometry_hash;
 use crate::exif_processing;
 use crate::formats::{is_raw_file, is_supported_image_file};
+pub use rapidraw_core::albums::AlbumItem;
 use crate::gpu_processing;
 use crate::image_loader;
 use crate::image_processing::GpuContext;
@@ -513,23 +514,6 @@ pub fn list_images_recursive(
     Ok(result_list)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum AlbumItem {
-    Album {
-        id: String,
-        name: String,
-        icon: Option<String>,
-        images: Vec<String>,
-    },
-    Group {
-        id: String,
-        name: String,
-        icon: Option<String>,
-        children: Vec<AlbumItem>,
-    },
-}
-
 fn get_albums_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     let data_dir = app_handle
         .path()
@@ -542,44 +526,16 @@ fn get_albums_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     Ok(albums_dir.join("albums.json"))
 }
 
-pub fn sort_album_tree(items: &mut [AlbumItem]) {
-    items.sort_by(|a, b| {
-        let get_sort_key = |item: &AlbumItem| match item {
-            AlbumItem::Group { name, .. } => (0, name.to_lowercase()),
-            AlbumItem::Album { name, .. } => (1, name.to_lowercase()),
-        };
-
-        let key_a = get_sort_key(a);
-        let key_b = get_sort_key(b);
-
-        key_a.cmp(&key_b)
-    });
-
-    for item in items.iter_mut() {
-        if let AlbumItem::Group { children, .. } = item {
-            sort_album_tree(children);
-        }
-    }
-}
-
 #[tauri::command]
 pub fn get_albums(app_handle: AppHandle) -> Result<Vec<AlbumItem>, String> {
     let path = get_albums_path(&app_handle)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut items: Vec<AlbumItem> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-    sort_album_tree(&mut items);
-    Ok(items)
+    Ok(rapidraw_core::albums::load_albums(&path))
 }
 
 #[tauri::command]
 pub fn save_albums(mut tree: Vec<AlbumItem>, app_handle: AppHandle) -> Result<(), String> {
     let path = get_albums_path(&app_handle)?;
-    sort_album_tree(&mut tree);
-    let json_string = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
-    fs::write(path, json_string).map_err(|e| e.to_string())
+    rapidraw_core::albums::save_albums(&path, &mut tree)
 }
 
 #[tauri::command]
@@ -589,31 +545,7 @@ pub fn add_to_album(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let mut tree = get_albums(app_handle.clone())?;
-
-    fn add_recursive(items: &mut [AlbumItem], target_id: &str, paths_to_add: &Vec<String>) -> bool {
-        for item in items.iter_mut() {
-            #[allow(clippy::collapsible_match)]
-            match item {
-                AlbumItem::Album { id, images, .. } if id == target_id => {
-                    for p in paths_to_add {
-                        if !images.contains(p) {
-                            images.push(p.clone());
-                        }
-                    }
-                    return true;
-                }
-                AlbumItem::Group { children, .. } => {
-                    if add_recursive(children, target_id, paths_to_add) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    if add_recursive(&mut tree, &album_id, &paths) {
+    if rapidraw_core::albums::add_to_album(&mut tree, &album_id, &paths) {
         save_albums(tree, app_handle)?;
     }
     Ok(())

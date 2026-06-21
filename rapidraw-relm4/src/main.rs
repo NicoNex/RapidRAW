@@ -27,8 +27,12 @@ mod sidecar;
 mod slider;
 mod state;
 mod thumb;
+mod sidebar;
+mod stars;
 mod thumb_cache;
 use controls::AdjustPanel;
+use sidebar::{Sidebar, SidebarIn, SidebarOut};
+use stars::{Stars, StarsMsg, StarsOut};
 use masks::MasksPanel;
 use curves::Channel;
 use editor::EditorCanvas;
@@ -38,7 +42,7 @@ use rapidraw_core::lut_processing::{parse_lut_file, Lut};
 use scopes::Scopes;
 use settings::Settings;
 use state::{Engine, Session};
-use thumb::{Thumb, ThumbMsg};
+use thumb::{Thumb, ThumbMsg, ThumbOut};
 
 /// Debounce window (ms) for coalescing rapid slider drags into one render.
 /// Small: the render thread also coalesces, and the cached GpuProcessor makes
@@ -163,6 +167,8 @@ enum AppMsg {
     ToggleClipping(bool),
     /// Reopen the last folder from a previous session.
     ContinueSession,
+    /// Sidebar picked a sub-folder to show in the grid (does NOT change the tree root).
+    ShowFolder(PathBuf),
     /// Library raw-status filter changed.
     FilterChanged(library::RawFilter),
     /// Library sort order changed.
@@ -295,8 +301,18 @@ enum AppMsg {
     ToggleFullscreen,
     /// Set the active image's star rating (0..5).
     RateActive(u8),
+    /// A thumbnail's star strip was clicked: set (or toggle-off) that path's rating.
+    RateThumb(PathBuf, u8),
     /// Open the About window.
     ShowAbout,
+    /// Show images from an album in the grid.
+    ShowAlbum(Vec<String>),
+    /// Create a new album with the given name.
+    AlbumNew(String),
+    /// Rename an album.
+    AlbumRename { id: String, name: String },
+    /// Delete an album.
+    AlbumDelete(String),
 }
 
 /// Copied edit settings (toolbar copy/paste between photos).
@@ -591,6 +607,12 @@ struct AppModel {
     settings_clip: Option<SettingsClip>,
     /// Star ratings per image (0..5), persisted to config.
     ratings: HashMap<PathBuf, u8>,
+    /// Album tree (persisted to config).
+    albums: Vec<rapidraw_core::albums::AlbumItem>,
+    /// Sidebar folder tree component.
+    sidebar: Controller<Sidebar>,
+    /// Star rating widget shown in the editor header bar.
+    editor_stars: Controller<Stars>,
 }
 
 impl AppModel {
@@ -754,6 +776,14 @@ impl AppModel {
             &self.images,
             0..self.images.len(),
         );
+    }
+
+    /// Persist albums to disk and push the updated list to the sidebar.
+    fn persist_albums(&mut self) {
+        if let Some(p) = albums_file() {
+            let _ = rapidraw_core::albums::save_albums(&p, &mut self.albums);
+        }
+        self.sidebar.emit(SidebarIn::SetAlbums(self.albums.clone()));
     }
 
     /// Apply the history entry at `hist_idx`: set engine state, restore the
@@ -936,8 +966,21 @@ impl Component for AppModel {
             #[name = "toast_overlay"]
             set_content = &adw::ToastOverlay {
                 #[wrap(Some)]
-                #[name = "nav"]
-                set_child = &adw::NavigationView {
+                #[name = "split"]
+                set_child = &gtk::Paned {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_position: 220,
+                    set_resize_start_child: false,
+                    set_shrink_start_child: false,
+                    set_shrink_end_child: false,
+                    #[wrap(Some)]
+                    #[name = "sidebar_slot"]
+                    set_start_child = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                    },
+                    #[wrap(Some)]
+                    #[name = "nav"]
+                    set_end_child = &adw::NavigationView {
                     // ----- Library page -----
                     add = &adw::NavigationPage {
                         set_tag: Some("library"),
@@ -945,6 +988,12 @@ impl Component for AppModel {
                         #[wrap(Some)]
                         set_child = &adw::ToolbarView {
                             add_top_bar = &adw::HeaderBar {
+                                #[name = "sidebar_toggle_lib"]
+                                pack_start = &gtk::ToggleButton {
+                                    set_icon_name: "sidebar-show-symbolic",
+                                    set_tooltip_text: Some("Toggle sidebar"),
+                                    set_active: false,
+                                },
                                 pack_start = &gtk::Button {
                                     set_label: "Open Folder",
                                     connect_clicked => AppMsg::OpenFolderDialog,
@@ -1020,6 +1069,12 @@ impl Component for AppModel {
                                 set_title_widget = &adw::WindowTitle {
                                     set_title: "RapidRAW",
                                 },
+                                #[name = "sidebar_toggle_ed"]
+                                pack_start = &gtk::ToggleButton {
+                                    set_icon_name: "sidebar-show-symbolic",
+                                    set_tooltip_text: Some("Toggle sidebar"),
+                                    set_active: false,
+                                },
                                 pack_start = &gtk::Box {
                                     add_css_class: "linked",
                                     gtk::Button {
@@ -1033,6 +1088,8 @@ impl Component for AppModel {
                                         connect_clicked => AppMsg::Redo,
                                     },
                                 },
+                                #[name = "editor_stars_slot"]
+                                pack_start = &gtk::Box {},
                                 #[name = "menu_ed"]
                                 pack_end = &gtk::MenuButton {
                                     set_icon_name: "open-menu-symbolic",
@@ -1079,6 +1136,7 @@ impl Component for AppModel {
                         },
                     },
                 },
+                },
             },
         }
     }
@@ -1090,9 +1148,32 @@ impl Component for AppModel {
     ) -> ComponentParts<Self> {
         let thumbs = FactoryVecDeque::builder()
             .launch(gtk::FlowBox::default())
-            .detach();
+            .forward(sender.input_sender(), |out| match out {
+                ThumbOut::Rate(path, n) => AppMsg::RateThumb(path, n),
+            });
 
         let render_tx = spawn_render_worker(engine.ctx.clone(), sender.clone());
+
+        let albums = albums_file()
+            .map(|p| rapidraw_core::albums::load_albums(&p))
+            .unwrap_or_default();
+
+        let sidebar = Sidebar::builder()
+            .launch(())
+            .forward(sender.input_sender(), |out| match out {
+                SidebarOut::SelectFolder(p) => AppMsg::ShowFolder(p),
+                SidebarOut::AddRootFolder => AppMsg::OpenFolderDialog,
+                SidebarOut::SelectAlbum(images) => AppMsg::ShowAlbum(images),
+                SidebarOut::NewAlbum(name) => AppMsg::AlbumNew(name),
+                SidebarOut::RenameAlbum { id, name } => AppMsg::AlbumRename { id, name },
+                SidebarOut::DeleteAlbum(id) => AppMsg::AlbumDelete(id),
+            });
+
+        let editor_stars = Stars::builder()
+            .launch(0)
+            .forward(sender.input_sender(), |out| match out {
+                StarsOut::Changed(n) => AppMsg::RateActive(n),
+            });
 
         let model = AppModel {
             session: Session::default(),
@@ -1141,6 +1222,9 @@ impl Component for AppModel {
             lut_path: None,
             settings_clip: None,
             ratings: load_ratings(),
+            albums,
+            sidebar,
+            editor_stars,
         };
         // Seed the engine struct with the UI defaults (e.g. vignette midpoint/
         // feather = 50) so effects behave like the original at zero amount.
@@ -1467,6 +1551,31 @@ impl Component for AppModel {
                 .scopes
                 .set_clip_toggle(move |on| sender.input(AppMsg::ToggleClipping(on)));
         }
+        {
+            let sb = model.sidebar.widget().clone();
+            let other = widgets.sidebar_toggle_ed.clone();
+            widgets.sidebar_toggle_lib.connect_toggled(move |b| {
+                sb.set_visible(b.is_active());
+                if other.is_active() != b.is_active() {
+                    other.set_active(b.is_active());
+                }
+            });
+        }
+        {
+            let sb = model.sidebar.widget().clone();
+            let other = widgets.sidebar_toggle_lib.clone();
+            widgets.sidebar_toggle_ed.connect_toggled(move |b| {
+                sb.set_visible(b.is_active());
+                if other.is_active() != b.is_active() {
+                    other.set_active(b.is_active());
+                }
+            });
+        }
+        widgets.split.set_start_child(Some(model.sidebar.widget()));
+        // Hidden until a folder is opened (no sidebar on the welcome/splash screen).
+        model.sidebar.widget().set_visible(false);
+        widgets.editor_stars_slot.append(model.editor_stars.widget());
+        model.sidebar.emit(SidebarIn::SetAlbums(model.albums.clone()));
         ComponentParts { model, widgets }
     }
 
@@ -1496,14 +1605,23 @@ impl Component for AppModel {
                 log::info!("{} images", self.all_images.len());
                 save_last_folder(&path);
                 self.last_folder = Some(path.clone());
-                self.session.current_folder = Some(path);
+                self.session.current_folder = Some(path.clone());
+                self.sidebar.emit(SidebarIn::AddRoot(path));
                 widgets.lib_stack.set_visible_child_name("grid");
+                // Reveal the sidebar now that there's a folder to navigate.
+                self.sidebar.widget().set_visible(true);
+                widgets.sidebar_toggle_lib.set_active(true);
+                widgets.sidebar_toggle_ed.set_active(true);
                 self.apply_library(&sender);
             }
             AppMsg::ContinueSession => {
                 if let Some(p) = self.last_folder.clone() {
                     sender.input(AppMsg::FolderChosen(p));
                 }
+            }
+            AppMsg::ShowFolder(dir) => {
+                self.all_images = library::scan_dir(&dir);
+                self.apply_library(&sender);
             }
             AppMsg::FilterChanged(f) => {
                 self.raw_filter = f;
@@ -2126,6 +2244,23 @@ impl Component for AppModel {
                 if let Some(i) = self.images.iter().position(|p| *p == path) {
                     self.thumbs.send(i, ThumbMsg::SetRating(r));
                 }
+                self.editor_stars.emit(StarsMsg::External(r));
+            }
+            AppMsg::RateThumb(path, n) => {
+                let cur = self.ratings.get(&path).copied().unwrap_or(0);
+                let r = if cur == n { 0 } else { n };
+                if r == 0 {
+                    self.ratings.remove(&path);
+                } else {
+                    self.ratings.insert(path.clone(), r);
+                }
+                save_ratings(&self.ratings);
+                if let Some(i) = self.images.iter().position(|p| *p == path) {
+                    self.thumbs.send(i, ThumbMsg::SetRating(r));
+                }
+                if self.session.active_path.as_deref() == Some(path.as_path()) {
+                    self.editor_stars.emit(StarsMsg::External(r));
+                }
             }
             AppMsg::OpenInEditor(path) => {
                 log::info!("Open in editor: {}", path.display());
@@ -2181,6 +2316,8 @@ impl Component for AppModel {
                 if !in_editor {
                     widgets.nav.push_by_tag("editor");
                 }
+                let r = self.ratings.get(&path).copied().unwrap_or(0);
+                self.editor_stars.emit(StarsMsg::External(r));
                 let p = path.clone();
                 spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {
                     Ok(img) => CmdMsg::BaseReady(p, img),
@@ -2573,6 +2710,39 @@ impl Component for AppModel {
                 };
                 self.show_active_tex();
             }
+            AppMsg::ShowAlbum(images) => {
+                let paths: Vec<PathBuf> = images
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .filter(|p| p.exists())
+                    .collect();
+                self.all_images = paths;
+                self.apply_library(&sender);
+            }
+            AppMsg::AlbumNew(name) => {
+                let id = format!(
+                    "album-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                );
+                self.albums.push(rapidraw_core::albums::AlbumItem::Album {
+                    id,
+                    name,
+                    icon: None,
+                    images: vec![],
+                });
+                self.persist_albums();
+            }
+            AppMsg::AlbumRename { id, name } => {
+                rename_album(&mut self.albums, &id, &name);
+                self.persist_albums();
+            }
+            AppMsg::AlbumDelete(id) => {
+                delete_album(&mut self.albums, &id);
+                self.persist_albums();
+            }
         }
         // Keep the mask overlay in sync with selection/geometry/tab after any
         // message (cheap no-op when the Masks tab isn't showing).
@@ -2825,6 +2995,28 @@ fn install_app_css() {
                  font-size: 30px;
                  font-weight: 800;
                  text-shadow: 0 2px 8px alpha(black, 0.6);
+             }
+             .thumb-stars {
+                 margin: 4px;
+                 padding: 0 3px;
+                 border-radius: 7px;
+                 background: alpha(black, 0.3);
+             }
+             .thumb-stars button.star {
+                 min-width: 0;
+                 min-height: 0;
+                 padding: 0 1px;
+                 margin: 0;
+                 background: none;
+                 border: none;
+                 box-shadow: none;
+                 font-size: 11px;
+                 color: alpha(white, 0.85);
+                 text-shadow: 0 1px 2px alpha(black, 0.8);
+             }
+             .thumb-stars button.star:hover {
+                 color: white;
+                 background: none;
              }",
         );
         if let Some(display) = gdk::Display::default() {
@@ -2867,6 +3059,13 @@ fn ratings_file() -> Option<PathBuf> {
     Some(base.join("rapidraw-relm4").join("ratings.json"))
 }
 
+fn albums_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rapidraw-relm4").join("albums.json"))
+}
+
 fn settings_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -2889,6 +3088,30 @@ fn save_settings(s: &Settings) {
     }
     if let Ok(json) = serde_json::to_vec(s) {
         let _ = std::fs::write(f, json);
+    }
+}
+
+fn rename_album(tree: &mut [rapidraw_core::albums::AlbumItem], target: &str, new_name: &str) {
+    use rapidraw_core::albums::AlbumItem::*;
+    for item in tree.iter_mut() {
+        match item {
+            Album { id, name, .. } if id == target => {
+                *name = new_name.to_string();
+                return;
+            }
+            Group { children, .. } => rename_album(children, target, new_name),
+            _ => {}
+        }
+    }
+}
+
+fn delete_album(tree: &mut Vec<rapidraw_core::albums::AlbumItem>, target: &str) {
+    use rapidraw_core::albums::AlbumItem::*;
+    tree.retain(|i| !matches!(i, Album { id, .. } if id == target));
+    for item in tree.iter_mut() {
+        if let Group { children, .. } = item {
+            delete_album(children, target);
+        }
     }
 }
 

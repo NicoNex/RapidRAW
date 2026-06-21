@@ -3,15 +3,7 @@ use std::path::{Path, PathBuf};
 use gtk::gdk;
 use gtk::glib::Bytes;
 use image::RgbaImage;
-
-const EXT: &[&str] = &[
-    "jpg", "jpeg", "png", "tiff", "tif", "webp", "raw", "arw", "cr2", "cr3", "nef", "orf", "raf",
-    "dng", "rw2", "pef", "srw", "3fr", "mef",
-];
-
-const RAW_EXT: &[&str] = &[
-    "raw", "arw", "cr2", "cr3", "nef", "orf", "raf", "dng", "rw2", "pef", "srw", "3fr", "mef",
-];
+pub use rapidraw_core::formats::{is_raw_file as is_raw, is_supported_image_file};
 
 /// Library raw-status filter, mirroring the original `RawStatus`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,14 +22,6 @@ pub enum SortBy {
     DateNewest,
     DateOldest,
     RatingDesc,
-}
-
-/// True if `p` has a raw file extension.
-pub fn is_raw(p: &Path) -> bool {
-    p.extension()
-        .and_then(|x| x.to_str())
-        .map(|x| RAW_EXT.contains(&x.to_lowercase().as_str()))
-        .unwrap_or(false)
 }
 
 fn stem(p: &Path) -> String {
@@ -107,12 +91,7 @@ pub fn scan_dir(dir: &Path) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_file())
-        .filter(|p| {
-            p.extension()
-                .and_then(|x| x.to_str())
-                .map(|x| EXT.contains(&x.to_lowercase().as_str()))
-                .unwrap_or(false)
-        })
+        .filter(|p| is_supported_image_file(p))
         .collect();
     v.sort();
     v
