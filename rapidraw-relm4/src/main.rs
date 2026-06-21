@@ -12,6 +12,7 @@ use image::{DynamicImage, GenericImageView, RgbaImage};
 use relm4::factory::FactoryVecDeque;
 use relm4::prelude::*;
 
+mod ai_masks;
 mod colorwheel;
 mod controls;
 mod crop;
@@ -254,6 +255,9 @@ enum AppMsg {
     },
     /// Clear all painted strokes from sub-mask `sub`.
     ClearStrokes(usize),
+    /// Run AI inference for sub-mask `sub` (within the selected mask) and store
+    /// the resulting mask. Type drives which model runs.
+    GenerateAiMask(usize),
     /// Add another sub-mask of `ty` to container `mask`.
     AddSubMask(usize, &'static str),
     DeleteSubMask {
@@ -409,6 +413,12 @@ enum CmdMsg {
     RenderReady(RgbaImage),
     /// A worker finished a full-res export: Ok(path) or Err(message).
     ExportDone(Result<PathBuf, String>),
+    /// An AI inference job finished for `(mask, sub)`: Ok(base64 PNG) or Err.
+    AiMaskReady {
+        mask: usize,
+        sub: usize,
+        result: Result<String, String>,
+    },
 }
 
 /// Run `f` on a dedicated OS thread and deliver its `CmdMsg` to `update_cmd`.
@@ -1783,6 +1793,38 @@ impl Component for AppModel {
                     sender.input(AppMsg::RequestRender);
                 }
             }
+            AppMsg::GenerateAiMask(sub) => {
+                let Some(mi) = self.selected_mask else { return };
+                let Some(base) = self.session.base_image.clone() else { return };
+                let Some(sm) = self
+                    .session
+                    .masks
+                    .get(mi)
+                    .and_then(|m| m.sub_masks.get(sub))
+                else {
+                    return;
+                };
+                let mask_type = sm.mask_type.clone();
+                let params = sm.parameters.clone();
+                let geom = self.geom;
+                spawn_bg(&sender, move || {
+                    let img = apply_geometry(&base, geom);
+                    let (w, h) = {
+                        use image::GenericImageView;
+                        let (w, h) = img.dimensions();
+                        (w as f64, h as f64)
+                    };
+                    let result = match ai_masks::Kind::from_sub(&mask_type, &params, w, h) {
+                        Some(kind) => ai_masks::generate(kind, &img),
+                        None => Err("not an AI mask type".to_string()),
+                    };
+                    CmdMsg::AiMaskReady {
+                        mask: mi,
+                        sub,
+                        result,
+                    }
+                });
+            }
             AppMsg::AddSubMask(mask, ty) => {
                 let (w, h) = self
                     .session
@@ -2465,6 +2507,39 @@ impl Component for AppModel {
                 self.toasts
                     .add_toast(adw::Toast::new(&format!("Export failed: {e}")));
             }
+            CmdMsg::AiMaskReady {
+                mask,
+                sub,
+                result,
+            } => match result {
+                Ok(b64) => {
+                    if let Some(sm) = self
+                        .session
+                        .masks
+                        .get_mut(mask)
+                        .and_then(|m| m.sub_masks.get_mut(sub))
+                    {
+                        if let Some(obj) = sm.parameters.as_object_mut() {
+                            obj.insert("maskDataBase64".into(), serde_json::json!(b64));
+                            // Inference ran in render space, so the transform is
+                            // identity (resolver only scales).
+                            obj.insert("rotation".into(), serde_json::json!(0.0));
+                            obj.insert("flipHorizontal".into(), serde_json::json!(false));
+                            obj.insert("flipVertical".into(), serde_json::json!(false));
+                            obj.insert("orientationSteps".into(), serde_json::json!(0));
+                        }
+                        self.schedule_history(&sender);
+                        self.refresh_mask_overlay();
+                        sender.input(AppMsg::RequestRender);
+                        self.toasts.add_toast(adw::Toast::new("AI mask generated"));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("AI mask failed: {e}");
+                    self.toasts
+                        .add_toast(adw::Toast::new(&format!("AI mask failed: {e}")));
+                }
+            },
         }
     }
 }

@@ -21,9 +21,9 @@ use rapidraw_core::mask_generation::{MaskDefinition, SubMask, SubMaskMode};
 use crate::slider::{slider_ex, Track};
 use crate::{AppModel, AppMsg};
 
-/// Non-AI mask types offered by the "Add" menu: `(label, type-string)`. The
-/// type string is the camelCase `SubMask.type` the engine dispatches on. AI
-/// types (ai-subject/foreground/sky/depth, quick-eraser) are deferred to P5.
+/// Mask types offered by the "Add" menu: `(label, type-string)`. The type
+/// string is the camelCase `SubMask.type` the engine dispatches on. AI types
+/// run ONNX models via [`crate::ai_masks`]; their mask is generated on demand.
 pub const MASK_TYPES: &[(&str, &str)] = &[
     ("Radial", "radial"),
     ("Linear", "linear"),
@@ -32,7 +32,16 @@ pub const MASK_TYPES: &[(&str, &str)] = &[
     ("Color", "color"),
     ("Luminance", "luminance"),
     ("All", "all"),
+    ("AI Subject", "ai-subject"),
+    ("AI Foreground", "ai-foreground"),
+    ("AI Sky", "ai-sky"),
+    ("AI Depth", "ai-depth"),
 ];
+
+/// True for mask types whose bitmap comes from an ONNX model.
+pub fn is_ai_type(t: &str) -> bool {
+    matches!(t, "ai-subject" | "ai-foreground" | "ai-sky" | "ai-depth" | "quick-eraser")
+}
 
 /// Per-mask scalar adjustments: `(label, json-key, min, max, step, default)`.
 /// Values are stored raw (UI units) in the mask's `adjustments` JSON; the engine
@@ -162,6 +171,17 @@ fn default_sub_params(mask_type: &str, w: f32, h: f32) -> Value {
         }),
         "flow" => json!({ "lines": [], "flow": 10.0 }),
         "brush" => json!({ "lines": [] }),
+        // AI types: empty mask until generated; grow/feather refine the result.
+        "ai-subject" | "ai-foreground" => {
+            json!({ "maskDataBase64": null, "grow": 0.0, "feather": 0.0 })
+        }
+        "ai-sky" => json!({ "maskDataBase64": null, "grow": 0.0, "feather": 0.0 }),
+        "ai-depth" => json!({
+            "maskDataBase64": null,
+            "minDepth": 20.0, "maxDepth": 100.0,
+            "minFade": 15.0, "maxFade": 15.0,
+            "grow": 0.0, "feather": 15.0,
+        }),
         // color/luminance/all: serde defaults; these need canvas/colour input
         // (P3/P4) to produce a non-empty mask.
         _ => json!({}),
@@ -741,6 +761,11 @@ fn submask_editor(
     }
     group.add(&mode);
 
+    if is_ai_type(&sm.mask_type) {
+        ai_controls(&group, mask_i, sub_i, sm, sender);
+        return group;
+    }
+
     let rows = geo_rows(&sm.mask_type);
     if rows.is_empty() {
         if matches!(sm.mask_type.as_str(), "brush" | "flow") {
@@ -845,6 +870,80 @@ fn brush_controls(
     }
     clear.add_suffix(&clear_btn);
     group.add(&clear);
+}
+
+/// AI sub-mask controls: a Generate button (runs the ONNX model), grow/feather
+/// refinement, plus depth-range rows for `ai-depth`. The generated bitmap lives
+/// in `maskDataBase64`; everything else just refines it at render time.
+fn ai_controls(
+    group: &adw::PreferencesGroup,
+    mask_i: usize,
+    sub_i: usize,
+    sm: &SubMask,
+    sender: &ComponentSender<AppModel>,
+) {
+    let has_mask = sm
+        .parameters
+        .get("maskDataBase64")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+
+    let gen = adw::ActionRow::new();
+    gen.set_title("Generate");
+    gen.set_subtitle(if has_mask { "Generated" } else { "Not generated yet" });
+    let gen_btn = gtk::Button::with_label(if has_mask { "Regenerate" } else { "Generate" });
+    gen_btn.add_css_class("suggested-action");
+    gen_btn.set_valign(gtk::Align::Center);
+    {
+        let sender = sender.clone();
+        gen_btn.connect_clicked(move |_| sender.input(AppMsg::GenerateAiMask(sub_i)));
+    }
+    gen.add_suffix(&gen_btn);
+    group.add(&gen);
+
+    // Depth range (0..100) before grow/feather.
+    if sm.mask_type == "ai-depth" {
+        for (label, key) in [
+            ("Min depth", "minDepth"),
+            ("Max depth", "maxDepth"),
+            ("Min fade", "minFade"),
+            ("Max fade", "maxFade"),
+        ] {
+            ai_param_row(group, mask_i, sub_i, sm, sender, label, key, 0.0, 100.0, 0.0);
+        }
+    }
+
+    ai_param_row(group, mask_i, sub_i, sm, sender, "Grow", "grow", -100.0, 100.0, 0.0);
+    ai_param_row(group, mask_i, sub_i, sm, sender, "Feather", "feather", 0.0, 100.0, 0.0);
+}
+
+/// One AI-refinement SpinRow bound to `sm.parameters[key]` via `SetSubMaskParam`.
+#[allow(clippy::too_many_arguments)]
+fn ai_param_row(
+    group: &adw::PreferencesGroup,
+    mask_i: usize,
+    sub_i: usize,
+    sm: &SubMask,
+    sender: &ComponentSender<AppModel>,
+    label: &str,
+    key: &'static str,
+    min: f64,
+    max: f64,
+    default: f64,
+) {
+    let row = adw::SpinRow::with_range(min, max, 1.0);
+    row.set_title(label);
+    row.set_value(sm.parameters.get(key).and_then(Value::as_f64).unwrap_or(default));
+    let sender = sender.clone();
+    row.connect_changed(move |r| {
+        sender.input(AppMsg::SetSubMaskParam {
+            mask: mask_i,
+            sub: sub_i,
+            key,
+            value: r.value(),
+        });
+    });
+    group.add(&row);
 }
 
 /// Title-case a mask type string for display (e.g. "color" -> "Color").
