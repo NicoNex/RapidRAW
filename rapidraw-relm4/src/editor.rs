@@ -101,6 +101,8 @@ enum MaskGrab {
     RadialResize,
     LinearStart,
     LinearEnd,
+    /// Drag the line body to translate both endpoints together.
+    LinearMove,
 }
 
 /// In-progress mask drag: which grab, the shape at press, and the press point in
@@ -912,11 +914,17 @@ fn hit_mask(view: &View, shapes: &[MaskShape], x: f64, y: f64) -> Option<MaskDra
                 }
             }
             MaskShape::Linear { x1, y1, x2, y2, .. } => {
-                if near(ix + x1 * iw, iy + y1 * ih) {
+                let (sx1, sy1) = (ix + x1 * iw, iy + y1 * ih);
+                let (sx2, sy2) = (ix + x2 * iw, iy + y2 * ih);
+                if near(sx1, sy1) {
                     return Some(MaskDrag { grab: MaskGrab::LinearStart, orig: *shape, press });
                 }
-                if near(ix + x2 * iw, iy + y2 * ih) {
+                if near(sx2, sy2) {
                     return Some(MaskDrag { grab: MaskGrab::LinearEnd, orig: *shape, press });
+                }
+                // Anywhere along the line body: move the whole mask.
+                if point_seg_dist(x, y, sx1, sy1, sx2, sy2) <= HANDLE {
+                    return Some(MaskDrag { grab: MaskGrab::LinearMove, orig: *shape, press });
                 }
             }
         }
@@ -955,9 +963,32 @@ fn apply_mask_drag(md: MaskDrag, cur: (f64, f64)) -> MaskShape {
             x2: cl(cur.0),
             y2: cl(cur.1),
         },
+        (MaskGrab::LinearMove, MaskShape::Linear { sub, x1, y1, x2, y2 }) => {
+            let dx = cur.0 - md.press.0;
+            let dy = cur.1 - md.press.1;
+            MaskShape::Linear {
+                sub,
+                x1: cl(x1 + dx),
+                y1: cl(y1 + dy),
+                x2: cl(x2 + dx),
+                y2: cl(y2 + dy),
+            }
+        }
         // Grab/shape mismatch can't happen (grab derived from the same shape).
         (_, s) => s,
     }
+}
+
+/// Distance (px) from point `(px,py)` to segment `(ax,ay)-(bx,by)`.
+fn point_seg_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f64::EPSILON {
+        return (px - ax).hypot(py - ay);
+    }
+    let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
+    let (cx, cy) = (ax + t * dx, ay + t * dy);
+    (px - cx).hypot(py - cy)
 }
 
 /// Widget point -> normalized image coords (0..1), clamped to the image.
