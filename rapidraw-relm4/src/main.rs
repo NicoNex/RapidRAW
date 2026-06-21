@@ -979,7 +979,7 @@ impl Component for AppModel {
             scopes: Scopes::new(),
             toasts: adw::ToastOverlay::new(), // replaced by the view's overlay below
             render_gen: 0,
-            settings: Settings::default(),
+            settings: load_settings(),
             render_tx,
             thumb_gen: Arc::new(AtomicUsize::new(0)),
             thumb_loaded: Vec::new(),
@@ -2231,6 +2231,7 @@ impl Component for AppModel {
             }
             AppMsg::SettingsChanged(s) => {
                 self.settings = s;
+                save_settings(&s); // persist so the next launch restores them
                 self.canvas.set_background(s.background);
                 // Re-render the preview at the (possibly new) preview size.
                 sender.input(AppMsg::RequestRender);
@@ -2560,6 +2561,31 @@ fn ratings_file() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("rapidraw-relm4").join("ratings.json"))
+}
+
+fn settings_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rapidraw-relm4").join("settings.json"))
+}
+
+/// Load persisted user settings, falling back to defaults.
+fn load_settings() -> Settings {
+    settings_file()
+        .and_then(|f| std::fs::read(f).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(s: &Settings) {
+    let Some(f) = settings_file() else { return };
+    if let Some(dir) = f.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec(s) {
+        let _ = std::fs::write(f, json);
+    }
 }
 
 fn load_ratings() -> HashMap<PathBuf, u8> {
