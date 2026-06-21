@@ -1917,7 +1917,17 @@ impl Component for AppModel {
                     .unwrap_or("RapidRAW");
                 self.win_title.set_title(name);
                 self.win_title.set_subtitle("");
-                widgets.nav.push_by_tag("editor");
+                // Only push the editor page if we're not already on it (opening a
+                // second image from the filmstrip stays in the editor) — pushing a
+                // tag already in the stack is an Adwaita CRITICAL.
+                let in_editor = widgets
+                    .nav
+                    .visible_page()
+                    .and_then(|p| p.tag())
+                    .map_or(false, |t| t == "editor");
+                if !in_editor {
+                    widgets.nav.push_by_tag("editor");
+                }
                 let p = path.clone();
                 spawn_bg(&sender, move || match rapidraw_core::load_base_image(&p) {
                     Ok(img) => CmdMsg::BaseReady(p, img),
