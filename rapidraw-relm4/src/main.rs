@@ -2831,7 +2831,7 @@ impl Component for AppModel {
         &mut self,
         msg: Self::CommandOutput,
         sender: ComponentSender<Self>,
-        _root: &Self::Root,
+        root: &Self::Root,
     ) {
         match msg {
             CmdMsg::ThumbReady(gen, i, rgba) => {
@@ -2933,6 +2933,9 @@ impl Component for AppModel {
                 }
             }
             CmdMsg::ExportDone(Ok(path)) => {
+                // Recover the gl renderer's stale framebuffer after the export's
+                // GPU work (macOS: window goes transparent without this).
+                root.queue_draw();
                 log::info!("export saved: {}", path.display());
                 let name = path
                     .file_name()
@@ -2942,6 +2945,7 @@ impl Component for AppModel {
                     .add_toast(adw::Toast::new(&format!("Saved {name}")));
             }
             CmdMsg::ExportDone(Err(e)) => {
+                root.queue_draw();
                 log::warn!("export failed: {e}");
                 self.toasts
                     .add_toast(adw::Toast::new(&format!("Export failed: {e}")));
@@ -3351,16 +3355,12 @@ fn export_lut(
 fn main() {
     env_logger::init();
 
-    // GTK's GL/Vulkan GSK renderer loses its framebuffer on macOS after the
-    // full-res GPU export (wgpu/Metal contends for the GPU): the window goes
-    // transparent and only damaged regions repaint on hover. The software cairo
-    // renderer has no GPU context to lose, so it's immune.
-    // ponytail: blunt — forces cairo for the whole app, not just post-export.
-    // Override with GSK_RENDERER=ngl/gl/vulkan to trade safety for GPU
-    // compositing; upgrade path is isolating the export GPU work if cairo
-    // preview perf ever becomes the bottleneck.
+    // Use the GPU-accelerated gl renderer. After the full-res GPU export the gl
+    // framebuffer goes stale on macOS (window transparent, regions repaint only
+    // on hover); a full-tree queue_draw() on ExportDone recovers it (see
+    // update_cmd). Override with GSK_RENDERER=cairo for the software fallback.
     if std::env::var_os("GSK_RENDERER").is_none() {
-        std::env::set_var("GSK_RENDERER", "cairo");
+        std::env::set_var("GSK_RENDERER", "gl");
     }
 
     let ctx = rapidraw_core::headless_context().expect("gpu init");
