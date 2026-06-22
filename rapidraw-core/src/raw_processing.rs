@@ -230,6 +230,53 @@ fn develop_internal(
     Ok((dynamic_image, orientation))
 }
 
+/// The camera's embedded preview JPEG (full-size), decoded. Used to match the
+/// in-camera look (auto tone curve). `None` if there's no embedded image.
+/// Orientation is irrelevant — callers only build a global luminance histogram.
+///
+/// rawler wires `preview_image` up for only a few formats (not RW2), so the
+/// reliable path is to scan for the largest embedded JPEG: virtually every RAW
+/// stores a full-res JPEG preview as an `FFD8…FFD9` blob.
+pub fn embedded_preview(path: &std::path::Path) -> Option<DynamicImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let source = RawSource::new_from_slice(&bytes);
+    if let Ok(decoder) = rawler::get_decoder(&source) {
+        let params = RawDecodeParams::default();
+        if let Ok(Some(img)) = decoder.preview_image(&source, &params) {
+            return Some(img);
+        }
+    }
+    largest_embedded_jpeg(&bytes)
+}
+
+/// The largest decodable JPEG (`FFD8…FFD9`) embedded in `bytes` — the camera's
+/// full-res preview for most RAW formats. Validates by decoding (skips garbage
+/// matches in sensor data). ponytail: byte-scan, not format-aware IFD parsing;
+/// good enough since the preview is by far the largest embedded JPEG.
+fn largest_embedded_jpeg(bytes: &[u8]) -> Option<DynamicImage> {
+    let mut blobs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF {
+            if let Some(end) = bytes[i..]
+                .windows(2)
+                .position(|w| w == [0xFF, 0xD9])
+                .map(|p| i + p + 2)
+            {
+                blobs.push((i, end - i));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    blobs.sort_by(|a, b| b.1.cmp(&a.1));
+    blobs
+        .into_iter()
+        .take(4)
+        .find_map(|(off, len)| image::load_from_memory(&bytes[off..off + len]).ok())
+}
+
 pub fn get_fast_demosaic_scale_factor(
     file_bytes: &[u8],
     decoded_width: u32,
@@ -251,4 +298,35 @@ pub fn get_fast_demosaic_scale_factor(
         }
     }
     1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::largest_embedded_jpeg;
+    use image::{DynamicImage, GenericImageView, RgbImage};
+
+    fn jpeg_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, image::Rgb([120, 130, 140])));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn finds_largest_embedded_jpeg() {
+        // junk + small jpeg + junk + big jpeg + junk: the camera preview is the
+        // biggest embedded jpeg, so the largest decodable blob must win.
+        let mut data = vec![0u8; 100];
+        data.extend_from_slice(&jpeg_bytes(8, 8));
+        data.extend_from_slice(&[0xAB; 50]);
+        data.extend_from_slice(&jpeg_bytes(64, 48));
+        data.extend_from_slice(&[0xCD; 30]);
+        let img = largest_embedded_jpeg(&data).expect("should find a jpeg");
+        assert_eq!(img.dimensions(), (64, 48));
+    }
+
+    #[test]
+    fn none_when_no_embedded_jpeg() {
+        assert!(largest_embedded_jpeg(&[0u8; 500]).is_none());
+    }
 }

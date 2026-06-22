@@ -1210,6 +1210,11 @@ impl Point {
             _pad2: 0.0,
         }
     }
+
+    /// `(x, y)` in the 0..255 domain (lets frontends read curves back).
+    pub fn xy(&self) -> (f32, f32) {
+        (self.x, self.y)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]

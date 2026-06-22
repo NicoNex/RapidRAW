@@ -167,6 +167,8 @@ pub struct AdjustPanel {
     /// "Sync from engine state" closures for non-slider widgets (colour-wheel
     /// disc, tone-mapper toggle), for undo/redo + sidecar visual restore.
     sync_hooks: Vec<std::rc::Rc<dyn Fn(&GlobalAdjustments)>>,
+    /// The Luma/RGB curve editor, kept so the auto tone curve can drive it.
+    curves: CurveEditor,
 }
 
 impl AdjustPanel {
@@ -205,7 +207,13 @@ impl AdjustPanel {
             defaults,
             reset_hooks,
             sync_hooks,
+            curves,
         }
+    }
+
+    /// Apply an auto tone curve (luma control points, 0..255) to the Luma curve.
+    pub fn set_luma_curve(&self, pts: Vec<(f64, f64)>) {
+        self.curves.set_luma_curve(pts);
     }
 
     /// Snapshot every slider's current UI value (build order).

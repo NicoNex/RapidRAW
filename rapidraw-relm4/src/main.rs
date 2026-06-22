@@ -163,6 +163,9 @@ enum AppMsg {
     SettingsChanged(Settings),
     /// A tone curve changed: channel + points (x,y in 0..255).
     CurveChanged(Channel, Vec<(f32, f32)>),
+    /// Compute an auto tone curve matching the camera's embedded preview and
+    /// apply it to the Luma curve (the "Auto" button in the Curves section).
+    AutoToneCurve,
     /// Debounced: commit the current adjustment state to the undo history if
     /// `gen` is still current (stale timers no-op).
     CommitHistory(u64),
@@ -480,6 +483,16 @@ enum RenderJob {
         lut: Option<Arc<Lut>>,
         path: PathBuf,
     },
+    /// Compute the auto tone curve: render `base` neutrally (the engine's
+    /// display output, sRGB) as the match source, then histogram-match it to the
+    /// RAW's embedded camera preview. Runs on the render thread because it needs
+    /// the GPU pipeline (the source must be the real pre-curve output, not a raw
+    /// linear develop, or the match is in the wrong domain).
+    AutoCurve {
+        base: Arc<DynamicImage>,
+        path: PathBuf,
+        geom: Geometry,
+    },
 }
 
 #[derive(Debug)]
@@ -491,6 +504,9 @@ enum CmdMsg {
     ThumbReady(usize, usize, RgbaImage),
     /// A worker finished decoding the full base image for the editor.
     BaseReady(PathBuf, DynamicImage),
+    /// A worker computed an auto tone curve (luma control points, 0..255).
+    /// Empty if the RAW has no embedded preview.
+    AutoCurveReady(Vec<(f32, f32)>),
     /// A worker finished a preview render. Carries the RGBA pixels (the gdk
     /// texture is built on the main thread).
     RenderReady(RgbaImage),
@@ -688,6 +704,23 @@ impl AppModel {
         std::thread::spawn(move || sidecar::save(&path, &e));
     }
 
+    /// Compute the auto tone curve (camera-look match) for the current RAW and
+    /// deliver it via `CmdMsg::AutoCurveReady`. Dispatched to the render thread
+    /// (it needs the GPU pipeline to produce the neutral source). No-op without
+    /// an open image.
+    fn spawn_auto_curve(&self) {
+        let (Some(path), Some(base)) =
+            (self.session.active_path.clone(), self.session.base_image.clone())
+        else {
+            return;
+        };
+        let _ = self.render_tx.send(RenderJob::AutoCurve {
+            base,
+            path,
+            geom: self.geom,
+        });
+    }
+
     /// Reset every edit (adjustments, curves, masks, LUT, crop/geometry) to
     /// defaults, in place (no panel rebuild). Shared by opening a new image and
     /// the Reset button. Does not render or record history — the caller does.
@@ -704,8 +737,9 @@ impl AppModel {
         self.selected_mask = None;
         self.masks_panel.rebuild(&self.session.masks, None, sender);
         self.panel.reset();
-        // Crop panel is small; rebuild so its toggles/straighten reset.
-        let fresh = crop::CropPanel::new(sender);
+        // Crop panel is small; rebuild so its toggles/straighten reset. geom was
+        // just set to default above, so this seeds it to defaults.
+        let fresh = crop::CropPanel::new(sender, self.geom);
         self.content_stack.remove(self.crop.root());
         self.content_stack.add_named(fresh.root(), Some("crop"));
         self.crop = fresh;
@@ -960,6 +994,31 @@ fn spawn_render_worker(
                     RenderJob::ExportLut { adj, lut, path } => {
                         let res = export_lut(&ctx, &adj, lut, &path).map(|()| path);
                         let _ = cmd.send(CmdMsg::ExportDone(res));
+                    }
+                    RenderJob::AutoCurve { base, path, geom } => {
+                        // Source = the engine's neutral display output (sRGB), so
+                        // the match is in the same space the luma curve applies.
+                        let base = apply_geometry(&base, geom);
+                        // Match the app's neutral (init_defaults seeds a few
+                        // non-zero defaults) so the source equals the real
+                        // pre-curve preview, not a bare zeroed struct.
+                        let mut neutral =
+                            rapidraw_core::image_processing::AllAdjustments::default();
+                        controls::init_defaults(&mut neutral.global);
+                        let pts = rapidraw_core::render(
+                            &ctx,
+                            &base,
+                            &neutral,
+                            &[],
+                            None,
+                            Some(1024),
+                            Some(&rapidraw_core::ai::ai_sub_mask_resolver),
+                        )
+                        .ok()
+                        .zip(rapidraw_core::embedded_preview(&path))
+                        .map(|(src, target)| rapidraw_core::auto_tone_curve(&src, &target))
+                        .unwrap_or_default();
+                        let _ = cmd.send(CmdMsg::AutoCurveReady(pts));
                     }
                 }
             }
@@ -1266,7 +1325,7 @@ impl Component for AppModel {
             last_folder: load_last_folder(),
             roots: load_roots(),
             geom: Geometry::default(),
-            crop: crop::CropPanel::new(&sender),
+            crop: crop::CropPanel::new(&sender, Geometry::default()),
             masks_panel: MasksPanel::new(&sender),
             selected_mask: None,
             brush_size: 50.0,
@@ -1771,7 +1830,7 @@ impl Component for AppModel {
                 self.crop_aspect = 0.0;
                 self.canvas.reset_crop();
                 // Rebuild the crop panel so its toggles/sliders reflect the reset.
-                let fresh = crop::CropPanel::new(&sender);
+                let fresh = crop::CropPanel::new(&sender, self.geom);
                 self.content_stack.remove(self.crop.root());
                 self.content_stack.add_named(fresh.root(), Some("crop"));
                 self.crop = fresh;
@@ -1784,6 +1843,9 @@ impl Component for AppModel {
                 self.reset_edits(&sender);
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::AutoToneCurve => {
+                self.spawn_auto_curve();
             }
             AppMsg::ShowAdjustPanel => {
                 self.content_stack.set_visible_child_name("adjust");
@@ -2875,6 +2937,15 @@ impl Component for AppModel {
                 let tex = library::texture_from_rgba(&rgba);
                 self.thumbs.send(i, ThumbMsg::SetTexture(tex));
             }
+            CmdMsg::AutoCurveReady(pts) => {
+                // <2 points = no embedded preview / no tonal range: leave as-is.
+                if pts.len() >= 2 {
+                    let pts: Vec<(f64, f64)> =
+                        pts.iter().map(|&(x, y)| (x as f64, y as f64)).collect();
+                    // set_luma_curve emits CurveChanged → engine + history + render.
+                    self.panel.set_luma_curve(pts);
+                }
+            }
             CmdMsg::BaseReady(path, img) => {
                 let (w, h) = img.dimensions();
                 log::info!("base image ready: {} ({w}x{h})", path.display());
@@ -2882,8 +2953,10 @@ impl Component for AppModel {
                 // just fill the EXIF subtitle and apply any saved edits.
                 self.win_title
                     .set_subtitle(&meta::read_summary(&path).unwrap_or_default());
+                let mut applied_sidecar = false;
                 if !self.settings.reset_on_open {
                     if let Some(e) = sidecar::load(&path) {
+                        applied_sidecar = true;
                         if e.global.len() == std::mem::size_of::<GlobalAdjustments>() {
                             // pod_read_unaligned: the JSON-decoded Vec<u8> has no
                             // alignment guarantee, unlike `from_bytes`.
@@ -2910,6 +2983,13 @@ impl Component for AppModel {
                         self.session.masks = e.masks;
                         self.selected_mask = None;
                         self.masks_panel.rebuild(&self.session.masks, None, &sender);
+                        // Reseed the crop panel (built with defaults in
+                        // OpenInEditor, before geom was known) so its flip
+                        // toggles / straighten reflect the restored geometry.
+                        let fresh = crop::CropPanel::new(&sender, self.geom);
+                        self.content_stack.remove(self.crop.root());
+                        self.content_stack.add_named(fresh.root(), Some("crop"));
+                        self.crop = fresh;
                     }
                 }
                 // Show the un-adjusted base immediately. We're on the GTK main
@@ -2936,6 +3016,11 @@ impl Component for AppModel {
                     masks: self.session.masks.clone(),
                 }];
                 self.hist_idx = 0;
+                // RawTherapee-style: on a fresh RAW (no saved edits) set the
+                // auto tone curve to match the camera's embedded preview.
+                if !applied_sidecar && rapidraw_core::formats::is_raw_file(&path) {
+                    self.spawn_auto_curve();
+                }
                 // Kick an initial engine render so the preview reflects the
                 // current adjustment stack (Phase 9).
                 sender.input(AppMsg::RequestRender);

@@ -156,17 +156,31 @@ thread_local! {
 
 pub struct CurveEditor {
     root: gtk::Box,
+    /// Set the Luma channel's manual points (0..255), switch to Point mode,
+    /// redraw and emit. Drives the auto tone curve.
+    set_luma: LumaSetter,
 }
 
 /// Sink for curve changes: `(channel, points 0..255)`. Lets the same editor
 /// drive the global adjustments or a specific mask's `curves` JSON.
 type Sink = Rc<dyn Fn(Channel, Vec<(f32, f32)>)>;
+/// Programmatic Luma-curve setter (auto tone curve).
+type LumaSetter = Rc<dyn Fn(Vec<(f64, f64)>)>;
 
 impl CurveEditor {
     pub fn new(sender: &ComponentSender<crate::AppModel>, vadj: &gtk::Adjustment) -> Self {
         let s = sender.clone();
         let sink: Sink = Rc::new(move |ch, pts| s.input(crate::AppMsg::CurveChanged(ch, pts)));
-        Self::build(vadj, None, sink, true)
+        let s2 = sender.clone();
+        let on_auto: Option<Rc<dyn Fn()>> =
+            Some(Rc::new(move || s2.input(crate::AppMsg::AutoToneCurve)));
+        Self::build(vadj, None, sink, true, on_auto)
+    }
+
+    /// Set the Luma curve to `pts` (0..255), reflecting it in the widget and the
+    /// engine. Used by the auto tone curve.
+    pub fn set_luma_curve(&self, pts: Vec<(f64, f64)>) {
+        (self.set_luma)(pts);
     }
 
     /// Per-mask editor: seeded from stored points and emitting via `sink`.
@@ -176,7 +190,7 @@ impl CurveEditor {
         seed: [Vec<(f64, f64)>; 4],
         sink: impl Fn(Channel, Vec<(f32, f32)>) + 'static,
     ) -> Self {
-        Self::build(vadj, Some(seed), Rc::new(sink), false)
+        Self::build(vadj, Some(seed), Rc::new(sink), false, None)
     }
 
     fn build(
@@ -184,6 +198,7 @@ impl CurveEditor {
         seed: Option<[Vec<(f64, f64)>; 4]>,
         sink: Sink,
         allow_reset: bool,
+        on_auto: Option<Rc<dyn Fn()>>,
     ) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
 
@@ -196,6 +211,9 @@ impl CurveEditor {
         let dragging = Rc::new(Cell::new(None::<usize>));
         // false = manual point curve, true = parametric region sliders.
         let parametric = Rc::new(Cell::new(false));
+        // Set while restoring the editor from engine state (sidecar reopen /
+        // undo) so forcing Point mode doesn't emit a spurious curve change.
+        let suppress_emit = Rc::new(Cell::new(false));
 
         let area = gtk::DrawingArea::new();
         area.set_content_width(SIZE);
@@ -339,6 +357,7 @@ impl CurveEditor {
             let state = state.clone();
             let active = active.clone();
             let sink = sink.clone();
+            let suppress_emit = suppress_emit.clone();
             param_btn.connect_toggled(move |b| {
                 let on = b.is_active();
                 parametric.set(on);
@@ -346,7 +365,9 @@ impl CurveEditor {
                 if on {
                     reload();
                 }
-                emit_active(&sink, &state, active.get(), on);
+                if !suppress_emit.get() {
+                    emit_active(&sink, &state, active.get(), on);
+                }
                 area.queue_draw();
             });
         }
@@ -364,6 +385,18 @@ impl CurveEditor {
         tools.append(&copy_btn);
         tools.append(&paste_btn);
         root.append(&tools);
+
+        // Auto tone curve (match the camera's embedded JPEG). Its own labelled
+        // row — a lone text button wedged between the copy/paste icons reads as
+        // an afterthought. Global editor only. `pill` gives it adwaita weight.
+        if let Some(on_auto) = on_auto {
+            let auto_btn = gtk::Button::with_label("Auto");
+            auto_btn.add_css_class("pill");
+            auto_btn.set_halign(gtk::Align::Center);
+            auto_btn.set_tooltip_text(Some("Auto tone curve: match the camera's embedded preview"));
+            auto_btn.connect_clicked(move |_| on_auto());
+            root.append(&auto_btn);
+        }
         {
             let state = state.clone();
             let active = active.clone();
@@ -539,9 +572,69 @@ impl CurveEditor {
             }));
         }
 
+        // Sync hook: restore the editor from the engine's stored curves on
+        // sidecar reopen / undo. Without it the image renders with the curve but
+        // the editor stays at default until touched. Resolved points are read
+        // back as manual points (parametric state isn't persisted; the curve
+        // shape is identical).
+        if allow_reset {
+            let state = state.clone();
+            let area = area.clone();
+            let point_btn = point_btn.clone();
+            let suppress_emit = suppress_emit.clone();
+            crate::slider::register_sync(Rc::new(
+                move |g: &rapidraw_core::image_processing::GlobalAdjustments| {
+                    {
+                        let mut st = state.borrow_mut();
+                        let curves = [
+                            (Channel::Luma, &g.luma_curve[..], g.luma_curve_count),
+                            (Channel::Red, &g.red_curve[..], g.red_curve_count),
+                            (Channel::Green, &g.green_curve[..], g.green_curve_count),
+                            (Channel::Blue, &g.blue_curve[..], g.blue_curve_count),
+                        ];
+                        for (ch, arr, count) in curves {
+                            *st.points_mut(ch) = if count >= 2 {
+                                arr.iter()
+                                    .take(count as usize)
+                                    .map(|p| {
+                                        let (x, y) = p.xy();
+                                        (x as f64, y as f64)
+                                    })
+                                    .collect()
+                            } else {
+                                vec![(0.0, 0.0), (255.0, 255.0)] // identity
+                            };
+                        }
+                    }
+                    // Force Point mode to show the restored points, without
+                    // emitting (restoring, not editing).
+                    suppress_emit.set(true);
+                    point_btn.set_active(true);
+                    suppress_emit.set(false);
+                    area.queue_draw();
+                },
+            ));
+        }
+
         root.append(&area);
         root.append(&param_box);
-        Self { root }
+
+        // Programmatic Luma setter for the auto tone curve: store manual points,
+        // force Point mode, redraw, emit to the engine.
+        let set_luma: LumaSetter = {
+            let state = state.clone();
+            let area = area.clone();
+            let sink = sink.clone();
+            let point_btn = point_btn.clone();
+            Rc::new(move |pts: Vec<(f64, f64)>| {
+                *state.borrow_mut().points_mut(Channel::Luma) = pts;
+                point_btn.set_active(true); // Point mode (manual points, not parametric)
+                area.queue_draw();
+                emit(&sink, &state, Channel::Luma);
+            })
+        };
+
+        Self { root, set_luma }
     }
 
     pub fn root(&self) -> &gtk::Box {
