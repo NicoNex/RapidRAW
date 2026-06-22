@@ -3355,12 +3355,14 @@ fn export_lut(
 fn main() {
     env_logger::init();
 
-    // Use the GPU-accelerated gl renderer. After the full-res GPU export the gl
-    // framebuffer goes stale on macOS (window transparent, regions repaint only
-    // on hover); a full-tree queue_draw() on ExportDone recovers it (see
-    // update_cmd). Override with GSK_RENDERER=cairo for the software fallback.
+    // Pick the GTK GSK renderer before GTK initialises the display. Per-platform
+    // default (macOS GL, Linux Vulkan) unless the user overrode it in Settings;
+    // an explicit GSK_RENDERER env var still wins over both. On the gl renderer
+    // the macOS framebuffer can go stale after a full-res GPU export (window
+    // transparent, regions repaint only on hover); a full-tree queue_draw() on
+    // ExportDone recovers it (see update_cmd).
     if std::env::var_os("GSK_RENDERER").is_none() {
-        std::env::set_var("GSK_RENDERER", "gl");
+        std::env::set_var("GSK_RENDERER", load_settings().renderer.gsk_value());
     }
 
     let ctx = rapidraw_core::headless_context().expect("gpu init");
