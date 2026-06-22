@@ -188,8 +188,8 @@ impl AdjustPanel {
 
         crate::slider::reg_begin();
         let curves = CurveEditor::new(sender, &vadj);
-        list.append(&card(&expander("Curves", curves.root(), true)));
         list.append(&card(&build_basic(sender, &vadj)));
+        list.append(&card(&expander("Curves", curves.root(), true)));
         list.append(&card(&build_color(sender, &vadj)));
         list.append(&card(&section("Details", DETAILS, sender, &vadj)));
         list.append(&card(&section("Effects", EFFECTS, sender, &vadj)));

@@ -192,6 +192,8 @@ enum AppMsg {
     Straighten(f32),
     CropSwapOrient,
     CropReset,
+    /// Reset every edit (adjustments, curves, masks, LUT, crop) to defaults.
+    ResetAll,
     /// Right-rail switcher: show the adjustments panel / the crop panel.
     ShowAdjustPanel,
     ShowCropPanel,
@@ -678,7 +680,38 @@ impl AppModel {
                 .map(|p| p.to_string_lossy().into_owned()),
             masks: self.session.masks.clone(),
         };
-        sidecar::save(&path, &e);
+        // Build the snapshot synchronously (captures current state), but write to
+        // disk off the main thread: this runs on every photo-open / library-return
+        // / history step, and a synchronous write hitched those transitions.
+        // ponytail: detached thread, last-writer-wins. Human-paced switching won't
+        // race meaningfully; add a per-path serial queue only if it ever does.
+        std::thread::spawn(move || sidecar::save(&path, &e));
+    }
+
+    /// Reset every edit (adjustments, curves, masks, LUT, crop/geometry) to
+    /// defaults, in place (no panel rebuild). Shared by opening a new image and
+    /// the Reset button. Does not render or record history — the caller does.
+    fn reset_edits(&mut self, sender: &ComponentSender<AppModel>) {
+        self.geom = Geometry::default();
+        self.crop_aspect = 0.0;
+        self.crop_active = false;
+        self.canvas.reset_crop();
+        self.session.adjustments = Default::default();
+        controls::init_defaults(&mut self.session.adjustments.global);
+        self.session.lut = None;
+        self.lut_path = None;
+        self.session.masks.clear();
+        self.selected_mask = None;
+        self.masks_panel.rebuild(&self.session.masks, None, sender);
+        self.panel.reset();
+        // Crop panel is small; rebuild so its toggles/straighten reset.
+        let fresh = crop::CropPanel::new(sender);
+        self.content_stack.remove(self.crop.root());
+        self.content_stack.add_named(fresh.root(), Some("crop"));
+        self.crop = fresh;
+        self.content_stack.set_visible_child_name("adjust");
+        // Reset the tab switcher to Edit.
+        self.edit_btn.set_active(true);
     }
 
     /// Push the selected mask's drawable shapes to the canvas overlay (only while
@@ -1134,6 +1167,11 @@ impl Component for AppModel {
                                         set_icon_name: "edit-paste-symbolic",
                                         set_tooltip_text: Some("Paste settings"),
                                         connect_clicked => AppMsg::PasteSettings,
+                                    },
+                                    gtk::Button {
+                                        set_icon_name: "edit-clear-all-symbolic",
+                                        set_tooltip_text: Some("Reset all adjustments"),
+                                        connect_clicked => AppMsg::ResetAll,
                                     },
                                     gtk::Button {
                                         set_icon_name: "view-fullscreen-symbolic",
@@ -1742,6 +1780,11 @@ impl Component for AppModel {
                 }
                 sender.input(AppMsg::RequestRender);
             }
+            AppMsg::ResetAll => {
+                self.reset_edits(&sender);
+                self.schedule_history(&sender);
+                sender.input(AppMsg::RequestRender);
+            }
             AppMsg::ShowAdjustPanel => {
                 self.content_stack.set_visible_child_name("adjust");
                 // Scopes show in Edit (hidden in Crop, like the reference).
@@ -2331,31 +2374,10 @@ impl Component for AppModel {
                 self.canvas.clear();
                 self.last_tex = None;
                 self.original_tex = None;
-                // Reset all controls to defaults *now* (in place, no rebuild) so
-                // the previous photo's slider/curve/wheel state isn't shown while
-                // the new image decodes. Saved edits (if any) are applied in
-                // BaseReady, after decode. Cheap → opening stays fluid.
-                self.geom = Geometry::default();
-                self.crop_aspect = 0.0;
-                self.crop_active = false;
-                self.canvas.reset_crop();
-                self.session.adjustments = Default::default();
-                controls::init_defaults(&mut self.session.adjustments.global);
-                self.session.lut = None;
-                self.lut_path = None;
-                self.session.masks.clear();
-                self.selected_mask = None;
-                self.masks_panel.rebuild(&self.session.masks, None, &sender);
-                self.panel.reset();
-                // Crop panel is small; rebuild so its toggles/straighten reset.
-                let fresh = crop::CropPanel::new(&sender);
-                self.content_stack.remove(self.crop.root());
-                self.content_stack.add_named(fresh.root(), Some("crop"));
-                self.crop = fresh;
-                self.content_stack.set_visible_child_name("adjust");
-                // Reset the tab switcher to Edit (opening from another tab, e.g.
-                // Masks, must not leave that button highlighted).
-                self.edit_btn.set_active(true);
+                // Reset all controls to defaults *now* (in place) so the previous
+                // photo's state isn't shown while the new image decodes. Saved
+                // edits (if any) are applied in BaseReady, after decode.
+                self.reset_edits(&sender);
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
