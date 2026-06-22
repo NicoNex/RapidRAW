@@ -124,6 +124,11 @@ fn build(
     let area = gtk::DrawingArea::new();
     area.set_content_width(DISC);
     area.set_content_height(DISC);
+    // Centre the disc in the column: the lum slider below is wider, so the box
+    // is wider than DISC; without this the area fills and draw_wheel paints the
+    // wheel left-aligned while the title label centres, so the label sits off to
+    // the side of the wheel.
+    area.set_halign(gtk::Align::Center);
     {
         let handle = handle.clone();
         area.set_draw_func(move |_, cr, w, h| draw_wheel(cr, w, h, handle.get()));
