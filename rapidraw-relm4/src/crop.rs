@@ -7,7 +7,7 @@
 use gtk::prelude::*;
 use relm4::{ComponentSender, RelmWidgetExt};
 
-use crate::{AppModel, AppMsg};
+use crate::{AppModel, AppMsg, Geometry};
 
 /// Aspect presets: (label, ratio w/h; 0 = free, -1 = original/native).
 const ASPECTS: &[(&str, f32)] = &[
@@ -27,7 +27,9 @@ pub struct CropPanel {
 }
 
 impl CropPanel {
-    pub fn new(sender: &ComponentSender<AppModel>) -> Self {
+    /// `geom` seeds the flip toggles and straighten angle so a reopened image
+    /// (restored from its sidecar) shows its real geometry, not defaults.
+    pub fn new(sender: &ComponentSender<AppModel>, geom: Geometry) -> Self {
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         list.set_margin_all(10);
 
@@ -73,6 +75,9 @@ impl CropPanel {
         let flip_v = gtk::ToggleButton::new();
         flip_v.set_icon_name("object-flip-vertical-symbolic");
         flip_v.set_tooltip_text(Some("Flip vertical"));
+        // Seed from geom before wiring handlers, so set_active doesn't emit.
+        flip_h.set_active(geom.flip_h);
+        flip_v.set_active(geom.flip_v);
         {
             let sender = sender.clone();
             rot_ccw.connect_clicked(move |_| sender.input(AppMsg::RotateCcw));
@@ -104,7 +109,7 @@ impl CropPanel {
         {
             let sender = sender.clone();
             let s = crate::slider::slider(
-                "Angle", -45.0, 45.0, 0.1, 0.0, crate::slider::Track::Plain, &vadj,
+                "Angle", -45.0, 45.0, 0.1, geom.straighten as f64, crate::slider::Track::Plain, &vadj,
                 move |v| sender.input(AppMsg::Straighten(v as f32)),
             );
             list.append(&s);
