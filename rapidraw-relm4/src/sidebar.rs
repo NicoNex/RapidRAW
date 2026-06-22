@@ -51,8 +51,13 @@ impl Component for Sidebar {
         // ToolbarView + empty HeaderBar so the start-side window controls
         // (macOS traffic lights) get reserved space instead of overlapping
         // the search entry. Matches the header bars on the right panels.
+        // Only macOS puts its controls here (left edge); elsewhere the controls
+        // live on the right panel, so showing them here too would draw a stray
+        // close button mid-window.
         adw::ToolbarView {
             add_top_bar = &adw::HeaderBar {
+                set_show_start_title_buttons: cfg!(target_os = "macos"),
+                set_show_end_title_buttons: false,
                 #[wrap(Some)]
                 set_title_widget = &gtk::Box {},
             },

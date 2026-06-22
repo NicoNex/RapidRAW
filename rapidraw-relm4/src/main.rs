@@ -998,6 +998,9 @@ impl Component for AppModel {
                         #[wrap(Some)]
                         set_child = &adw::ToolbarView {
                             add_top_bar = &adw::HeaderBar {
+                                // macOS controls live on the left sidebar header;
+                                // here only the right-side controls (Linux close).
+                                set_show_start_title_buttons: false,
                                 #[name = "sidebar_toggle_lib"]
                                 pack_start = &gtk::ToggleButton {
                                     set_icon_name: "sidebar-show-symbolic",
@@ -1074,6 +1077,9 @@ impl Component for AppModel {
                         #[wrap(Some)]
                         set_child = &adw::ToolbarView {
                             add_top_bar = &adw::HeaderBar {
+                                // macOS controls live on the left sidebar header;
+                                // here only the right-side controls (Linux close).
+                                set_show_start_title_buttons: false,
                                 #[wrap(Some)]
                                 #[name = "win_title"]
                                 set_title_widget = &adw::WindowTitle {
