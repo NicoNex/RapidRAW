@@ -11,6 +11,7 @@ use relm4::prelude::*;
 pub enum SidebarOut {
     SelectFolder(PathBuf),
     AddRootFolder,
+    RemoveRootFolder(PathBuf),
     SelectAlbum(Vec<String>),
     NewAlbum(String),
     RenameAlbum { id: String, name: String },
@@ -47,7 +48,16 @@ impl Component for Sidebar {
     type CommandOutput = ();
 
     view! {
-        gtk::Box {
+        // ToolbarView + empty HeaderBar so the start-side window controls
+        // (macOS traffic lights) get reserved space instead of overlapping
+        // the search entry. Matches the header bars on the right panels.
+        adw::ToolbarView {
+            add_top_bar = &adw::HeaderBar {
+                #[wrap(Some)]
+                set_title_widget = &gtk::Box {},
+            },
+            #[wrap(Some)]
+            set_content = &gtk::Box {
             set_orientation: gtk::Orientation::Vertical,
             set_spacing: 6,
             set_margin_all: 6,
@@ -69,6 +79,9 @@ impl Component for Sidebar {
             gtk::ScrolledWindow {
                 set_vexpand: true,
                 set_hscrollbar_policy: gtk::PolicyType::Never,
+                // Non-overlay: scrollbar takes its own gutter so it never floats
+                // over the row's remove button at the right edge.
+                set_overlay_scrolling: false,
                 #[local_ref]
                 folders_box -> gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
@@ -109,11 +122,15 @@ impl Component for Sidebar {
             gtk::ScrolledWindow {
                 set_vexpand: true,
                 set_hscrollbar_policy: gtk::PolicyType::Never,
+                // Non-overlay: scrollbar takes its own gutter so it never floats
+                // over the row's remove button at the right edge.
+                set_overlay_scrolling: false,
                 #[local_ref]
                 albums_box -> gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
                     set_spacing: 2,
                 },
+            },
             },
         }
     }
@@ -254,6 +271,23 @@ impl Sidebar {
         let p = path.clone();
         btn.connect_clicked(move |_| s.input(SidebarIn::SelectFolder(p.clone())));
         row.append(&btn);
+
+        // Root rows (depth 0) get a remove button: un-lists the folder (does
+        // not touch files on disk), so no confirmation needed.
+        if depth == 0 {
+            let remove = gtk::Button::builder()
+                .icon_name("list-remove-symbolic")
+                .css_classes(["flat", "circular"])
+                .tooltip_text("Remove folder from sidebar (does not delete files)")
+                .valign(gtk::Align::Center)
+                .build();
+            let s = sender.clone();
+            let p = path.clone();
+            remove.connect_clicked(move |_| {
+                let _ = s.output(SidebarOut::RemoveRootFolder(p.clone()));
+            });
+            row.append(&remove);
+        }
 
         self.folders_box.append(&row);
     }

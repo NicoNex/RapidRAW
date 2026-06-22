@@ -49,7 +49,7 @@ use thumb::{Thumb, ThumbMsg, ThumbOut};
 /// each render cheap, so a short debounce keeps the preview responsive.
 const RENDER_DEBOUNCE_MS: u64 = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExportFormat {
     Jpeg,
     Png,
@@ -80,7 +80,7 @@ impl ExportFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResizeMode {
     LongEdge,
     Width,
@@ -88,20 +88,26 @@ pub enum ResizeMode {
 }
 
 /// Resize on export: target `value` px for `mode`, optionally never upscaling.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Resize {
     pub mode: ResizeMode,
     pub value: u32,
     pub dont_enlarge: bool,
 }
 
-/// Output options for export.
-#[derive(Debug, Clone, Copy)]
+/// Output options for export (the last-used set is persisted in `Settings`).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ExportOpts {
     pub format: ExportFormat,
     /// JPEG quality 1..=100 (ignored for PNG/TIFF).
     pub quality: u8,
     pub resize: Option<Resize>,
+}
+
+impl Default for ExportOpts {
+    fn default() -> Self {
+        Self { format: ExportFormat::Jpeg, quality: 90, resize: None }
+    }
 }
 
 /// A slider change: a setter that writes one `GlobalAdjustments` field plus the
@@ -123,6 +129,8 @@ impl std::fmt::Debug for Adjust {
 enum AppMsg {
     OpenFolderDialog,
     FolderChosen(PathBuf),
+    /// Remove a root folder from the sidebar (un-list only; files untouched).
+    RemoveRoot(PathBuf),
     OpenInEditor(PathBuf),
     /// A slider moved: write the value into the adjustment stack.
     Adjust(Adjust),
@@ -1165,6 +1173,7 @@ impl Component for AppModel {
             .forward(sender.input_sender(), |out| match out {
                 SidebarOut::SelectFolder(p) => AppMsg::ShowFolder(p),
                 SidebarOut::AddRootFolder => AppMsg::OpenFolderDialog,
+                SidebarOut::RemoveRootFolder(p) => AppMsg::RemoveRoot(p),
                 SidebarOut::SelectAlbum(images) => AppMsg::ShowAlbum(images),
                 SidebarOut::NewAlbum(name) => AppMsg::AlbumNew(name),
                 SidebarOut::RenameAlbum { id, name } => AppMsg::AlbumRename { id, name },
@@ -1177,6 +1186,7 @@ impl Component for AppModel {
                 StarsOut::Changed(n) => AppMsg::RateActive(n),
             });
 
+        let loaded = load_settings();
         let model = AppModel {
             session: Session::default(),
             images: Vec::new(),
@@ -1189,7 +1199,7 @@ impl Component for AppModel {
             scopes: Scopes::new(),
             toasts: adw::ToastOverlay::new(), // replaced by the view's overlay below
             render_gen: 0,
-            settings: load_settings(),
+            settings: loaded,
             render_tx,
             thumb_gen: Arc::new(AtomicUsize::new(0)),
             thumb_loaded: Vec::new(),
@@ -1206,8 +1216,8 @@ impl Component for AppModel {
             last_rgba: None,
             win_title: adw::WindowTitle::new("RapidRAW", ""),
             all_images: Vec::new(),
-            raw_filter: library::RawFilter::All,
-            sort_by: library::SortBy::Name,
+            raw_filter: loaded.raw_filter,
+            sort_by: loaded.sort_by,
             search: String::new(),
             last_folder: load_last_folder(),
             roots: load_roots(),
@@ -1328,6 +1338,24 @@ impl Component for AppModel {
         s_sec.append(Some("Rating"), Some("app.sort::rating"));
         fs_menu.append_section(Some("Sort"), &s_sec);
         widgets.filter_menu.set_menu_model(Some(&fs_menu));
+
+        // Reflect the persisted filter/sort in the menu radios, and apply the
+        // persisted editor background to the canvas (load only set the field).
+        let filter_key = match model.raw_filter {
+            library::RawFilter::RawOnly => "raw",
+            library::RawFilter::NonRawOnly => "nonraw",
+            library::RawFilter::PreferRaw => "prefer",
+            library::RawFilter::All => "all",
+        };
+        let sort_key = match model.sort_by {
+            library::SortBy::DateNewest => "new",
+            library::SortBy::DateOldest => "old",
+            library::SortBy::RatingDesc => "rating",
+            library::SortBy::Name => "name",
+        };
+        act_filter.set_state(&gtk::glib::Variant::from(filter_key));
+        act_sort.set_state(&gtk::glib::Variant::from(sort_key));
+        model.canvas.set_background(model.settings.background);
 
         // Search: a SearchEntry in the drop-down SearchBar, toggled by the header
         // search button (GNOME/Nautilus pattern). Entry is wide/centred.
@@ -1621,6 +1649,11 @@ impl Component for AppModel {
                 widgets.sidebar_toggle_ed.set_active(true);
                 self.apply_library(&sender);
             }
+            AppMsg::RemoveRoot(path) => {
+                self.roots.retain(|r| r != &path);
+                save_roots(&self.roots);
+                self.sidebar.emit(SidebarIn::SetRoots(self.roots.clone()));
+            }
             AppMsg::ContinueSession => {
                 // Re-show every previously added root, not just the last one. Opening the
                 // folder for the grid (FolderChosen) re-emits the full root list.
@@ -1632,13 +1665,21 @@ impl Component for AppModel {
             AppMsg::ShowFolder(dir) => {
                 self.all_images = library::scan_dir(&dir);
                 self.apply_library(&sender);
+                widgets.lib_stack.set_visible_child_name("grid");
+                // If we're on the editor page (folder clicked mid-edit), return
+                // to the library so the new folder's thumbnails are visible.
+                widgets.nav.pop_to_tag("library");
             }
             AppMsg::FilterChanged(f) => {
                 self.raw_filter = f;
+                self.settings.raw_filter = f;
+                save_settings(&self.settings);
                 self.apply_library(&sender);
             }
             AppMsg::SortChanged(s) => {
                 self.sort_by = s;
+                self.settings.sort_by = s;
+                save_settings(&self.settings);
                 self.apply_library(&sender);
             }
             AppMsg::SearchChanged(q) => {
@@ -2422,6 +2463,29 @@ impl Component for AppModel {
                 resize.set_value(2048.0);
                 let dont_enlarge = gtk::CheckButton::with_label("Don't enlarge");
                 dont_enlarge.set_active(true);
+
+                // Restore the last-used export options (set before the update
+                // closures fire so visibility matches the restored format).
+                let last = self.settings.last_export;
+                fmt.set_selected(match last.format {
+                    ExportFormat::Png => 1,
+                    ExportFormat::Tiff => 2,
+                    ExportFormat::Webp => 3,
+                    ExportFormat::Jxl => 4,
+                    ExportFormat::Avif => 5,
+                    ExportFormat::CubeLut => 6,
+                    ExportFormat::Jpeg => 0,
+                });
+                q.set_value(last.quality as f64);
+                if let Some(r) = last.resize {
+                    resize_mode.set_selected(match r.mode {
+                        ResizeMode::LongEdge => 1,
+                        ResizeMode::Width => 2,
+                        ResizeMode::Height => 3,
+                    });
+                    resize.set_value(r.value as f64);
+                    dont_enlarge.set_active(r.dont_enlarge);
+                }
                 let rrow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 rrow.append(&gtk::Label::new(Some("Resize")));
                 rrow.append(&resize_mode);
@@ -2503,6 +2567,9 @@ impl Component for AppModel {
                 win.present();
             }
             AppMsg::ExportConfigured(opts) => {
+                // Persist as the last-used export options.
+                self.settings.last_export = opts;
+                save_settings(&self.settings);
                 let ext = opts.format.ext();
                 let suggested = self
                     .session
@@ -3283,6 +3350,18 @@ fn export_lut(
 
 fn main() {
     env_logger::init();
+
+    // GTK's GL/Vulkan GSK renderer loses its framebuffer on macOS after the
+    // full-res GPU export (wgpu/Metal contends for the GPU): the window goes
+    // transparent and only damaged regions repaint on hover. The software cairo
+    // renderer has no GPU context to lose, so it's immune.
+    // ponytail: blunt — forces cairo for the whole app, not just post-export.
+    // Override with GSK_RENDERER=ngl/gl/vulkan to trade safety for GPU
+    // compositing; upgrade path is isolating the export GPU work if cairo
+    // preview perf ever becomes the bottleneck.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        std::env::set_var("GSK_RENDERER", "cairo");
+    }
 
     let ctx = rapidraw_core::headless_context().expect("gpu init");
     let engine = Engine { ctx: Arc::new(ctx) };

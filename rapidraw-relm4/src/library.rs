@@ -6,7 +6,7 @@ use image::RgbaImage;
 pub use rapidraw_core::formats::{is_raw_file as is_raw, is_supported_image_file};
 
 /// Library raw-status filter, mirroring the original `RawStatus`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum RawFilter {
     All,
     RawOnly,
@@ -16,7 +16,7 @@ pub enum RawFilter {
 }
 
 /// Library sort order.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SortBy {
     Name,
     DateNewest,

@@ -176,6 +176,9 @@ impl AdjustPanel {
 
         let root = gtk::ScrolledWindow::new();
         root.set_hscrollbar_policy(gtk::PolicyType::Never);
+        // Non-overlay so the scrollbar gets its own gutter instead of floating
+        // over the curve's right edge / control points (overlay blocks clicks).
+        root.set_overlay_scrolling(false);
         root.set_child(Some(&list));
         root.set_hexpand(false);
         root.set_vexpand(true);

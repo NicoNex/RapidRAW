@@ -25,6 +25,12 @@ pub struct Settings {
     pub background: Background,
     /// Reset adjustments to defaults when opening a new image.
     pub reset_on_open: bool,
+    /// Library raw-status filter (persisted, like the Tauri app).
+    pub raw_filter: crate::library::RawFilter,
+    /// Library sort order (persisted, like the Tauri app).
+    pub sort_by: crate::library::SortBy,
+    /// Last-used export options (format/quality/resize), restored in the dialog.
+    pub last_export: crate::ExportOpts,
 }
 
 impl Default for Settings {
@@ -36,6 +42,9 @@ impl Default for Settings {
             // Remember each image's edits (like the original). Toggle on to
             // always start a freshly-opened image from defaults instead.
             reset_on_open: false,
+            raw_filter: crate::library::RawFilter::All,
+            sort_by: crate::library::SortBy::Name,
+            last_export: crate::ExportOpts::default(),
         }
     }
 }
@@ -168,6 +177,10 @@ pub fn present(
                 thumb_dim: THUMB_DIMS.get(thumb_idx).copied().unwrap_or(300),
                 background: index_to_background(background_row.selected()),
                 reset_on_open: reset_switch.is_active(),
+                // Not editable here; carry the persisted prefs through.
+                raw_filter: current.raw_filter,
+                sort_by: current.sort_by,
+                last_export: current.last_export,
             };
             sender.input(crate::AppMsg::SettingsChanged(settings));
         }
