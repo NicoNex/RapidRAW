@@ -38,3 +38,4 @@ src-tauri/libs/
 **/keystore.properties
 **/keystore.jks
 **/key.propertieslast-claude.txt
+dist/
