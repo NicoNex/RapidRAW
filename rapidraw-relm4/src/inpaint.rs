@@ -14,12 +14,16 @@ use rapidraw_core::mask_generation::AiPatchDefinition;
 
 use crate::{AppModel, AppMsg};
 
-/// Sub-mask types offered for a patch: `(label, type-string)`. Brush paints the
-/// region; the AI types segment it automatically.
+/// Region types offered for a patch: `(label, type-string)`, matching the Tauri
+/// inpaint tools. AI types segment automatically; brush paints; radial/linear
+/// are drawn on the canvas.
 const PATCH_SUB_TYPES: &[(&str, &str)] = &[
-    ("Brush", "brush"),
+    ("Quick Erase", "quick-eraser"),
     ("AI Subject", "ai-subject"),
     ("AI Foreground", "ai-foreground"),
+    ("Brush", "brush"),
+    ("Linear", "linear"),
+    ("Radial", "radial"),
 ];
 
 pub struct InpaintPanel {
@@ -153,10 +157,19 @@ fn patch_details(
     let col = gtk::Box::new(gtk::Orientation::Vertical, 4);
     col.set_margin_top(6);
 
+    // Workflow order: 1) pick a region tool, 2) refine it, 3) generate.
+    // Step 1 — region tools (auto-arm on pick).
+    col.append(&sub_add_menu(i, sender));
+    for (sub_i, sm) in p.sub_masks.iter().enumerate() {
+        col.append(&crate::masks::submask_editor(i, sub_i, sm, sender));
+    }
+
+    // Step 2/3 — backend + generate.
     let group = adw::PreferencesGroup::new();
     group.set_title("Generative replace");
     group.set_margin_start(6);
     group.set_margin_end(6);
+    group.set_margin_top(4);
 
     // Fast erase (local LaMa, no prompt) vs prompt-driven external connector.
     let fast_row = adw::SwitchRow::new();
@@ -169,18 +182,17 @@ fn patch_details(
     }
     group.add(&fast_row);
 
-    // Prompt (used when fast erase is off).
-    let prompt = adw::EntryRow::new();
-    prompt.set_title("Prompt");
-    prompt.set_text(&p.prompt);
-    prompt.set_sensitive(!fast);
-    {
+    // Prompt only matters for the connector path — hide it in fast-erase mode.
+    if !fast {
+        let prompt = adw::EntryRow::new();
+        prompt.set_title("Prompt");
+        prompt.set_text(&p.prompt);
         let sender = sender.clone();
         prompt.connect_changed(move |e| {
             sender.input(AppMsg::SetPatchPrompt(i, e.text().to_string()));
         });
+        group.add(&prompt);
     }
-    group.add(&prompt);
 
     let has_region = !p.sub_masks.is_empty();
     let has_result = p.patch_data.is_some();
@@ -191,7 +203,7 @@ fn patch_details(
     } else if has_region {
         "Ready"
     } else {
-        "Add a region below first"
+        "Add a region above first"
     });
     let gen_btn = gtk::Button::with_label(if has_result { "Regenerate" } else { "Generate" });
     gen_btn.add_css_class("suggested-action");
@@ -204,12 +216,6 @@ fn patch_details(
     gen.add_suffix(&gen_btn);
     group.add(&gen);
     col.append(&group);
-
-    // Sub-mask region: add menu + the reused sub-mask editors.
-    col.append(&sub_add_menu(i, sender));
-    for (sub_i, sm) in p.sub_masks.iter().enumerate() {
-        col.append(&crate::masks::submask_editor(i, sub_i, sm, sender));
-    }
 
     col
 }

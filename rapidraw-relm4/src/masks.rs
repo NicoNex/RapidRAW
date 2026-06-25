@@ -172,7 +172,7 @@ fn default_sub_params(mask_type: &str, w: f32, h: f32) -> Value {
         "flow" => json!({ "lines": [], "flow": 10.0 }),
         "brush" => json!({ "lines": [] }),
         // AI types: empty mask until generated; grow/feather refine the result.
-        "ai-subject" | "ai-foreground" => {
+        "ai-subject" | "ai-foreground" | "quick-eraser" => {
             json!({ "maskDataBase64": null, "grow": 0.0, "feather": 0.0 })
         }
         "ai-sky" => json!({ "maskDataBase64": null, "grow": 0.0, "feather": 0.0 }),
@@ -214,13 +214,13 @@ pub fn new_mask(label: &str, mask_type: &str, w: f32, h: f32) -> MaskDefinition 
 /// Normalized (0..1) drawable shapes for a mask's visible radial/linear
 /// sub-masks, for the canvas overlay. `(w, h)` is the full image size (params are
 /// full-res pixels). Brush/flow/color/luminance/all have no drawable shape.
-pub fn overlay_shapes(m: &MaskDefinition, w: f64, h: f64) -> Vec<crate::editor::MaskShape> {
+pub fn overlay_shapes(sub_masks: &[SubMask], w: f64, h: f64) -> Vec<crate::editor::MaskShape> {
     use crate::editor::MaskShape;
     if w <= 0.0 || h <= 0.0 {
         return Vec::new();
     }
     let g = |p: &Value, k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-    m.sub_masks
+    sub_masks
         .iter()
         .enumerate()
         .filter(|(_, sm)| sm.visible)

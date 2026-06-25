@@ -914,20 +914,27 @@ impl AppModel {
     /// Push the selected mask's drawable shapes to the canvas overlay (only while
     /// the Masks tab is active); hides it otherwise.
     fn refresh_mask_overlay(&self) {
-        let on = self
-            .content_stack
-            .visible_child_name()
-            .map(|s| s == "masks")
-            .unwrap_or(false);
-        let shapes = match (on, self.selected_mask, self.session.base_image.as_ref()) {
+        let tab = self.content_stack.visible_child_name();
+        let on = matches!(tab.as_deref(), Some("masks") | Some("inpaint"));
+        let shapes = match (on, self.active_container(), self.session.base_image.as_ref()) {
             (true, Some(i), Some(base)) => {
                 use image::GenericImageView;
                 let (w, h) = base.dimensions();
-                self.session
-                    .masks
-                    .get(i)
-                    .map(|m| masks::overlay_shapes(m, w as f64, h as f64))
-                    .unwrap_or_default()
+                let (w, h) = (w as f64, h as f64);
+                // active_container indexes patches when editing one, else masks.
+                if self.edit_patch.is_some() {
+                    self.session
+                        .ai_patches
+                        .get(i)
+                        .map(|p| masks::overlay_shapes(&p.sub_masks, w, h))
+                        .unwrap_or_default()
+                } else {
+                    self.session
+                        .masks
+                        .get(i)
+                        .map(|m| masks::overlay_shapes(&m.sub_masks, w, h))
+                        .unwrap_or_default()
+                }
             }
             _ => Vec::new(),
         };
@@ -2135,7 +2142,8 @@ impl Component for AppModel {
             }
             AppMsg::ShowInpaintPanel => {
                 self.content_stack.set_visible_child_name("inpaint");
-                self.scopes.root().set_visible(true);
+                // Scopes show only on Adjust/Masks (matching the Tauri UI).
+                self.scopes.root().set_visible(false);
                 if self.crop_active {
                     self.crop_active = false;
                     let (x, y, w, h) = self.canvas.exit_crop();
@@ -2154,7 +2162,7 @@ impl Component for AppModel {
                     self.inpaint_fast,
                     &sender,
                 );
-                self.refresh_mask_preview(&sender); // clears (Masks tab off)
+                self.refresh_mask_overlay();
             }
             AppMsg::AddPatch => {
                 let n = self.session.ai_patches.len() + 1;
@@ -2194,6 +2202,7 @@ impl Component for AppModel {
                     self.inpaint_fast,
                     &sender,
                 );
+                self.refresh_mask_overlay();
             }
             AppMsg::DeletePatch(i) => {
                 if i < self.session.ai_patches.len() {
@@ -2321,7 +2330,8 @@ impl Component for AppModel {
             AppMsg::ShowInfoPanel => {
                 self.content_stack.set_visible_child_name("info");
                 self.edit_patch = None;
-                self.scopes.root().set_visible(true);
+                // Scopes show only on Adjust/Masks (matching the Tauri UI).
+                self.scopes.root().set_visible(false);
                 if self.crop_active {
                     self.crop_active = false;
                     let (x, y, w, h) = self.canvas.exit_crop();
@@ -2564,12 +2574,8 @@ impl Component for AppModel {
                         ],
                     ),
                 };
-                if let Some(sm) = self
-                    .session
-                    .masks
-                    .get_mut(self.selected_mask.unwrap_or(usize::MAX))
-                    .and_then(|m| m.sub_masks.get_mut(sub))
-                {
+                let c = self.active_container().unwrap_or(usize::MAX);
+                if let Some(sm) = self.container_subs_mut(c).and_then(|s| s.get_mut(sub)) {
                     if let Some(obj) = sm.parameters.as_object_mut() {
                         for (k, v) in keys {
                             obj.insert(k.to_string(), serde_json::json!(v));
@@ -2579,6 +2585,7 @@ impl Component for AppModel {
                     // (reselect); the overlay updates live. Rebuild on every drag
                     // tick would thrash the panel.
                     self.schedule_history(&sender);
+                    self.refresh_mask_overlay();
                     sender.input(AppMsg::RequestRender);
                 }
             }
@@ -2746,11 +2753,23 @@ impl Component for AppModel {
                     subs.push(sub);
                     let new_sub = subs.len() - 1;
                     self.rebuild_active(&sender);
-                    // Arm "draw to place" for a radial/linear sub-mask (masks only;
-                    // patches don't offer those types).
-                    if !is_patch && matches!(ty, "radial" | "linear") {
+                    // Arm "draw to place" for a radial/linear sub-mask (masks and
+                    // patches alike — geometry routes via active_container).
+                    if matches!(ty, "radial" | "linear") {
                         self.canvas.set_mask_draw(Some((new_sub, ty == "radial")));
+                    } else if is_patch {
+                        // Patch regions: arm the matching tool immediately so the
+                        // listed inpaint tools are one-click (simple to use).
+                        match ty {
+                            "brush" | "flow" => sender.input(AppMsg::ArmPaint(Some(new_sub))),
+                            "ai-subject" | "quick-eraser" => {
+                                sender.input(AppMsg::ArmPick(Some(new_sub)))
+                            }
+                            "ai-foreground" => sender.input(AppMsg::GenerateAiMask(new_sub)),
+                            _ => {}
+                        }
                     }
+                    self.refresh_mask_overlay();
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
