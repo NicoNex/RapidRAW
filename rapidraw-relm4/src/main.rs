@@ -37,7 +37,7 @@ use masks::MasksPanel;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
-use rapidraw_core::mask_generation::MaskDefinition;
+use rapidraw_core::mask_generation::{AiPatchDefinition, MaskDefinition};
 use rapidraw_core::lut_processing::{parse_lut_file, Lut};
 use scopes::Scopes;
 use settings::Settings;
@@ -405,6 +405,30 @@ fn apply_geometry(base: &DynamicImage, g: Geometry) -> DynamicImage {
     img
 }
 
+/// Bake AI inpaint patches onto the (geometry-applied) `base` before the engine
+/// runs, mirroring the Tauri path. Patches are generated in this same
+/// render-space (geometry applied), so they align 1:1. Falls back to the
+/// un-composited base on error.
+// ponytail: re-cropping after generating a patch can misalign it (mask was
+// rasterized against the prior crop); regenerate the patch if that matters.
+fn composite_patches(base: DynamicImage, patches: &[AiPatchDefinition]) -> DynamicImage {
+    if patches.is_empty() {
+        return base;
+    }
+    let adj = serde_json::json!({ "aiPatches": patches });
+    match rapidraw_core::image_loader::composite_patches_on_image(
+        &base,
+        &adj,
+        Some(&rapidraw_core::ai::ai_sub_mask_resolver),
+    ) {
+        Ok(img) => img,
+        Err(e) => {
+            log::warn!("patch compositing failed: {e}");
+            base
+        }
+    }
+}
+
 /// Rasterize the mask's coverage as a red translucent overlay, mirroring the
 /// preview render path (geometry applied, downscaled to `preview_dim`, same
 /// `scale`/resolver as `core::render`). Returns premultiplied BGRA bytes (cairo
@@ -454,6 +478,7 @@ struct HistEntry {
     lut: Option<Arc<Lut>>,
     vals: Vec<f64>,
     masks: Vec<rapidraw_core::mask_generation::MaskDefinition>,
+    ai_patches: Vec<AiPatchDefinition>,
 }
 
 /// Work sent to the persistent render thread. Keeping a single long-lived
@@ -464,6 +489,7 @@ enum RenderJob {
         base: Arc<DynamicImage>,
         adj: Box<rapidraw_core::image_processing::AllAdjustments>,
         masks: Vec<MaskDefinition>,
+        patches: Vec<AiPatchDefinition>,
         lut: Option<Arc<Lut>>,
         dim: u32,
         geom: Geometry,
@@ -472,6 +498,7 @@ enum RenderJob {
         base: Arc<DynamicImage>,
         adj: Box<rapidraw_core::image_processing::AllAdjustments>,
         masks: Vec<MaskDefinition>,
+        patches: Vec<AiPatchDefinition>,
         lut: Option<Arc<Lut>>,
         path: PathBuf,
         opts: ExportOpts,
@@ -695,6 +722,7 @@ impl AppModel {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             masks: self.session.masks.clone(),
+            ai_patches: self.session.ai_patches.clone(),
         };
         // Build the snapshot synchronously (captures current state), but write to
         // disk off the main thread: this runs on every photo-open / library-return
@@ -734,6 +762,7 @@ impl AppModel {
         self.session.lut = None;
         self.lut_path = None;
         self.session.masks.clear();
+        self.session.ai_patches.clear();
         self.selected_mask = None;
         self.masks_panel.rebuild(&self.session.masks, None, sender);
         self.panel.reset();
@@ -870,6 +899,7 @@ impl AppModel {
         self.session.adjustments = entry.adj;
         self.session.lut = entry.lut;
         self.session.masks = entry.masks;
+        self.session.ai_patches = entry.ai_patches;
         self.selected_mask = self
             .selected_mask
             .filter(|&i| i < self.session.masks.len());
@@ -972,12 +1002,14 @@ fn spawn_render_worker(
                         base,
                         adj,
                         masks,
+                        patches,
                         lut,
                         path,
                         opts,
                         geom,
                     } => {
                         let base = apply_geometry(&base, geom);
+                        let base = composite_patches(base, &patches);
                         let res = rapidraw_core::render(
                             &ctx,
                             &base,
@@ -1026,12 +1058,14 @@ fn spawn_render_worker(
                 base,
                 adj,
                 masks,
+                patches,
                 lut,
                 dim,
                 geom,
             }) = latest_preview
             {
                 let base = apply_geometry(&base, geom);
+                let base = composite_patches(base, &patches);
                 match rapidraw_core::render(
                     &ctx,
                     &base,
@@ -2524,6 +2558,7 @@ impl Component for AppModel {
                     base,
                     adj: Box::new(self.session.adjustments),
                     masks: self.session.masks.clone(),
+                    patches: self.session.ai_patches.clone(),
                     lut: self.session.lut.clone(),
                     dim: self.settings.preview_dim,
                     geom,
@@ -2711,6 +2746,7 @@ impl Component for AppModel {
                     base,
                     adj: Box::new(self.session.adjustments),
                     masks: self.session.masks.clone(),
+                    patches: self.session.ai_patches.clone(),
                     lut: self.session.lut.clone(),
                     path,
                     opts,
@@ -2843,6 +2879,8 @@ impl Component for AppModel {
                 let lut = self.session.lut.clone();
                 let masks = self.session.masks.clone();
                 let masks_json = serde_json::to_value(&masks).unwrap_or_default();
+                let patches = self.session.ai_patches.clone();
+                let patches_json = serde_json::to_value(&patches).unwrap_or_default();
                 let same = self
                     .history
                     .get(self.hist_idx)
@@ -2850,6 +2888,8 @@ impl Component for AppModel {
                         bytemuck::bytes_of(&e.adj.global) == bytemuck::bytes_of(&cur.global)
                             && lut_eq(&e.lut, &lut)
                             && serde_json::to_value(&e.masks).unwrap_or_default() == masks_json
+                            && serde_json::to_value(&e.ai_patches).unwrap_or_default()
+                                == patches_json
                     })
                     .unwrap_or(false);
                 if same {
@@ -2861,6 +2901,7 @@ impl Component for AppModel {
                     lut,
                     vals: self.panel.snapshot(),
                     masks,
+                    ai_patches: patches,
                 });
                 self.hist_idx = self.history.len() - 1;
                 self.save_edits();
@@ -3001,6 +3042,7 @@ impl Component for AppModel {
                         self.panel.restore(&e.vals);
                         self.panel.sync(&self.session.adjustments.global);
                         self.session.masks = e.masks;
+                        self.session.ai_patches = e.ai_patches;
                         self.selected_mask = None;
                         self.masks_panel.rebuild(&self.session.masks, None, &sender);
                         // Reseed the crop panel (built with defaults in
@@ -3034,6 +3076,7 @@ impl Component for AppModel {
                     lut: self.session.lut.clone(),
                     vals: self.panel.snapshot(),
                     masks: self.session.masks.clone(),
+                    ai_patches: self.session.ai_patches.clone(),
                 }];
                 self.hist_idx = 0;
                 // RawTherapee-style: on a fresh RAW (no saved edits) set the

@@ -10,7 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use rapidraw_core::mask_generation::MaskDefinition;
+use rapidraw_core::mask_generation::{AiPatchDefinition, MaskDefinition};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -30,6 +30,10 @@ pub struct Edits {
     /// Tauri sidecar). Defaulted so old sidecars without it still load.
     #[serde(default)]
     pub masks: Vec<MaskDefinition>,
+    /// AI inpaint patches, camelCase JSON (same contract as the Tauri sidecar).
+    /// Defaulted so old sidecars without it still load.
+    #[serde(default)]
+    pub ai_patches: Vec<AiPatchDefinition>,
 }
 
 fn edits_path(image: &Path) -> Option<PathBuf> {
