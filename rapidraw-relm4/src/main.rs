@@ -14,6 +14,7 @@ use relm4::prelude::*;
 
 mod ai_masks;
 mod colorwheel;
+mod inpaint;
 mod controls;
 mod crop;
 mod curves;
@@ -33,11 +34,12 @@ mod thumb_cache;
 use controls::AdjustPanel;
 use sidebar::{Sidebar, SidebarIn, SidebarOut};
 use stars::{Stars, StarsMsg, StarsOut};
+use inpaint::InpaintPanel;
 use masks::MasksPanel;
 use curves::Channel;
 use editor::EditorCanvas;
 use rapidraw_core::image_processing::{GlobalAdjustments, Point};
-use rapidraw_core::mask_generation::{AiPatchDefinition, MaskDefinition};
+use rapidraw_core::mask_generation::{AiPatchDefinition, MaskDefinition, SubMask};
 use rapidraw_core::lut_processing::{parse_lut_file, Lut};
 use scopes::Scopes;
 use settings::Settings;
@@ -201,6 +203,20 @@ enum AppMsg {
     ShowAdjustPanel,
     ShowCropPanel,
     ShowMasksPanel,
+    /// Show the AI inpaint (generative replace) panel.
+    ShowInpaintPanel,
+    /// Inpaint panel actions. Patches reuse the sub-mask messages below
+    /// (AddSubMask/DeleteSubMask/…); routing to a patch vs a mask is decided by
+    /// the `edit_patch` flag set when a patch is selected.
+    AddPatch,
+    SelectPatch(Option<usize>),
+    DeletePatch(usize),
+    TogglePatchVisible(usize),
+    SetPatchPrompt(usize, String),
+    /// Panel-level toggle: fast local erase vs prompt-driven connector.
+    SetInpaintFast(bool),
+    /// Run the inpaint engine for patch `patch` and store the result.
+    GenerateInpaint { patch: usize },
     /// Masks panel actions.
     AddMask(&'static str),
     SelectMask(Option<usize>),
@@ -376,6 +392,13 @@ impl Geometry {
 
 /// Apply geometry to `base`. Cheap for rotate/flip/crop; only free straighten
 /// (arbitrary-angle resample) is costly, and only when set.
+/// Monotonic counter for unique patch ids within a session.
+fn next_patch_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 fn apply_geometry(base: &DynamicImage, g: Geometry) -> DynamicImage {
     use rapidraw_core::image_processing::{apply_coarse_rotation, apply_rotation};
     if g.is_identity() {
@@ -539,11 +562,19 @@ enum CmdMsg {
     RenderReady(RgbaImage),
     /// A worker finished a full-res export: Ok(path) or Err(message).
     ExportDone(Result<PathBuf, String>),
-    /// An AI inference job finished for `(mask, sub)`: Ok(base64 PNG) or Err.
+    /// An AI inference job finished for container `mask`'s sub `sub`: Ok(base64
+    /// PNG) or Err. `patch` routes the result to a patch (vs a mask) — captured
+    /// at request time so a container switch mid-inference can't misroute it.
     AiMaskReady {
         mask: usize,
         sub: usize,
+        patch: bool,
         result: Result<String, String>,
+    },
+    /// An inpaint job finished for patch `patch`: Ok(PatchData) or Err.
+    InpaintReady {
+        patch: usize,
+        result: Result<rapidraw_core::mask_generation::PatchData, String>,
     },
     /// A mask-coverage overlay finished rasterizing. `gen` guards against stale
     /// (superseded) jobs; `data` is `(premult BGRA, w, h)` or None to clear.
@@ -641,6 +672,19 @@ struct AppModel {
     masks_panel: MasksPanel,
     /// Index of the mask whose adjustments are shown in the masks panel.
     selected_mask: Option<usize>,
+    /// AI inpaint panel (right-rail "AI" section).
+    inpaint_panel: InpaintPanel,
+    /// Index of the selected patch in the inpaint panel.
+    selected_patch: Option<usize>,
+    /// When `Some(i)`, the shared sub-mask tools (brush/pick/AI/add/delete) edit
+    /// patch `i` instead of the selected mask. Set on patch select, cleared when
+    /// a mask panel/selection takes over.
+    edit_patch: Option<usize>,
+    /// Inpaint panel: fast local erase (true) vs prompt-driven connector.
+    inpaint_fast: bool,
+    /// External AI-connector address (host:port) for prompt-driven inpaint.
+    /// Wired to a settings field in a follow-up; persistence lands with that.
+    ai_connector_address: Option<String>,
     /// Brush radius (image px) for painting brush/flow sub-masks.
     brush_size: f64,
     /// Brush edge feather (UI 0..100); stored as 0..1 per stroke.
@@ -701,6 +745,37 @@ impl AppModel {
         } else {
             w as f32 / h as f32
         }
+    }
+
+    /// The sub_masks the shared sub-mask tools currently edit: a patch's when
+    /// the inpaint panel has armed one (`edit_patch`), else the given mask's.
+    fn container_subs_mut(&mut self, idx: usize) -> Option<&mut Vec<SubMask>> {
+        if self.edit_patch.is_some() {
+            self.session.ai_patches.get_mut(idx).map(|p| &mut p.sub_masks)
+        } else {
+            self.session.masks.get_mut(idx).map(|m| &mut m.sub_masks)
+        }
+    }
+
+    /// Rebuild whichever right-rail list owns the active container.
+    fn rebuild_active(&self, sender: &ComponentSender<AppModel>) {
+        if self.edit_patch.is_some() {
+            self.inpaint_panel.rebuild(
+                &self.session.ai_patches,
+                self.selected_patch,
+                self.inpaint_fast,
+                sender,
+            );
+        } else {
+            self.masks_panel
+                .rebuild(&self.session.masks, self.selected_mask, sender);
+        }
+    }
+
+    /// Container index the canvas-armed tools (brush/pick/AI) act on: the armed
+    /// patch, else the selected mask.
+    fn active_container(&self) -> Option<usize> {
+        self.edit_patch.or(self.selected_mask)
     }
 
     /// Persist the active image's edits (adjustments + geometry + LUT) so
@@ -764,7 +839,11 @@ impl AppModel {
         self.session.masks.clear();
         self.session.ai_patches.clear();
         self.selected_mask = None;
+        self.selected_patch = None;
+        self.edit_patch = None;
         self.masks_panel.rebuild(&self.session.masks, None, sender);
+        self.inpaint_panel
+            .rebuild(&self.session.ai_patches, None, self.inpaint_fast, sender);
         self.panel.reset();
         // Crop panel is small; rebuild so its toggles/straighten reset. geom was
         // just set to default above, so this seeds it to defaults.
@@ -900,6 +979,16 @@ impl AppModel {
         self.session.lut = entry.lut;
         self.session.masks = entry.masks;
         self.session.ai_patches = entry.ai_patches;
+        self.selected_patch = self
+            .selected_patch
+            .filter(|&i| i < self.session.ai_patches.len());
+        self.edit_patch = self.edit_patch.filter(|&i| i < self.session.ai_patches.len());
+        self.inpaint_panel.rebuild(
+            &self.session.ai_patches,
+            self.selected_patch,
+            self.inpaint_fast,
+            sender,
+        );
         self.selected_mask = self
             .selected_mask
             .filter(|&i| i < self.session.masks.len());
@@ -1364,6 +1453,11 @@ impl Component for AppModel {
             crop: crop::CropPanel::new(&sender, Geometry::default()),
             masks_panel: MasksPanel::new(&sender),
             selected_mask: None,
+            inpaint_panel: InpaintPanel::new(&sender),
+            selected_patch: None,
+            edit_patch: None,
+            inpaint_fast: true,
+            ai_connector_address: None,
             brush_size: 50.0,
             brush_feather: 50.0,
             brush_erase: false,
@@ -1624,6 +1718,9 @@ impl Component for AppModel {
         model
             .content_stack
             .add_named(model.masks_panel.root(), Some("masks"));
+        model
+            .content_stack
+            .add_named(model.inpaint_panel.root(), Some("inpaint"));
         model.content_stack.set_visible_child_name("adjust");
         // Fixed, comfortable panel width. The Paned sizes the end child to this
         // natural width at any window size (the canvas absorbs the rest), so the
@@ -1647,6 +1744,9 @@ impl Component for AppModel {
         let masks_btn = gtk::ToggleButton::with_label("Masks");
         masks_btn.set_tooltip_text(Some("Masks"));
         masks_btn.set_group(Some(&adj_btn));
+        let ai_btn = gtk::ToggleButton::with_label("AI");
+        ai_btn.set_tooltip_text(Some("AI inpaint (generative replace)"));
+        ai_btn.set_group(Some(&adj_btn));
         {
             let sender = sender.clone();
             adj_btn.connect_toggled(move |b| {
@@ -1671,9 +1771,18 @@ impl Component for AppModel {
                 }
             });
         }
+        {
+            let sender = sender.clone();
+            ai_btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::ShowInpaintPanel);
+                }
+            });
+        }
         tabs.append(&adj_btn);
         tabs.append(&crop_btn);
         tabs.append(&masks_btn);
+        tabs.append(&ai_btn);
         model.edit_btn = adj_btn.clone();
 
         model.right_col.append(&tabs);
@@ -1903,6 +2012,7 @@ impl Component for AppModel {
             }
             AppMsg::ShowAdjustPanel => {
                 self.content_stack.set_visible_child_name("adjust");
+                self.edit_patch = None;
                 // Scopes show in Edit (hidden in Crop, like the reference).
                 self.scopes.root().set_visible(true);
                 // Commit the interactive crop on leaving crop mode.
@@ -1920,6 +2030,7 @@ impl Component for AppModel {
             }
             AppMsg::ShowCropPanel => {
                 self.content_stack.set_visible_child_name("crop");
+                self.edit_patch = None;
                 // Crop hides the scopes (matches the reference UI).
                 self.scopes.root().set_visible(false);
                 self.crop_active = true;
@@ -1930,6 +2041,8 @@ impl Component for AppModel {
             }
             AppMsg::ShowMasksPanel => {
                 self.content_stack.set_visible_child_name("masks");
+                // Masks mode takes over the shared sub-mask tools from patches.
+                self.edit_patch = None;
                 // Masks shows the scopes (like Edit; only Crop hides them).
                 self.scopes.root().set_visible(true);
                 // Leaving crop mode commits the interactive crop (mirror ShowAdjustPanel).
@@ -1946,6 +2059,191 @@ impl Component for AppModel {
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
                 self.refresh_mask_preview(&sender);
+            }
+            AppMsg::ShowInpaintPanel => {
+                self.content_stack.set_visible_child_name("inpaint");
+                self.scopes.root().set_visible(true);
+                if self.crop_active {
+                    self.crop_active = false;
+                    let (x, y, w, h) = self.canvas.exit_crop();
+                    self.geom.crop = if w >= 0.999 && h >= 0.999 && x <= 0.001 && y <= 0.001 {
+                        None
+                    } else {
+                        Some([x as f32, y as f32, w as f32, h as f32])
+                    };
+                    sender.input(AppMsg::RequestRender);
+                }
+                // Re-arm patch editing for the selected patch (if any).
+                self.edit_patch = self.selected_patch;
+                self.inpaint_panel.rebuild(
+                    &self.session.ai_patches,
+                    self.selected_patch,
+                    self.inpaint_fast,
+                    &sender,
+                );
+                self.refresh_mask_preview(&sender); // clears (Masks tab off)
+            }
+            AppMsg::AddPatch => {
+                let n = self.session.ai_patches.len() + 1;
+                self.session.ai_patches.push(AiPatchDefinition {
+                    id: format!("patch-{}", next_patch_id()),
+                    name: format!("Patch {n}"),
+                    visible: true,
+                    invert: false,
+                    prompt: String::new(),
+                    patch_data: None,
+                    opacity: 100.0,
+                    sub_masks: Vec::new(),
+                });
+                let i = self.session.ai_patches.len() - 1;
+                self.selected_patch = Some(i);
+                self.edit_patch = Some(i);
+                self.inpaint_panel.rebuild(
+                    &self.session.ai_patches,
+                    self.selected_patch,
+                    self.inpaint_fast,
+                    &sender,
+                );
+                self.schedule_history(&sender);
+            }
+            AppMsg::SelectPatch(idx) => {
+                self.selected_patch = idx;
+                self.edit_patch = idx;
+                // Disarm canvas tools (they targeted the prior container).
+                if self.paint_sub.take().is_some() {
+                    self.canvas.set_paint(None);
+                }
+                self.canvas.set_pick(None);
+                self.canvas.set_mask_draw(None);
+                self.inpaint_panel.rebuild(
+                    &self.session.ai_patches,
+                    self.selected_patch,
+                    self.inpaint_fast,
+                    &sender,
+                );
+            }
+            AppMsg::DeletePatch(i) => {
+                if i < self.session.ai_patches.len() {
+                    self.session.ai_patches.remove(i);
+                    self.selected_patch = match self.selected_patch {
+                        Some(s) if s == i => None,
+                        Some(s) if s > i => Some(s - 1),
+                        other => other,
+                    };
+                    self.edit_patch = self.selected_patch;
+                    self.inpaint_panel.rebuild(
+                        &self.session.ai_patches,
+                        self.selected_patch,
+                        self.inpaint_fast,
+                        &sender,
+                    );
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::TogglePatchVisible(i) => {
+                if let Some(p) = self.session.ai_patches.get_mut(i) {
+                    p.visible = !p.visible;
+                    self.inpaint_panel.rebuild(
+                        &self.session.ai_patches,
+                        self.selected_patch,
+                        self.inpaint_fast,
+                        &sender,
+                    );
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::SetPatchPrompt(i, text) => {
+                if let Some(p) = self.session.ai_patches.get_mut(i) {
+                    p.prompt = text;
+                    self.schedule_history(&sender);
+                }
+            }
+            AppMsg::SetInpaintFast(on) => {
+                self.inpaint_fast = on;
+                // Rebuild so the prompt row enables/disables.
+                self.inpaint_panel.rebuild(
+                    &self.session.ai_patches,
+                    self.selected_patch,
+                    self.inpaint_fast,
+                    &sender,
+                );
+            }
+            AppMsg::GenerateInpaint { patch } => {
+                let Some(base) = self.session.base_image.clone() else { return };
+                let Some(p) = self.session.ai_patches.get(patch).cloned() else { return };
+                if p.sub_masks.is_empty() {
+                    self.toasts
+                        .add_toast(adw::Toast::new("Add a region to the patch first"));
+                    return;
+                }
+                // Source = the image with the OTHER patches baked in (so this
+                // patch inpaints over the current look), geometry applied.
+                let others: Vec<AiPatchDefinition> = self
+                    .session
+                    .ai_patches
+                    .iter()
+                    .filter(|q| q.id != p.id)
+                    .cloned()
+                    .collect();
+                let mask_def = MaskDefinition {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    visible: true,
+                    invert: p.invert,
+                    opacity: 100.0,
+                    adjustments: serde_json::Value::Null,
+                    sub_masks: p.sub_masks.clone(),
+                };
+                let geom = self.geom;
+                let fast = self.inpaint_fast;
+                let prompt = p.prompt.clone();
+                let connector = self.ai_connector_address.clone();
+                let source_path = self
+                    .session
+                    .active_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let backend = if fast {
+                    Some(ai_masks::InpaintBackend::FastErase)
+                } else {
+                    connector
+                        .filter(|a| !a.is_empty())
+                        .map(|address| ai_masks::InpaintBackend::Connector {
+                            base_url: format!("http://{address}"),
+                            source_path,
+                            prompt,
+                        })
+                };
+                let Some(backend) = backend else {
+                    self.toasts.add_toast(adw::Toast::new(
+                        "Set the AI connector address in Settings, or enable Fast erase",
+                    ));
+                    return;
+                };
+                self.win_title.set_subtitle("Generating inpaint…");
+                spawn_bg(&sender, move || {
+                    let img = apply_geometry(&base, geom);
+                    let src = composite_patches(img.clone(), &others);
+                    let (w, h) = {
+                        use image::GenericImageView;
+                        img.dimensions()
+                    };
+                    let result = rapidraw_core::mask_generation::generate_mask_bitmap(
+                        &mask_def,
+                        w,
+                        h,
+                        1.0,
+                        (0.0, 0.0),
+                        None,
+                        Some(&rapidraw_core::ai::ai_sub_mask_resolver),
+                    )
+                    .ok_or_else(|| "patch mask is empty (draw or auto-mask a region)".to_string())
+                    .and_then(|mask| ai_masks::run_inpaint(&src, &mask, backend));
+                    CmdMsg::InpaintReady { patch, result }
+                });
             }
             AppMsg::AddMask(ty) => {
                 // Default sub-mask geometry needs the full image size.
@@ -1978,6 +2276,7 @@ impl Component for AppModel {
             }
             AppMsg::SelectMask(idx) => {
                 self.selected_mask = idx;
+                self.edit_patch = None;
                 // Disarm painting/picking (they target the prior selection).
                 if self.paint_sub.take().is_some() {
                     self.canvas.set_paint(None);
@@ -2090,12 +2389,7 @@ impl Component for AppModel {
                 key,
                 value,
             } => {
-                if let Some(sm) = self
-                    .session
-                    .masks
-                    .get_mut(mask)
-                    .and_then(|m| m.sub_masks.get_mut(sub))
-                {
+                if let Some(sm) = self.container_subs_mut(mask).and_then(|s| s.get_mut(sub)) {
                     if !sm.parameters.is_object() {
                         sm.parameters = serde_json::json!({});
                     }
@@ -2108,12 +2402,7 @@ impl Component for AppModel {
                 }
             }
             AppMsg::SetSubMaskMode { mask, sub, mode } => {
-                if let Some(sm) = self
-                    .session
-                    .masks
-                    .get_mut(mask)
-                    .and_then(|m| m.sub_masks.get_mut(sub))
-                {
+                if let Some(sm) = self.container_subs_mut(mask).and_then(|s| s.get_mut(sub)) {
                     sm.mode = masks::mode_from_index(mode);
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
@@ -2197,43 +2486,37 @@ impl Component for AppModel {
             }
             AppMsg::AddBrushStroke { sub, points, erase } => {
                 let Some((w, h)) = self.image_dims() else { return };
-                if let Some(m) = self.session.masks.get_mut(self.selected_mask.unwrap_or(usize::MAX)) {
-                    if let Some(sm) = m.sub_masks.get_mut(sub) {
-                        let is_flow = sm.mask_type == "flow";
-                        let pts: Vec<serde_json::Value> = points
-                            .iter()
-                            .map(|(x, y)| serde_json::json!({ "x": x * w, "y": y * h }))
-                            .collect();
-                        let mut line = serde_json::json!({
-                            "tool": if erase { "eraser" } else { "brush" },
-                            "brushSize": self.brush_size,
-                            "feather": self.brush_feather / 100.0,
-                            "points": pts,
-                        });
-                        if is_flow {
-                            // Flow lines carry a per-line flow (default matches core).
-                            line["flow"] = serde_json::json!(10.0);
-                        }
-                        let obj = sm.parameters.as_object_mut();
-                        if let Some(obj) = obj {
-                            obj.entry("lines")
-                                .or_insert_with(|| serde_json::json!([]));
-                            if let Some(arr) = obj["lines"].as_array_mut() {
-                                arr.push(line);
-                            }
-                        }
-                        self.schedule_history(&sender);
-                        sender.input(AppMsg::RequestRender);
+                let (bsize, bfeather) = (self.brush_size, self.brush_feather);
+                let Some(c) = self.active_container() else { return };
+                if let Some(sm) = self.container_subs_mut(c).and_then(|s| s.get_mut(sub)) {
+                    let is_flow = sm.mask_type == "flow";
+                    let pts: Vec<serde_json::Value> = points
+                        .iter()
+                        .map(|(x, y)| serde_json::json!({ "x": x * w, "y": y * h }))
+                        .collect();
+                    let mut line = serde_json::json!({
+                        "tool": if erase { "eraser" } else { "brush" },
+                        "brushSize": bsize,
+                        "feather": bfeather / 100.0,
+                        "points": pts,
+                    });
+                    if is_flow {
+                        // Flow lines carry a per-line flow (default matches core).
+                        line["flow"] = serde_json::json!(10.0);
                     }
+                    if let Some(obj) = sm.parameters.as_object_mut() {
+                        obj.entry("lines").or_insert_with(|| serde_json::json!([]));
+                        if let Some(arr) = obj["lines"].as_array_mut() {
+                            arr.push(line);
+                        }
+                    }
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
                 }
             }
             AppMsg::ClearStrokes(sub) => {
-                if let Some(sm) = self
-                    .session
-                    .masks
-                    .get_mut(self.selected_mask.unwrap_or(usize::MAX))
-                    .and_then(|m| m.sub_masks.get_mut(sub))
-                {
+                let Some(c) = self.active_container() else { return };
+                if let Some(sm) = self.container_subs_mut(c).and_then(|s| s.get_mut(sub)) {
                     if let Some(obj) = sm.parameters.as_object_mut() {
                         obj.insert("lines".into(), serde_json::json!([]));
                     }
@@ -2242,13 +2525,10 @@ impl Component for AppModel {
                 }
             }
             AppMsg::GenerateAiMask(sub) => {
-                let Some(mi) = self.selected_mask else { return };
+                let Some(mi) = self.active_container() else { return };
+                let patch = self.edit_patch.is_some();
                 let Some(base) = self.session.base_image.clone() else { return };
-                let Some(sm) = self
-                    .session
-                    .masks
-                    .get(mi)
-                    .and_then(|m| m.sub_masks.get(sub))
+                let Some(sm) = self.container_subs_mut(mi).and_then(|s| s.get(sub).cloned())
                 else {
                     return;
                 };
@@ -2272,6 +2552,7 @@ impl Component for AppModel {
                     CmdMsg::AiMaskReady {
                         mask: mi,
                         sub,
+                        patch,
                         result,
                     }
                 });
@@ -2280,25 +2561,20 @@ impl Component for AppModel {
                 self.canvas.set_mask_preview_visible(shown);
             }
             AppMsg::ArmPick(sub) => {
+                let c = self.active_container().unwrap_or(usize::MAX);
                 let arm = sub.and_then(|s| {
                     let ty = self
-                        .session
-                        .masks
-                        .get(self.selected_mask.unwrap_or(usize::MAX))
-                        .and_then(|m| m.sub_masks.get(s))
-                        .map(|sm| sm.mask_type.as_str());
-                    ty.map(|t| (s, matches!(t, "ai-subject" | "quick-eraser")))
+                        .container_subs_mut(c)
+                        .and_then(|subs| subs.get(s))
+                        .map(|sm| sm.mask_type.clone());
+                    ty.map(|t| (s, matches!(t.as_str(), "ai-subject" | "quick-eraser")))
                 });
                 self.canvas.set_pick(arm);
             }
             AppMsg::PickResult { sub, x1, y1, x2, y2 } => {
                 let Some((w, h)) = self.image_dims() else { return };
-                let Some(mi) = self.selected_mask else { return };
-                let Some(sm) = self
-                    .session
-                    .masks
-                    .get_mut(mi)
-                    .and_then(|m| m.sub_masks.get_mut(sub))
+                let Some(mi) = self.active_container() else { return };
+                let Some(sm) = self.container_subs_mut(mi).and_then(|s| s.get_mut(sub))
                 else {
                     return;
                 };
@@ -2334,21 +2610,22 @@ impl Component for AppModel {
                         (w as f32, h as f32)
                     })
                     .unwrap_or((1000.0, 1000.0));
-                if let Some(m) = self.session.masks.get_mut(mask) {
-                    // Reuse new_mask's sub-mask seeding, then move it onto this
-                    // container (keeps default geometry/params in one place).
-                    let label = masks::MASK_TYPES
-                        .iter()
-                        .find(|(_, t)| *t == ty)
-                        .map(|(l, _)| *l)
-                        .unwrap_or(ty);
-                    let sub = masks::new_mask(label, ty, w, h).sub_masks.remove(0);
-                    m.sub_masks.push(sub);
-                    let new_sub = m.sub_masks.len() - 1;
-                    self.masks_panel
-                        .rebuild(&self.session.masks, self.selected_mask, &sender);
-                    // Arm "draw to place" for a radial/linear sub-mask too.
-                    if matches!(ty, "radial" | "linear") {
+                let label = masks::MASK_TYPES
+                    .iter()
+                    .find(|(_, t)| *t == ty)
+                    .map(|(l, _)| *l)
+                    .unwrap_or(ty);
+                // Reuse new_mask's sub-mask seeding, then move it onto this
+                // container (keeps default geometry/params in one place).
+                let sub = masks::new_mask(label, ty, w, h).sub_masks.remove(0);
+                let is_patch = self.edit_patch.is_some();
+                if let Some(subs) = self.container_subs_mut(mask) {
+                    subs.push(sub);
+                    let new_sub = subs.len() - 1;
+                    self.rebuild_active(&sender);
+                    // Arm "draw to place" for a radial/linear sub-mask (masks only;
+                    // patches don't offer those types).
+                    if !is_patch && matches!(ty, "radial" | "linear") {
                         self.canvas.set_mask_draw(Some((new_sub, ty == "radial")));
                     }
                     self.schedule_history(&sender);
@@ -2356,38 +2633,38 @@ impl Component for AppModel {
                 }
             }
             AppMsg::DeleteSubMask { mask, sub } => {
-                if let Some(m) = self.session.masks.get_mut(mask) {
-                    if sub < m.sub_masks.len() {
-                        m.sub_masks.remove(sub);
-                        self.masks_panel
-                            .rebuild(&self.session.masks, self.selected_mask, &sender);
-                        self.schedule_history(&sender);
-                        sender.input(AppMsg::RequestRender);
-                    }
+                let removed = self
+                    .container_subs_mut(mask)
+                    .filter(|s| sub < s.len())
+                    .map(|s| {
+                        s.remove(sub);
+                    })
+                    .is_some();
+                if removed {
+                    self.rebuild_active(&sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
                 }
             }
             AppMsg::ToggleSubMaskVisible { mask, sub } => {
-                if let Some(sm) = self
-                    .session
-                    .masks
-                    .get_mut(mask)
-                    .and_then(|m| m.sub_masks.get_mut(sub))
-                {
-                    sm.visible = !sm.visible;
-                    self.masks_panel
-                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                let ok = self
+                    .container_subs_mut(mask)
+                    .and_then(|s| s.get_mut(sub))
+                    .map(|sm| sm.visible = !sm.visible)
+                    .is_some();
+                if ok {
+                    self.rebuild_active(&sender);
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
             }
             AppMsg::ToggleSubMaskInvert { mask, sub } => {
-                if let Some(sm) = self
-                    .session
-                    .masks
-                    .get_mut(mask)
-                    .and_then(|m| m.sub_masks.get_mut(sub))
-                {
-                    sm.invert = !sm.invert;
+                let ok = self
+                    .container_subs_mut(mask)
+                    .and_then(|s| s.get_mut(sub))
+                    .map(|sm| sm.invert = !sm.invert)
+                    .is_some();
+                if ok {
                     self.schedule_history(&sender);
                     sender.input(AppMsg::RequestRender);
                 }
@@ -3129,6 +3406,7 @@ impl Component for AppModel {
             CmdMsg::AiMaskReady {
                 mask,
                 sub,
+                patch,
                 result,
             } => {
                 // Clear the "Generating…" status (back to the EXIF summary).
@@ -3141,12 +3419,14 @@ impl Component for AppModel {
                 self.win_title.set_subtitle(&subtitle);
                 match result {
                 Ok(b64) => {
-                    if let Some(sm) = self
-                        .session
-                        .masks
-                        .get_mut(mask)
-                        .and_then(|m| m.sub_masks.get_mut(sub))
-                    {
+                    // Route by the captured `patch` flag (not edit_patch) so a
+                    // container switch during inference can't misroute the result.
+                    let subs = if patch {
+                        self.session.ai_patches.get_mut(mask).map(|p| &mut p.sub_masks)
+                    } else {
+                        self.session.masks.get_mut(mask).map(|m| &mut m.sub_masks)
+                    };
+                    if let Some(sm) = subs.and_then(|s| s.get_mut(sub)) {
                         if let Some(obj) = sm.parameters.as_object_mut() {
                             obj.insert("maskDataBase64".into(), serde_json::json!(b64));
                             // Inference ran in render space, so the transform is
@@ -3157,7 +3437,9 @@ impl Component for AppModel {
                             obj.insert("orientationSteps".into(), serde_json::json!(0));
                         }
                         self.schedule_history(&sender);
-                        self.refresh_mask_overlay();
+                        if !patch {
+                            self.refresh_mask_overlay();
+                        }
                         sender.input(AppMsg::RequestRender);
                         self.toasts.add_toast(adw::Toast::new("AI mask generated"));
                     }
@@ -3167,6 +3449,36 @@ impl Component for AppModel {
                     self.toasts
                         .add_toast(adw::Toast::new(&format!("AI mask failed: {e}")));
                 }
+                }
+            }
+            CmdMsg::InpaintReady { patch, result } => {
+                let subtitle = self
+                    .session
+                    .active_path
+                    .as_deref()
+                    .and_then(meta::read_summary)
+                    .unwrap_or_default();
+                self.win_title.set_subtitle(&subtitle);
+                match result {
+                    Ok(data) => {
+                        if let Some(p) = self.session.ai_patches.get_mut(patch) {
+                            p.patch_data = Some(data);
+                            self.inpaint_panel.rebuild(
+                                &self.session.ai_patches,
+                                self.selected_patch,
+                                self.inpaint_fast,
+                                &sender,
+                            );
+                            self.schedule_history(&sender);
+                            sender.input(AppMsg::RequestRender);
+                            self.toasts.add_toast(adw::Toast::new("Inpaint generated"));
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("inpaint failed: {e}");
+                        self.toasts
+                            .add_toast(adw::Toast::new(&format!("Inpaint failed: {e}")));
+                    }
                 }
             }
             CmdMsg::MaskPreviewReady { gen, data } => {

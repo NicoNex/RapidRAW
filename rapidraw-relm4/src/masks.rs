@@ -695,7 +695,10 @@ fn build_mask_grading(
 
 /// Geometry + compositing-mode editor for one sub-mask (libadwaita rows). Brush/
 /// flow show a canvas hint (P4); "all" has no geometry.
-fn submask_editor(
+/// Build the editor group for one sub-mask. Shared with the inpaint panel:
+/// `mask_i` is the container index (a mask or, when the inpaint panel is active,
+/// a patch) — the handlers route by the model's `edit_patch` flag.
+pub fn submask_editor(
     mask_i: usize,
     sub_i: usize,
     sm: &SubMask,
