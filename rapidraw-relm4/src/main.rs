@@ -682,9 +682,6 @@ struct AppModel {
     edit_patch: Option<usize>,
     /// Inpaint panel: fast local erase (true) vs prompt-driven connector.
     inpaint_fast: bool,
-    /// External AI-connector address (host:port) for prompt-driven inpaint.
-    /// Wired to a settings field in a follow-up; persistence lands with that.
-    ai_connector_address: Option<String>,
     /// Brush radius (image px) for painting brush/flow sub-masks.
     brush_size: f64,
     /// Brush edge feather (UI 0..100); stored as 0..1 per stroke.
@@ -1415,6 +1412,9 @@ impl Component for AppModel {
             });
 
         let loaded = load_settings();
+        // Copy out the fields needed elsewhere in the literal before `loaded` is
+        // moved into `settings` (Settings is no longer Copy).
+        let (loaded_raw_filter, loaded_sort_by) = (loaded.raw_filter, loaded.sort_by);
         let model = AppModel {
             session: Session::default(),
             images: Vec::new(),
@@ -1444,8 +1444,8 @@ impl Component for AppModel {
             last_rgba: None,
             win_title: adw::WindowTitle::new("RapidRAW", ""),
             all_images: Vec::new(),
-            raw_filter: loaded.raw_filter,
-            sort_by: loaded.sort_by,
+            raw_filter: loaded_raw_filter,
+            sort_by: loaded_sort_by,
             search: String::new(),
             last_folder: load_last_folder(),
             roots: load_roots(),
@@ -1457,7 +1457,6 @@ impl Component for AppModel {
             selected_patch: None,
             edit_patch: None,
             inpaint_fast: true,
-            ai_connector_address: None,
             brush_size: 50.0,
             brush_feather: 50.0,
             brush_erase: false,
@@ -2199,7 +2198,7 @@ impl Component for AppModel {
                 let geom = self.geom;
                 let fast = self.inpaint_fast;
                 let prompt = p.prompt.clone();
-                let connector = self.ai_connector_address.clone();
+                let connector = self.settings.ai_connector_address.clone();
                 let source_path = self
                     .session
                     .active_path
@@ -3119,12 +3118,12 @@ impl Component for AppModel {
                 }
             }
             AppMsg::OpenSettings => {
-                settings::present(root, self.settings, &sender);
+                settings::present(root, self.settings.clone(), &sender);
             }
             AppMsg::SettingsChanged(s) => {
-                self.settings = s;
                 save_settings(&s); // persist so the next launch restores them
                 self.canvas.set_background(s.background);
+                self.settings = s;
                 // Re-render the preview at the (possibly new) preview size.
                 sender.input(AppMsg::RequestRender);
             }
