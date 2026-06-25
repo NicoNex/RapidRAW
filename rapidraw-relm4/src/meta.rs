@@ -1,6 +1,7 @@
 //! Minimal EXIF readout for the editor toolbar: shutter, aperture, ISO, focal
 //! length, capture date. Pure-Rust (`kamadak-exif`), no system deps.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use exif::{In, Tag};
@@ -35,4 +36,80 @@ pub fn read_summary(path: &Path) -> Option<String> {
     }
 
     (!parts.is_empty()).then(|| parts.join("  ·  "))
+}
+
+/// Read the full EXIF tag set as a `name -> display string` map for the Info
+/// panel. A few key tags are normalized to match the Tauri keys/format
+/// (`ExposureTime`, `FNumber`, `FocalLengthIn35mmFilm`, `PhotographicSensitivity`,
+/// `LensModel`, GPS, dates); everything else is the tag's display value.
+///
+// ponytail: kamadak only — covers JPEG/TIFF and TIFF-based RAW (CR2/NEF/ARW…).
+// Add the rawler fallback (Tauri extract_metadata's second half) if a RAW format
+// shows no EXIF here.
+pub fn read_full_exif(path: &Path) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let Ok(file) = std::fs::File::open(path) else {
+        return map;
+    };
+    let mut buf = std::io::BufReader::new(file);
+    let Ok(reader) = exif::Reader::new().read_from_container(&mut buf) else {
+        return map;
+    };
+
+    let rat = |f: &exif::Field| -> Option<f32> {
+        match &f.value {
+            exif::Value::Rational(v) if !v.is_empty() && v[0].denom != 0 => {
+                Some(v[0].num as f32 / v[0].denom as f32)
+            }
+            _ => None,
+        }
+    };
+
+    for field in reader.fields() {
+        match field.tag {
+            Tag::ExposureTime => {
+                if let Some(v) = rat(field) {
+                    let s = if v < 1.0 && v > 0.0 {
+                        format!("1/{} s", (1.0 / v).round())
+                    } else {
+                        format!("{v} s")
+                    };
+                    map.insert("ExposureTime".into(), s);
+                }
+            }
+            Tag::FNumber => {
+                if let Some(v) = rat(field) {
+                    map.insert("FNumber".into(), format!("f/{v}"));
+                }
+            }
+            Tag::FocalLength => {
+                if let Some(v) = rat(field) {
+                    map.insert("FocalLengthIn35mmFilm".into(), format!("{v} mm"));
+                }
+            }
+            Tag::PhotographicSensitivity | Tag::ISOSpeed => {
+                map.insert(
+                    "PhotographicSensitivity".into(),
+                    field.display_value().to_string(),
+                );
+            }
+            Tag::LensModel => {
+                map.insert(
+                    "LensModel".into(),
+                    field.display_value().to_string().replace('"', ""),
+                );
+            }
+            Tag::DateTimeOriginal => {
+                map.insert("DateTimeOriginal".into(), field.display_value().to_string());
+            }
+            _ => {
+                let key = format!("{}", field.tag);
+                let val = field.display_value().with_unit(&reader).to_string();
+                if !val.trim().is_empty() {
+                    map.entry(key).or_insert(val);
+                }
+            }
+        }
+    }
+    map
 }

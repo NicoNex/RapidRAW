@@ -25,6 +25,8 @@ pub struct Session {
     pub ai_patches: Vec<AiPatchDefinition>,
     /// Loaded 3D LUT (.cube/.3dl), applied at `adjustments.global.lut_intensity`.
     pub lut: Option<Arc<Lut>>,
+    /// Editable photo metadata (Info panel): author fields, tags, colour label.
+    pub meta: crate::sidecar::ImageMeta,
 }
 
 impl Default for Session {
@@ -37,6 +39,7 @@ impl Default for Session {
             masks: Vec::new(),
             ai_patches: Vec::new(),
             lut: None,
+            meta: Default::default(),
         }
     }
 }

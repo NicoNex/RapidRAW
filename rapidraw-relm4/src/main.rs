@@ -14,6 +14,7 @@ use relm4::prelude::*;
 
 mod ai_masks;
 mod colorwheel;
+mod info;
 mod inpaint;
 mod controls;
 mod crop;
@@ -34,6 +35,7 @@ mod thumb_cache;
 use controls::AdjustPanel;
 use sidebar::{Sidebar, SidebarIn, SidebarOut};
 use stars::{Stars, StarsMsg, StarsOut};
+use info::InfoPanel;
 use inpaint::InpaintPanel;
 use masks::MasksPanel;
 use curves::Channel;
@@ -217,6 +219,15 @@ enum AppMsg {
     SetInpaintFast(bool),
     /// Run the inpaint engine for patch `patch` and store the result.
     GenerateInpaint { patch: usize },
+    /// Show the Info (metadata) panel.
+    ShowInfoPanel,
+    /// Set one editable author field ("title"/"artist"/"copyright"/"comment").
+    SetMetaField(&'static str, String),
+    /// Add/remove a user tag on the open image.
+    AddMetaTag(String),
+    RemoveMetaTag(String),
+    /// Set (or clear, with None) the colour label.
+    SetColorLabel(Option<String>),
     /// Masks panel actions.
     AddMask(&'static str),
     SelectMask(Option<usize>),
@@ -682,6 +693,8 @@ struct AppModel {
     edit_patch: Option<usize>,
     /// Inpaint panel: fast local erase (true) vs prompt-driven connector.
     inpaint_fast: bool,
+    /// Info (metadata) panel.
+    info_panel: InfoPanel,
     /// Brush radius (image px) for painting brush/flow sub-masks.
     brush_size: f64,
     /// Brush edge feather (UI 0..100); stored as 0..1 per stroke.
@@ -775,6 +788,50 @@ impl AppModel {
         self.edit_patch.or(self.selected_mask)
     }
 
+    /// Rebuild the Info panel from the open image's EXIF + sidecar metadata.
+    fn refresh_info_panel(&self, sender: &ComponentSender<AppModel>) {
+        let Some(path) = self.session.active_path.as_ref() else {
+            self.info_panel.rebuild(None, sender);
+            return;
+        };
+        let exif = meta::read_full_exif(path);
+        let (w, h) = self
+            .session
+            .base_image
+            .as_ref()
+            .map(|b| {
+                use image::GenericImageView;
+                b.dimensions()
+            })
+            .unwrap_or((0, 0));
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_uppercase())
+            .unwrap_or_else(|| "FILE".into());
+        let rating = self.ratings.get(path).copied().unwrap_or(0);
+        let data = info::InfoData {
+            file_name,
+            extension,
+            width: w,
+            height: h,
+            exif: &exif,
+            meta: &self.session.meta,
+            rating,
+        };
+        self.info_panel.rebuild(Some(&data), sender);
+    }
+
+    /// True when the Info tab is the visible right-rail panel.
+    fn info_visible(&self) -> bool {
+        self.content_stack.visible_child_name().as_deref() == Some("info")
+    }
+
     /// Persist the active image's edits (adjustments + geometry + LUT) so
     /// reopening it restores them.
     fn save_edits(&self) {
@@ -795,6 +852,7 @@ impl AppModel {
                 .map(|p| p.to_string_lossy().into_owned()),
             masks: self.session.masks.clone(),
             ai_patches: self.session.ai_patches.clone(),
+            meta: self.session.meta.clone(),
         };
         // Build the snapshot synchronously (captures current state), but write to
         // disk off the main thread: this runs on every photo-open / library-return
@@ -1457,6 +1515,7 @@ impl Component for AppModel {
             selected_patch: None,
             edit_patch: None,
             inpaint_fast: true,
+            info_panel: InfoPanel::new(),
             brush_size: 50.0,
             brush_feather: 50.0,
             brush_erase: false,
@@ -1720,6 +1779,9 @@ impl Component for AppModel {
         model
             .content_stack
             .add_named(model.inpaint_panel.root(), Some("inpaint"));
+        model
+            .content_stack
+            .add_named(model.info_panel.root(), Some("info"));
         model.content_stack.set_visible_child_name("adjust");
         // Fixed, comfortable panel width. The Paned sizes the end child to this
         // natural width at any window size (the canvas absorbs the rest), so the
@@ -1746,6 +1808,9 @@ impl Component for AppModel {
         let ai_btn = gtk::ToggleButton::with_label("AI");
         ai_btn.set_tooltip_text(Some("AI inpaint (generative replace)"));
         ai_btn.set_group(Some(&adj_btn));
+        let info_btn = gtk::ToggleButton::with_label("Info");
+        info_btn.set_tooltip_text(Some("Photo info & metadata"));
+        info_btn.set_group(Some(&adj_btn));
         {
             let sender = sender.clone();
             adj_btn.connect_toggled(move |b| {
@@ -1778,10 +1843,19 @@ impl Component for AppModel {
                 }
             });
         }
+        {
+            let sender = sender.clone();
+            info_btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::ShowInfoPanel);
+                }
+            });
+        }
         tabs.append(&adj_btn);
         tabs.append(&crop_btn);
         tabs.append(&masks_btn);
         tabs.append(&ai_btn);
+        tabs.append(&info_btn);
         model.edit_btn = adj_btn.clone();
 
         model.right_col.append(&tabs);
@@ -2243,6 +2317,56 @@ impl Component for AppModel {
                     .and_then(|mask| ai_masks::run_inpaint(&src, &mask, backend));
                     CmdMsg::InpaintReady { patch, result }
                 });
+            }
+            AppMsg::ShowInfoPanel => {
+                self.content_stack.set_visible_child_name("info");
+                self.edit_patch = None;
+                self.scopes.root().set_visible(true);
+                if self.crop_active {
+                    self.crop_active = false;
+                    let (x, y, w, h) = self.canvas.exit_crop();
+                    self.geom.crop = if w >= 0.999 && h >= 0.999 && x <= 0.001 && y <= 0.001 {
+                        None
+                    } else {
+                        Some([x as f32, y as f32, w as f32, h as f32])
+                    };
+                    sender.input(AppMsg::RequestRender);
+                }
+                self.refresh_info_panel(&sender);
+                self.refresh_mask_preview(&sender); // clears (Masks tab off)
+            }
+            AppMsg::SetMetaField(field, value) => {
+                let v = {
+                    let t = value.trim();
+                    (!t.is_empty()).then(|| t.to_string())
+                };
+                match field {
+                    "title" => self.session.meta.title = v,
+                    "artist" => self.session.meta.artist = v,
+                    "copyright" => self.session.meta.copyright = v,
+                    "comment" => self.session.meta.comment = v,
+                    _ => {}
+                }
+                self.save_edits();
+            }
+            AppMsg::AddMetaTag(tag) => {
+                let t = tag.trim().to_lowercase();
+                if !t.is_empty() && !self.session.meta.tags.contains(&t) {
+                    self.session.meta.tags.push(t);
+                    self.session.meta.tags.sort();
+                    self.save_edits();
+                    self.refresh_info_panel(&sender);
+                }
+            }
+            AppMsg::RemoveMetaTag(tag) => {
+                self.session.meta.tags.retain(|x| x != &tag);
+                self.save_edits();
+                self.refresh_info_panel(&sender);
+            }
+            AppMsg::SetColorLabel(c) => {
+                self.session.meta.color = c;
+                self.save_edits();
+                self.refresh_info_panel(&sender);
             }
             AppMsg::AddMask(ty) => {
                 // Default sub-mask geometry needs the full image size.
@@ -2737,6 +2861,9 @@ impl Component for AppModel {
                     self.thumbs.send(i, ThumbMsg::SetRating(r));
                 }
                 self.editor_stars.emit(StarsMsg::External(r));
+                if self.info_visible() {
+                    self.refresh_info_panel(&sender);
+                }
             }
             AppMsg::RateThumb(path, n) => {
                 let cur = self.ratings.get(&path).copied().unwrap_or(0);
@@ -2770,6 +2897,10 @@ impl Component for AppModel {
                 // photo's state isn't shown while the new image decodes. Saved
                 // edits (if any) are applied in BaseReady, after decode.
                 self.reset_edits(&sender);
+                // Clear the previous image's metadata too (Reset button keeps it,
+                // so this lives here, not in reset_edits). Restored from sidecar
+                // on load if present.
+                self.session.meta = Default::default();
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -3319,6 +3450,7 @@ impl Component for AppModel {
                         self.panel.sync(&self.session.adjustments.global);
                         self.session.masks = e.masks;
                         self.session.ai_patches = e.ai_patches;
+                        self.session.meta = e.meta;
                         self.selected_mask = None;
                         self.masks_panel.rebuild(&self.session.masks, None, &sender);
                         // Reseed the crop panel (built with defaults in
@@ -3355,6 +3487,11 @@ impl Component for AppModel {
                     ai_patches: self.session.ai_patches.clone(),
                 }];
                 self.hist_idx = 0;
+                // Refresh the Info panel now the image (dims) + sidecar metadata
+                // are loaded, if it's the visible tab.
+                if self.info_visible() {
+                    self.refresh_info_panel(&sender);
+                }
                 // RawTherapee-style: on a fresh RAW (no saved edits) set the
                 // auto tone curve to match the camera's embedded preview.
                 if !applied_sidecar && rapidraw_core::formats::is_raw_file(&path) {
