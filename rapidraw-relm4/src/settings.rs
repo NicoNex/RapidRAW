@@ -76,7 +76,7 @@ fn index_to_renderer(idx: u32) -> Renderer {
     RENDERER_OPTS.get(idx as usize).map(|&(v, _)| v).unwrap_or(Renderer::Auto)
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Editor preview max edge in px.
@@ -94,6 +94,9 @@ pub struct Settings {
     pub last_export: crate::ExportOpts,
     /// GTK UI renderer (applied via `GSK_RENDERER` at startup; needs a restart).
     pub renderer: Renderer,
+    /// External AI-connector address (host:port) for prompt-driven inpaint.
+    /// Empty/None = only local fast-erase inpaint is available.
+    pub ai_connector_address: Option<String>,
 }
 
 impl Default for Settings {
@@ -109,6 +112,7 @@ impl Default for Settings {
             sort_by: crate::library::SortBy::Name,
             last_export: crate::ExportOpts::default(),
             renderer: Renderer::Auto,
+            ai_connector_address: None,
         }
     }
 }
@@ -223,8 +227,17 @@ pub fn present(
 
     library_group.add(&thumb_row);
 
+    // --- AI group ---
+    let ai_group = adw::PreferencesGroup::new();
+    ai_group.set_title("AI");
+    let connector_row = adw::EntryRow::new();
+    connector_row.set_title("AI connector address (host:port)");
+    connector_row.set_text(current.ai_connector_address.as_deref().unwrap_or(""));
+    ai_group.add(&connector_row);
+
     page.add(&editor_group);
     page.add(&library_group);
+    page.add(&ai_group);
     dialog.add(&page);
 
     // Wrap the rows so a single 'static closure can read all three on change.
@@ -233,6 +246,7 @@ pub fn present(
     let thumb_row = Rc::new(thumb_row);
     let reset_switch = Rc::new(reset_switch);
     let renderer_row = Rc::new(renderer_row);
+    let connector_row = Rc::new(connector_row);
 
     let emit = {
         let background_row = Rc::clone(&background_row);
@@ -240,10 +254,12 @@ pub fn present(
         let thumb_row = Rc::clone(&thumb_row);
         let reset_switch = Rc::clone(&reset_switch);
         let renderer_row = Rc::clone(&renderer_row);
+        let connector_row = Rc::clone(&connector_row);
         let sender = sender.clone();
         move || {
             let preview_idx = preview_row.selected() as usize;
             let thumb_idx = thumb_row.selected() as usize;
+            let addr = connector_row.text().trim().to_string();
             let settings = Settings {
                 preview_dim: PREVIEW_DIMS
                     .get(preview_idx)
@@ -253,10 +269,11 @@ pub fn present(
                 background: index_to_background(background_row.selected()),
                 reset_on_open: reset_switch.is_active(),
                 renderer: index_to_renderer(renderer_row.selected()),
+                ai_connector_address: (!addr.is_empty()).then_some(addr),
                 // Not editable here; carry the persisted prefs through.
                 raw_filter: current.raw_filter,
                 sort_by: current.sort_by,
-                last_export: current.last_export,
+                last_export: current.last_export.clone(),
             };
             sender.input(crate::AppMsg::SettingsChanged(settings));
         }
@@ -281,6 +298,10 @@ pub fn present(
     {
         let emit = emit.clone();
         renderer_row.connect_selected_notify(move |_| emit());
+    }
+    {
+        let emit = emit.clone();
+        connector_row.connect_changed(move |_| emit());
     }
 
     dialog.present();

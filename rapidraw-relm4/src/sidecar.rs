@@ -10,8 +10,26 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use rapidraw_core::mask_generation::MaskDefinition;
+use rapidraw_core::mask_generation::{AiPatchDefinition, MaskDefinition};
 use serde::{Deserialize, Serialize};
+
+/// Editable photo metadata shown in the Info panel. Stored non-destructively in
+/// the sidecar (the original file is never rewritten) and overlaid on the file's
+/// EXIF when displayed. Author fields mirror the Tauri editable EXIF keys.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct ImageMeta {
+    /// ImageDescription.
+    pub title: Option<String>,
+    /// Artist.
+    pub artist: Option<String>,
+    pub copyright: Option<String>,
+    /// UserComment.
+    pub comment: Option<String>,
+    /// User tags (plain strings, no prefix).
+    pub tags: Vec<String>,
+    /// Colour label name (e.g. "red"), or None.
+    pub color: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Edits {
@@ -30,6 +48,13 @@ pub struct Edits {
     /// Tauri sidecar). Defaulted so old sidecars without it still load.
     #[serde(default)]
     pub masks: Vec<MaskDefinition>,
+    /// AI inpaint patches, camelCase JSON (same contract as the Tauri sidecar).
+    /// Defaulted so old sidecars without it still load.
+    #[serde(default)]
+    pub ai_patches: Vec<AiPatchDefinition>,
+    /// Editable photo metadata (Info panel). Defaulted for old sidecars.
+    #[serde(default)]
+    pub meta: ImageMeta,
 }
 
 fn edits_path(image: &Path) -> Option<PathBuf> {

@@ -1,8 +1,10 @@
-use image::{DynamicImage, GenericImageView, GrayImage, Luma};
+use base64::{Engine as _, engine::general_purpose};
+use image::{DynamicImage, GenericImageView, GrayImage, Luma, Rgb, RgbImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::f32::consts::PI;
+use std::io::Cursor;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +51,97 @@ impl MaskDefinition {
         self.sub_masks
             .iter()
             .any(|sm| sm.mask_type == "color" || sm.mask_type == "luminance")
+    }
+}
+
+/// The generated inpaint result stored on a patch: base64 JPEGs of the replaced
+/// color region and its mask. `composite_patches_on_image` blends `color`
+/// through `mask` onto the base.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchData {
+    pub color: String,
+    pub mask: String,
+}
+
+/// An AI inpaint/generative-replace patch container. Same JSON contract as the
+/// React app's `AiPatch` (camelCase). `patch_data` is `None` until generated.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AiPatchDefinition {
+    pub id: String,
+    pub name: String,
+    pub visible: bool,
+    pub invert: bool,
+    pub prompt: String,
+    #[serde(default)]
+    pub patch_data: Option<PatchData>,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+    pub sub_masks: Vec<SubMask>,
+}
+
+/// Encode an inpaint backend result into [`PatchData`]: the mask is rescaled to
+/// the returned patch size, the color is the patch RGB inside the mask (black
+/// outside), both stored as base64 JPEG. Mirrors the tail of the Tauri
+/// `invoke_generative_replace_with_mask_def` command so both UIs store the same
+/// shape.
+pub fn encode_patch_data(
+    mask_bitmap: &GrayImage,
+    patch_rgba: &image::RgbaImage,
+) -> anyhow::Result<PatchData> {
+    let (patch_w, patch_h) = patch_rgba.dimensions();
+    let scaled_mask = image::imageops::resize(
+        mask_bitmap,
+        patch_w,
+        patch_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let mut color_image = RgbImage::new(patch_w, patch_h);
+    for y in 0..patch_h {
+        for x in 0..patch_w {
+            if scaled_mask.get_pixel(x, y)[0] > 0 {
+                let p = patch_rgba.get_pixel(x, y);
+                color_image.put_pixel(x, y, Rgb([p[0], p[1], p[2]]));
+            } else {
+                color_image.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+    }
+
+    let quality = 92;
+    let encode = |img: &dyn EncodableJpeg| -> anyhow::Result<String> {
+        let mut buf = Cursor::new(Vec::new());
+        img.write_jpeg(&mut buf, quality)?;
+        Ok(general_purpose::STANDARD.encode(buf.get_ref()))
+    };
+
+    Ok(PatchData {
+        color: encode(&color_image)?,
+        mask: encode(&scaled_mask)?,
+    })
+}
+
+// ponytail: tiny trait so the JPEG encode closure works for both Rgb and Gray
+// without duplicating the encoder block. Drop if a second use never appears.
+trait EncodableJpeg {
+    fn write_jpeg(&self, buf: &mut Cursor<Vec<u8>>, quality: u8) -> anyhow::Result<()>;
+}
+impl EncodableJpeg for RgbImage {
+    fn write_jpeg(&self, buf: &mut Cursor<Vec<u8>>, quality: u8) -> anyhow::Result<()> {
+        self.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+            buf, quality,
+        ))?;
+        Ok(())
+    }
+}
+impl EncodableJpeg for GrayImage {
+    fn write_jpeg(&self, buf: &mut Cursor<Vec<u8>>, quality: u8) -> anyhow::Result<()> {
+        self.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+            buf, quality,
+        ))?;
+        Ok(())
     }
 }
 
@@ -1095,5 +1188,24 @@ mod tests {
         m.sub_masks[0].mask_type = "ai-subject".into();
         let bmp = generate_mask_bitmap(&m, 10, 10, 1.0, (0.0, 0.0), None, None);
         assert_eq!(bmp.unwrap().get_pixel(5, 5)[0], 0, "no resolver: ai sub-mask contributes nothing");
+    }
+
+    #[test]
+    fn encode_patch_data_keeps_color_inside_mask_only() {
+        // Left half masked-in, right half masked-out. Patch is solid red.
+        let mut mask = GrayImage::new(4, 2);
+        for y in 0..2 {
+            mask.put_pixel(0, y, Luma([255]));
+            mask.put_pixel(1, y, Luma([255]));
+        }
+        let patch = image::RgbaImage::from_pixel(4, 2, image::Rgba([200, 30, 30, 255]));
+        let pd = encode_patch_data(&mask, &patch).unwrap();
+
+        // Decode the stored color JPEG and check masked-out region is black.
+        let bytes = general_purpose::STANDARD.decode(&pd.color).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert!(img.get_pixel(0, 0)[0] > 100, "masked-in pixel keeps color");
+        assert!(img.get_pixel(3, 0)[0] < 50, "masked-out pixel is black");
+        assert!(!pd.mask.is_empty());
     }
 }

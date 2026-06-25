@@ -9,8 +9,9 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView, GrayImage, Rgba, RgbaImage};
 use rapidraw_core::ai::{self, AiState};
+use rapidraw_core::mask_generation::{PatchData, encode_patch_data};
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -87,4 +88,75 @@ pub fn generate(kind: Kind, image: &DynamicImage) -> Result<String, String> {
     }
     .map_err(|e| e.to_string())?;
     ai::encode_mask_png_base64(&gray).map_err(|e| e.to_string())
+}
+
+/// Where the inpaint result comes from.
+pub enum InpaintBackend {
+    /// Local LaMa erase — removes content under the mask, no prompt. Downloads
+    /// the LaMa model on first use.
+    FastErase,
+    /// External generative server (the local AI-connector middleware).
+    /// `source_path` keys its upload cache; `prompt` guides the fill.
+    Connector {
+        base_url: String,
+        source_path: String,
+        prompt: String,
+    },
+}
+
+/// Generate an inpaint patch: run `backend` over `source_image` (other patches
+/// already composited, geometry-applied) within `mask_bitmap` (render-space),
+/// returning the encoded [`PatchData`]. Blocks; call on a worker thread.
+///
+/// Mirrors the tail of the Tauri `invoke_generative_replace_with_mask_def`
+/// command, minus the warp/unwarp dance (relm4 masks are already render-space).
+pub fn run_inpaint(
+    source_image: &DynamicImage,
+    mask_bitmap: &GrayImage,
+    backend: InpaintBackend,
+) -> Result<PatchData, String> {
+    let (st, lock) = state();
+    let progress = |e: ai::DownloadEvent| match e {
+        ai::DownloadEvent::Start(name) => log::info!("AI model download: {name}…"),
+        ai::DownloadEvent::Finish(name) => log::info!("AI model ready: {name}"),
+        ai::DownloadEvent::Progress(msg) => log::info!("AI: {msg}"),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let patch_rgba = match backend {
+        InpaintBackend::FastErase => {
+            let lama = rt
+                .block_on(ai::get_or_init_lama_model(&models_dir(), &progress, st, lock))
+                .map_err(|e| e.to_string())?;
+            ai::run_lama_inpainting(source_image, mask_bitmap, &lama).map_err(|e| e.to_string())?
+        }
+        InpaintBackend::Connector {
+            base_url,
+            source_path,
+            prompt,
+        } => {
+            // Server expects an RGBA mask the size of the source (white = fill).
+            let (w, h) = source_image.dimensions();
+            let mut rgba = RgbaImage::new(w, h);
+            for (x, y, p) in mask_bitmap.enumerate_pixels() {
+                let i = p[0];
+                rgba.put_pixel(x, y, Rgba([i, i, i, 255]));
+            }
+            let mask_dyn = DynamicImage::ImageRgba8(rgba);
+            rt.block_on(rapidraw_core::ai_connector::process_inpainting(
+                &base_url,
+                &source_path,
+                source_image,
+                &mask_dyn,
+                prompt,
+                None,
+            ))
+            .map_err(|e| e.to_string())?
+        }
+    };
+
+    encode_patch_data(mask_bitmap, &patch_rgba).map_err(|e| e.to_string())
 }

@@ -172,7 +172,7 @@ fn default_sub_params(mask_type: &str, w: f32, h: f32) -> Value {
         "flow" => json!({ "lines": [], "flow": 10.0 }),
         "brush" => json!({ "lines": [] }),
         // AI types: empty mask until generated; grow/feather refine the result.
-        "ai-subject" | "ai-foreground" => {
+        "ai-subject" | "ai-foreground" | "quick-eraser" => {
             json!({ "maskDataBase64": null, "grow": 0.0, "feather": 0.0 })
         }
         "ai-sky" => json!({ "maskDataBase64": null, "grow": 0.0, "feather": 0.0 }),
@@ -214,13 +214,13 @@ pub fn new_mask(label: &str, mask_type: &str, w: f32, h: f32) -> MaskDefinition 
 /// Normalized (0..1) drawable shapes for a mask's visible radial/linear
 /// sub-masks, for the canvas overlay. `(w, h)` is the full image size (params are
 /// full-res pixels). Brush/flow/color/luminance/all have no drawable shape.
-pub fn overlay_shapes(m: &MaskDefinition, w: f64, h: f64) -> Vec<crate::editor::MaskShape> {
+pub fn overlay_shapes(sub_masks: &[SubMask], w: f64, h: f64) -> Vec<crate::editor::MaskShape> {
     use crate::editor::MaskShape;
     if w <= 0.0 || h <= 0.0 {
         return Vec::new();
     }
     let g = |p: &Value, k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-    m.sub_masks
+    sub_masks
         .iter()
         .enumerate()
         .filter(|(_, sm)| sm.visible)
@@ -336,7 +336,12 @@ impl MasksPanel {
 /// The "Add mask" menu button (popover of non-AI types).
 fn add_menu(sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
     let btn = gtk::MenuButton::new();
-    btn.set_label("Add mask");
+    btn.set_child(Some(
+        &adw::ButtonContent::builder()
+            .icon_name("add-regular")
+            .label("Add mask")
+            .build(),
+    ));
     btn.add_css_class("flat");
 
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -362,7 +367,12 @@ fn add_menu(sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
 /// "Add sub-mask" menu for a container (non-AI types), emitting `AddSubMask`.
 fn sub_add_menu(mask_i: usize, sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
     let btn = gtk::MenuButton::new();
-    btn.set_label("Add sub-mask");
+    btn.set_child(Some(
+        &adw::ButtonContent::builder()
+            .icon_name("add-regular")
+            .label("Add sub-mask")
+            .build(),
+    ));
     btn.add_css_class("flat");
     btn.set_margin_start(6);
     btn.set_margin_end(6);
@@ -399,9 +409,9 @@ fn mask_row(
 
     let eye = gtk::ToggleButton::new();
     eye.set_icon_name(if m.visible {
-        "display-brightness-symbolic"
+        "eye-regular"
     } else {
-        "weather-clear-night-symbolic"
+        "eye-off-regular"
     });
     eye.set_active(m.visible);
     eye.add_css_class("flat");
@@ -695,7 +705,10 @@ fn build_mask_grading(
 
 /// Geometry + compositing-mode editor for one sub-mask (libadwaita rows). Brush/
 /// flow show a canvas hint (P4); "all" has no geometry.
-fn submask_editor(
+/// Build the editor group for one sub-mask. Shared with the inpaint panel:
+/// `mask_i` is the container index (a mask or, when the inpaint panel is active,
+/// a patch) — the handlers route by the model's `edit_patch` flag.
+pub fn submask_editor(
     mask_i: usize,
     sub_i: usize,
     sm: &SubMask,
@@ -711,9 +724,9 @@ fn submask_editor(
     let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     let eye = gtk::ToggleButton::new();
     eye.set_icon_name(if sm.visible {
-        "display-brightness-symbolic"
+        "eye-regular"
     } else {
-        "weather-clear-night-symbolic"
+        "eye-off-regular"
     });
     eye.set_active(sm.visible);
     eye.add_css_class("flat");
