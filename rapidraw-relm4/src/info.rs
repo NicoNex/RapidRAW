@@ -192,15 +192,30 @@ fn author_group(d: &InfoData, sender: &ComponentSender<AppModel>) -> adw::Prefer
     group
 }
 
+/// A captioned block: small uppercase label above a full-width control. Used
+/// instead of ActionRow suffixes for the wide rating/colour/tag controls (a wide
+/// suffix squeezes the ActionRow title until it wraps one char per line).
+fn labeled_block(caption: &str, content: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    b.set_margin_top(8);
+    b.set_margin_bottom(8);
+    b.set_margin_start(12);
+    b.set_margin_end(12);
+    let lbl = gtk::Label::new(Some(caption));
+    lbl.add_css_class("caption-heading");
+    lbl.add_css_class("dim-label");
+    lbl.set_halign(gtk::Align::Start);
+    b.append(&lbl);
+    b.append(content);
+    b
+}
+
 fn organization_group(d: &InfoData, sender: &ComponentSender<AppModel>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Organization");
 
     // Rating: five toggle stars.
-    let rating_row = adw::ActionRow::new();
-    rating_row.set_title("Rating");
     let stars = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-    stars.set_valign(gtk::Align::Center);
     for n in 1..=5u8 {
         let b = gtk::Button::new();
         b.set_icon_name(if n <= d.rating {
@@ -218,14 +233,14 @@ fn organization_group(d: &InfoData, sender: &ComponentSender<AppModel>) -> adw::
         });
         stars.append(&b);
     }
-    rating_row.add_suffix(&stars);
-    group.add(&rating_row);
+    group.add(&labeled_block("Rating", &stars));
 
-    // Colour label: swatches + a clear button.
-    let color_row = adw::ActionRow::new();
-    color_row.set_title("Colour label");
-    let swatches = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    swatches.set_valign(gtk::Align::Center);
+    // Colour label: a clear button + swatches, wrapping if needed.
+    let swatches = gtk::FlowBox::new();
+    swatches.set_selection_mode(gtk::SelectionMode::None);
+    swatches.set_max_children_per_line(8);
+    swatches.set_column_spacing(2);
+    swatches.set_halign(gtk::Align::Start);
     let clear = gtk::Button::from_icon_name("edit-clear-symbolic");
     clear.add_css_class("flat");
     clear.set_tooltip_text(Some("No label"));
@@ -241,23 +256,21 @@ fn organization_group(d: &InfoData, sender: &ComponentSender<AppModel>) -> adw::
         let selected = d.meta.color.as_deref() == Some(cname);
         let glyph = if selected { "●" } else { "○" };
         let dot = gtk::Label::new(None);
-        dot.set_markup(&format!("<span foreground='{hex}' size='x-large'>{glyph}</span>"));
+        dot.set_markup(&format!("<span foreground='{hex}' size='large'>{glyph}</span>"));
         b.set_child(Some(&dot));
         let sender = sender.clone();
         b.connect_clicked(move |_| sender.input(AppMsg::SetColorLabel(Some(cname.to_string()))));
         swatches.append(&b);
     }
-    color_row.add_suffix(&swatches);
-    group.add(&color_row);
+    group.add(&labeled_block("Colour label", &swatches));
 
-    // Tags: existing chips, then an add entry.
+    // Tags: existing chips (wrapping), then an add entry.
     if !d.meta.tags.is_empty() {
         let chips = gtk::FlowBox::new();
         chips.set_selection_mode(gtk::SelectionMode::None);
         chips.set_column_spacing(4);
         chips.set_row_spacing(4);
-        chips.set_margin_top(2);
-        chips.set_margin_bottom(2);
+        chips.set_halign(gtk::Align::Start);
         for tag in &d.meta.tags {
             let chip = gtk::Button::with_label(&format!("{tag}  ✕"));
             chip.add_css_class("pill");
@@ -267,10 +280,7 @@ fn organization_group(d: &InfoData, sender: &ComponentSender<AppModel>) -> adw::
             chip.connect_clicked(move |_| sender.input(AppMsg::RemoveMetaTag(tag.clone())));
             chips.append(&chip);
         }
-        let chips_row = adw::ActionRow::new();
-        chips_row.set_title("Tags");
-        chips_row.set_child(Some(&chips));
-        group.add(&chips_row);
+        group.add(&labeled_block("Tags", &chips));
     }
     let add = adw::EntryRow::new();
     add.set_title("Add tag");
