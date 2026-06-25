@@ -5119,6 +5119,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "blake3",
  "bytemuck",
  "glam 0.32.1",
  "half",

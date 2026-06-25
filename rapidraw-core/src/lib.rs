@@ -19,6 +19,11 @@ pub mod mask_generation;
 #[cfg(feature = "ai")]
 pub mod ai;
 
+/// HTTP client for the external generative-inpaint backend (local AI-connector
+/// or cloud middleware). Feature-gated with `ai` since it needs `reqwest`.
+#[cfg(feature = "ai")]
+pub mod ai_connector;
+
 mod context;
 pub use context::headless_context;
 

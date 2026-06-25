@@ -6,16 +6,12 @@ use crate::file_management::{parse_virtual_path, read_file_mapped};
 use crate::formats::is_raw_file;
 use crate::image_processing::ImageMetadata;
 use crate::image_processing::{apply_orientation, remove_raw_artifacts_and_enhance};
-use crate::mask_generation::{MaskDefinition, SubMask, generate_mask_bitmap};
 use crate::raw_processing::develop_raw_image;
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose};
 use exif::{Reader as ExifReader, Tag};
-use image::{DynamicImage, GenericImageView, ImageReader, imageops};
+use image::{DynamicImage, GenericImageView, ImageReader};
 use rawler::Orientation;
-use rayon::prelude::*;
-use serde::Deserialize;
-use serde_json::{Value, from_value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::panic;
@@ -33,17 +29,6 @@ pub struct LoadImageResult {
     pub metadata: ImageMetadata,
     pub exif: HashMap<String, String>,
     pub is_raw: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PatchMaskInfo {
-    id: String,
-    name: String,
-    #[serde(default)]
-    invert: bool,
-    #[serde(default)]
-    sub_masks: Vec<SubMask>,
 }
 
 pub fn load_and_composite(
@@ -211,124 +196,17 @@ pub fn load_image_with_orientation(
     Ok(DynamicImage::ImageRgb32F(oriented_image.to_rgb32f()))
 }
 
+/// Thin wrapper over the core implementation, injecting the AI sub-mask resolver
+/// so patches whose mask is regenerated from AI sub_masks keep working.
 pub fn composite_patches_on_image(
     base_image: &DynamicImage,
     current_adjustments: &Value,
 ) -> Result<DynamicImage> {
-    let patches_val = match current_adjustments.get("aiPatches") {
-        Some(val) => val,
-        None => return Ok(base_image.clone()),
-    };
-
-    let patches_arr = match patches_val.as_array() {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => return Ok(base_image.clone()),
-    };
-
-    let visible_patches: Vec<&Value> = patches_arr
-        .par_iter()
-        .filter(|patch_obj| {
-            let is_visible = patch_obj
-                .get("visible")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if !is_visible {
-                return false;
-            }
-            patch_obj
-                .get("patchData")
-                .and_then(|data| data.get("color"))
-                .and_then(|color| color.as_str())
-                .is_some_and(|s| !s.is_empty())
-        })
-        .collect();
-
-    if visible_patches.is_empty() {
-        return Ok(base_image.clone());
-    }
-
-    let (base_w, base_h) = base_image.dimensions();
-    let mut composited_rgba = base_image.to_rgba32f();
-
-    for patch_obj in visible_patches {
-        let patch_data = patch_obj.get("patchData").context("Missing patchData")?;
-
-        let mask_bitmap = if let Some(mask_b64) = patch_data
-            .get("mask")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            let mask_bytes = general_purpose::STANDARD.decode(mask_b64)?;
-            let mask_img = image::load_from_memory(&mask_bytes)?.to_luma8();
-            if mask_img.width() != base_w || mask_img.height() != base_h {
-                imageops::resize(&mask_img, base_w, base_h, imageops::FilterType::Lanczos3)
-            } else {
-                mask_img
-            }
-        } else {
-            let patch_info: PatchMaskInfo = from_value(patch_obj.clone())
-                .context("Failed to deserialize patch info for mask generation")?;
-
-            let mask_def = MaskDefinition {
-                id: patch_info.id,
-                name: patch_info.name,
-                visible: true,
-                invert: patch_info.invert,
-                opacity: 100.0,
-                adjustments: Value::Null,
-                sub_masks: patch_info.sub_masks,
-            };
-
-            generate_mask_bitmap(&mask_def, base_w, base_h, 1.0, (0.0, 0.0), None)
-                .context("Failed to generate mask from sub_masks for compositing")?
-        };
-
-        let color_b64 = patch_data
-            .get("color")
-            .and_then(|v| v.as_str())
-            .context("Missing color data")?;
-        let color_bytes = general_purpose::STANDARD.decode(color_b64)?;
-        let color_image_u8 = image::load_from_memory(&color_bytes)?.to_rgb8();
-
-        let (patch_w, patch_h) = color_image_u8.dimensions();
-        let color_image_f32 = if base_w != patch_w || base_h != patch_h {
-            let resized = imageops::resize(
-                &color_image_u8,
-                base_w,
-                base_h,
-                imageops::FilterType::Lanczos3,
-            );
-            DynamicImage::ImageRgb8(resized).to_rgb32f()
-        } else {
-            DynamicImage::ImageRgb8(color_image_u8).to_rgb32f()
-        };
-
-        composited_rgba
-            .par_chunks_mut((base_w * 4) as usize)
-            .enumerate()
-            .for_each(|(y, row)| {
-                for x in 0..base_w as usize {
-                    let mask_value = mask_bitmap.get_pixel(x as u32, y as u32)[0];
-
-                    if mask_value > 0 {
-                        let patch_pixel = color_image_f32.get_pixel(x as u32, y as u32);
-
-                        let alpha = mask_value as f32 / 255.0;
-                        let one_minus_alpha = 1.0 - alpha;
-
-                        let base_r = row[x * 4];
-                        let base_g = row[x * 4 + 1];
-                        let base_b = row[x * 4 + 2];
-
-                        row[x * 4] = patch_pixel[0] * alpha + base_r * one_minus_alpha;
-                        row[x * 4 + 1] = patch_pixel[1] * alpha + base_g * one_minus_alpha;
-                        row[x * 4 + 2] = patch_pixel[2] * alpha + base_b * one_minus_alpha;
-                    }
-                }
-            });
-    }
-
-    Ok(DynamicImage::ImageRgba32F(composited_rgba))
+    rapidraw_core::image_loader::composite_patches_on_image(
+        base_image,
+        current_adjustments,
+        Some(&rapidraw_core::ai::ai_sub_mask_resolver),
+    )
 }
 
 #[tauri::command]

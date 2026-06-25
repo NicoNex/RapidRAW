@@ -1,4 +1,4 @@
-pub use rapidraw_core::mask_generation::{MaskDefinition, SubMask};
+pub use rapidraw_core::mask_generation::{AiPatchDefinition, MaskDefinition};
 
 use base64::{Engine as _, engine::general_purpose};
 use image::{DynamicImage, GrayImage, ImageFormat, Rgba, RgbaImage};
@@ -9,34 +9,6 @@ use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::get_cached_full_warped_image;
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-#[serde(crate = "serde")]
-#[serde(rename_all = "camelCase")]
-pub struct PatchData {
-    pub color: String,
-    pub mask: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-#[serde(crate = "serde")]
-#[serde(rename_all = "camelCase")]
-pub struct AiPatchDefinition {
-    pub id: String,
-    pub name: String,
-    pub visible: bool,
-    pub invert: bool,
-    pub prompt: String,
-    #[serde(default)]
-    pub patch_data: Option<PatchData>,
-    #[serde(default = "default_opacity")]
-    pub opacity: f32,
-    pub sub_masks: Vec<SubMask>,
-}
-
-fn default_opacity() -> f32 {
-    100.0
-}
 
 /// Same signature the rest of src-tauri already calls; injects the AI resolver
 /// so AI sub-masks keep working while non-AI rasterization lives in core.
