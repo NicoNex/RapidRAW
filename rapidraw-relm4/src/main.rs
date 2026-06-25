@@ -1803,21 +1803,26 @@ impl Component for AppModel {
         tabs.set_halign(gtk::Align::Center);
         tabs.set_margin_top(6);
         tabs.set_margin_bottom(2);
-        // Text labels: Adwaita has no crop/adjust symbolic icons, so icon names
-        // render as the "missing image" placeholder. Tabs read fine as text.
-        let adj_btn = gtk::ToggleButton::with_label("Edit");
+        // Icon tabs (relm4-icons line glyphs), matching the Tauri rail. Tooltips
+        // carry the names since the buttons are icon-only.
+        let adj_btn = gtk::ToggleButton::new();
+        adj_btn.set_icon_name("options-regular");
         adj_btn.set_tooltip_text(Some("Adjustments"));
         adj_btn.set_active(true);
-        let crop_btn = gtk::ToggleButton::with_label("Crop");
+        let crop_btn = gtk::ToggleButton::new();
+        crop_btn.set_icon_name("crop-regular");
         crop_btn.set_tooltip_text(Some("Crop & geometry"));
         crop_btn.set_group(Some(&adj_btn));
-        let masks_btn = gtk::ToggleButton::with_label("Masks");
+        let masks_btn = gtk::ToggleButton::new();
+        masks_btn.set_icon_name("layer-diagonal-regular");
         masks_btn.set_tooltip_text(Some("Masks"));
         masks_btn.set_group(Some(&adj_btn));
-        let ai_btn = gtk::ToggleButton::with_label("Inpaint");
+        let ai_btn = gtk::ToggleButton::new();
+        ai_btn.set_icon_name("paint-brush-regular");
         ai_btn.set_tooltip_text(Some("Inpaint (generative replace)"));
         ai_btn.set_group(Some(&adj_btn));
-        let info_btn = gtk::ToggleButton::with_label("Info");
+        let info_btn = gtk::ToggleButton::new();
+        info_btn.set_icon_name("info-regular");
         info_btn.set_tooltip_text(Some("Photo info & metadata"));
         info_btn.set_group(Some(&adj_btn));
         {
@@ -4021,5 +4026,8 @@ fn main() {
     log::info!("GPU context initialized");
 
     let app = RelmApp::new("com.rapidraw.relm4");
+    // Register the bundled relm4-icons gresource so set_icon_name resolves the
+    // line icons used by the tabs / inpaint cards (matches the app id above).
+    relm4_icons::initialize_icons();
     app.run::<AppModel>(engine);
 }

@@ -1,4 +1,4 @@
-//! Right-rail "AI" panel: AI inpaint patches (generative replace / quick erase).
+//! Right-rail "Inpaint" panel: AI inpaint patches (generative replace / quick erase).
 //! Mirrors the default UI's inpaint section. A patch is a container of sub-masks
 //! (brush region or AI auto-mask) plus a prompt; pressing Generate runs the
 //! inpaint engine (local LaMa erase, or the external connector for prompt-driven
@@ -16,7 +16,7 @@ use crate::{AppModel, AppMsg};
 
 /// Region types offered inside a patch: `(label, type-string)`. AI types segment
 /// automatically; brush paints; radial/linear are drawn on the canvas. (Quick
-/// Erase is a patch *kind*, not a region — see [`PatchKind`].)
+/// Erase is a top-level create tool, listed in `CREATE_TOOLS`, not here.)
 const PATCH_SUB_TYPES: &[(&str, &str)] = &[
     ("AI Subject", "ai-subject"),
     ("AI Foreground", "ai-foreground"),
@@ -138,16 +138,17 @@ fn create_grid(sender: &ComponentSender<AppModel>) -> gtk::Grid {
     grid
 }
 
-/// Symbolic icon for a create tool. Only names guaranteed present in the stock
-/// Adwaita icon theme are used (so no broken placeholders); the rest are
-// label-only until relm4-icons lands matching glyphs.
-// ponytail: swap to relm4-icons names once that crate is wired for full parity.
+/// relm4-icons line glyph for each create tool (bundled via icons.toml).
 fn tool_icon(ty: &str) -> Option<&'static str> {
-    match ty {
-        "quick-eraser" => Some("edit-clear-symbolic"),
-        "ai-foreground" => Some("avatar-default-symbolic"),
-        _ => None,
-    }
+    Some(match ty {
+        "quick-eraser" => "eraser",
+        "ai-subject" => "sparkle-regular",
+        "ai-foreground" => "person-regular",
+        "brush" => "paint-brush-regular",
+        "linear" => "line-horizontal-4-regular",
+        "radial" => "circle-regular",
+        _ => return None,
+    })
 }
 
 /// One patch-list row: visibility toggle | name (selects) | delete.
@@ -162,9 +163,9 @@ fn patch_row(
 
     let eye = gtk::ToggleButton::new();
     eye.set_icon_name(if p.visible {
-        "display-brightness-symbolic"
+        "eye-regular"
     } else {
-        "weather-clear-night-symbolic"
+        "eye-off-regular"
     });
     eye.set_active(p.visible);
     eye.add_css_class("flat");
@@ -277,7 +278,12 @@ fn patch_details(
 /// "Add region" menu for a patch (brush / AI auto-mask), emitting `AddSubMask`.
 fn sub_add_menu(patch_i: usize, sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
     let btn = gtk::MenuButton::new();
-    btn.set_label("Add region");
+    btn.set_child(Some(
+        &adw::ButtonContent::builder()
+            .icon_name("add-regular")
+            .label("Add region")
+            .build(),
+    ));
     btn.add_css_class("flat");
     btn.set_margin_start(6);
     btn.set_margin_end(6);

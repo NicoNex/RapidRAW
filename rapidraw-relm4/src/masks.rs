@@ -336,7 +336,12 @@ impl MasksPanel {
 /// The "Add mask" menu button (popover of non-AI types).
 fn add_menu(sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
     let btn = gtk::MenuButton::new();
-    btn.set_label("Add mask");
+    btn.set_child(Some(
+        &adw::ButtonContent::builder()
+            .icon_name("add-regular")
+            .label("Add mask")
+            .build(),
+    ));
     btn.add_css_class("flat");
 
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -362,7 +367,12 @@ fn add_menu(sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
 /// "Add sub-mask" menu for a container (non-AI types), emitting `AddSubMask`.
 fn sub_add_menu(mask_i: usize, sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
     let btn = gtk::MenuButton::new();
-    btn.set_label("Add sub-mask");
+    btn.set_child(Some(
+        &adw::ButtonContent::builder()
+            .icon_name("add-regular")
+            .label("Add sub-mask")
+            .build(),
+    ));
     btn.add_css_class("flat");
     btn.set_margin_start(6);
     btn.set_margin_end(6);
@@ -399,9 +409,9 @@ fn mask_row(
 
     let eye = gtk::ToggleButton::new();
     eye.set_icon_name(if m.visible {
-        "display-brightness-symbolic"
+        "eye-regular"
     } else {
-        "weather-clear-night-symbolic"
+        "eye-off-regular"
     });
     eye.set_active(m.visible);
     eye.add_css_class("flat");
@@ -714,9 +724,9 @@ pub fn submask_editor(
     let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     let eye = gtk::ToggleButton::new();
     eye.set_icon_name(if sm.visible {
-        "display-brightness-symbolic"
+        "eye-regular"
     } else {
-        "weather-clear-night-symbolic"
+        "eye-off-regular"
     });
     eye.set_active(sm.visible);
     eye.add_css_class("flat");
