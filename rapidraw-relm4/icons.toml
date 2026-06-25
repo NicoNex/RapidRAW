@@ -2,8 +2,6 @@
 # the file stem without the `-symbolic.svg` suffix. Used for the right-rail tabs
 # and the inpaint "create" cards (and other buttons that read clearer with an
 # icon). Keep this list tight — only what's actually referenced.
-app_id = "com.rapidraw.relm4"
-base_resource_path = "/com/rapidraw/relm4/"
 icons = [
     # Right-rail tabs
     "options-regular",        # Adjust

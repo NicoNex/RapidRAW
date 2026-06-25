@@ -1448,6 +1448,11 @@ impl Component for AppModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        // Register the bundled relm4-icons gresource and add it to the icon theme
+        // (needs a live display, so it runs here, not in main()). Without this the
+        // tab/card icon names fall back to the broken-image placeholder.
+        relm4_icons::initialize_icons();
+
         let thumbs = FactoryVecDeque::builder()
             .launch(gtk::FlowBox::default())
             .forward(sender.input_sender(), |out| match out {
@@ -4026,8 +4031,5 @@ fn main() {
     log::info!("GPU context initialized");
 
     let app = RelmApp::new("com.rapidraw.relm4");
-    // Register the bundled relm4-icons gresource so set_icon_name resolves the
-    // line icons used by the tabs / inpaint cards (matches the app id above).
-    relm4_icons::initialize_icons();
     app.run::<AppModel>(engine);
 }
