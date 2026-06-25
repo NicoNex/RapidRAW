@@ -210,7 +210,9 @@ enum AppMsg {
     /// Inpaint panel actions. Patches reuse the sub-mask messages below
     /// (AddSubMask/DeleteSubMask/…); routing to a patch vs a mask is decided by
     /// the `edit_patch` flag set when a patch is selected.
-    AddPatch,
+    /// Create a new patch seeded with the given region tool (one of the
+    /// "Create New Generative Edit" grid cards).
+    AddPatch(&'static str),
     SelectPatch(Option<usize>),
     DeletePatch(usize),
     TogglePatchVisible(usize),
@@ -1812,8 +1814,8 @@ impl Component for AppModel {
         let masks_btn = gtk::ToggleButton::with_label("Masks");
         masks_btn.set_tooltip_text(Some("Masks"));
         masks_btn.set_group(Some(&adj_btn));
-        let ai_btn = gtk::ToggleButton::with_label("AI");
-        ai_btn.set_tooltip_text(Some("AI inpaint (generative replace)"));
+        let ai_btn = gtk::ToggleButton::with_label("Inpaint");
+        ai_btn.set_tooltip_text(Some("Inpaint (generative replace)"));
         ai_btn.set_group(Some(&adj_btn));
         let info_btn = gtk::ToggleButton::with_label("Info");
         info_btn.set_tooltip_text(Some("Photo info & metadata"));
@@ -2164,11 +2166,12 @@ impl Component for AppModel {
                 );
                 self.refresh_mask_overlay();
             }
-            AppMsg::AddPatch => {
+            AppMsg::AddPatch(region_ty) => {
                 let n = self.session.ai_patches.len() + 1;
+                let label = inpaint::tool_label(region_ty);
                 self.session.ai_patches.push(AiPatchDefinition {
                     id: format!("patch-{}", next_patch_id()),
-                    name: format!("Patch {n}"),
+                    name: format!("{label} {n}"),
                     visible: true,
                     invert: false,
                     prompt: String::new(),
@@ -2179,6 +2182,9 @@ impl Component for AppModel {
                 let i = self.session.ai_patches.len() - 1;
                 self.selected_patch = Some(i);
                 self.edit_patch = Some(i);
+                // Quick Erase defaults to local fast erase; the rest to the
+                // prompt-driven connector (toggle on the patch overrides).
+                self.inpaint_fast = region_ty == "quick-eraser";
                 self.inpaint_panel.rebuild(
                     &self.session.ai_patches,
                     self.selected_patch,
@@ -2186,6 +2192,8 @@ impl Component for AppModel {
                     &sender,
                 );
                 self.schedule_history(&sender);
+                // Seed the chosen region (auto-arms its tool via AddSubMask).
+                sender.input(AppMsg::AddSubMask(i, region_ty));
             }
             AppMsg::SelectPatch(idx) => {
                 self.selected_patch = idx;

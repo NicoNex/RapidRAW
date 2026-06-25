@@ -14,17 +14,36 @@ use rapidraw_core::mask_generation::AiPatchDefinition;
 
 use crate::{AppModel, AppMsg};
 
-/// Region types offered for a patch: `(label, type-string)`, matching the Tauri
-/// inpaint tools. AI types segment automatically; brush paints; radial/linear
-/// are drawn on the canvas.
+/// Region types offered inside a patch: `(label, type-string)`. AI types segment
+/// automatically; brush paints; radial/linear are drawn on the canvas. (Quick
+/// Erase is a patch *kind*, not a region — see [`PatchKind`].)
 const PATCH_SUB_TYPES: &[(&str, &str)] = &[
-    ("Quick Erase", "quick-eraser"),
     ("AI Subject", "ai-subject"),
     ("AI Foreground", "ai-foreground"),
     ("Brush", "brush"),
     ("Linear", "linear"),
     ("Radial", "radial"),
 ];
+
+/// The "Create New Generative Edit" grid cards: `(label, region type)`. Each
+/// creates a patch seeded with that region tool, mirroring the Tauri grid.
+const CREATE_TOOLS: &[(&str, &str)] = &[
+    ("Quick Erase", "quick-eraser"),
+    ("Subject", "ai-subject"),
+    ("Foreground", "ai-foreground"),
+    ("Brush", "brush"),
+    ("Linear", "linear"),
+    ("Radial", "radial"),
+];
+
+/// Display label for a region tool type (for the patch name).
+pub fn tool_label(ty: &str) -> &'static str {
+    CREATE_TOOLS
+        .iter()
+        .find(|(_, t)| *t == ty)
+        .map(|(l, _)| *l)
+        .unwrap_or("Patch")
+}
 
 pub struct InpaintPanel {
     root: gtk::ScrolledWindow,
@@ -64,35 +83,70 @@ impl InpaintPanel {
             self.body.remove(&c);
         }
 
-        let add = gtk::Button::with_label("Add patch");
-        add.add_css_class("flat");
-        {
-            let sender = sender.clone();
-            add.connect_clicked(move |_| sender.input(AppMsg::AddPatch));
-        }
-        self.body.append(&add);
+        let heading = gtk::Label::new(Some("Create New Generative Edit"));
+        heading.add_css_class("heading");
+        heading.set_halign(gtk::Align::Start);
+        heading.set_margin_bottom(2);
+        self.body.append(&heading);
+        self.body.append(&create_grid(sender));
 
-        if patches.is_empty() {
-            let hint = gtk::Label::new(Some("No patches. Add one above, draw or\nauto-mask a region, then Generate."));
-            hint.add_css_class("dim-label");
-            hint.set_margin_top(8);
-            self.body.append(&hint);
-            return;
+        if !patches.is_empty() {
+            let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            list.add_css_class("card");
+            list.set_margin_top(8);
+            for (i, p) in patches.iter().enumerate() {
+                list.append(&patch_row(i, p, selected == Some(i), sender));
+            }
+            self.body.append(&list);
         }
-
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        list.add_css_class("card");
-        list.set_margin_top(4);
-        for (i, p) in patches.iter().enumerate() {
-            list.append(&patch_row(i, p, selected == Some(i), sender));
-        }
-        self.body.append(&list);
 
         if let Some(i) = selected {
             if let Some(p) = patches.get(i) {
                 self.body.append(&patch_details(i, p, fast, sender));
             }
         }
+    }
+}
+
+/// The 2-column "Create New Generative Edit" card grid. Each card creates a new
+/// patch seeded with that tool's region.
+fn create_grid(sender: &ComponentSender<AppModel>) -> gtk::Grid {
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(6);
+    grid.set_column_spacing(6);
+    grid.set_column_homogeneous(true);
+    for (idx, &(label, ty)) in CREATE_TOOLS.iter().enumerate() {
+        let card = gtk::Button::new();
+        card.add_css_class("card");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        if let Some(icon) = tool_icon(ty) {
+            let img = gtk::Image::from_icon_name(icon);
+            img.set_pixel_size(22);
+            content.append(&img);
+        }
+        let lbl = gtk::Label::new(Some(label));
+        lbl.set_wrap(true);
+        lbl.set_justify(gtk::Justification::Center);
+        content.append(&lbl);
+        card.set_child(Some(&content));
+        let sender = sender.clone();
+        card.connect_clicked(move |_| sender.input(AppMsg::AddPatch(ty)));
+        grid.attach(&card, (idx % 2) as i32, (idx / 2) as i32, 1, 1);
+    }
+    grid
+}
+
+/// Symbolic icon for a create tool. Only names guaranteed present in the stock
+/// Adwaita icon theme are used (so no broken placeholders); the rest are
+// label-only until relm4-icons lands matching glyphs.
+// ponytail: swap to relm4-icons names once that crate is wired for full parity.
+fn tool_icon(ty: &str) -> Option<&'static str> {
+    match ty {
+        "quick-eraser" => Some("edit-clear-symbolic"),
+        "ai-foreground" => Some("avatar-default-symbolic"),
+        _ => None,
     }
 }
 
