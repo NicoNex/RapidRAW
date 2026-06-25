@@ -1089,6 +1089,7 @@ impl Component for AppModel {
                         set_title: "RapidRAW",
                         #[wrap(Some)]
                         set_child = &adw::ToolbarView {
+                            #[name = "header_lib"]
                             add_top_bar = &adw::HeaderBar {
                                 // macOS controls live on the left sidebar header;
                                 // here only the right-side controls (Linux close).
@@ -1168,6 +1169,7 @@ impl Component for AppModel {
                         set_title: "Editor",
                         #[wrap(Some)]
                         set_child = &adw::ToolbarView {
+                            #[name = "header_ed"]
                             add_top_bar = &adw::HeaderBar {
                                 // macOS controls live on the left sidebar header;
                                 // here only the right-side controls (Linux close).
@@ -1685,11 +1687,26 @@ impl Component for AppModel {
                 .scopes
                 .set_clip_toggle(move |on| sender.input(AppMsg::ToggleClipping(on)));
         }
+        // macOS: native traffic lights sit at the window's top-left. They normally
+        // live over the sidebar header; when the sidebar collapses, the content
+        // header slides under them and they cover the toggle/Open Folder buttons.
+        // Reserve the controls inset on the content headers while collapsed so the
+        // buttons shift clear. No-op on Linux (controls live on the right).
+        let header_lib = widgets.header_lib.clone();
+        let header_ed = widgets.header_ed.clone();
+        let reserve_inset = move |sidebar_visible: bool| {
+            if cfg!(target_os = "macos") {
+                header_lib.set_show_start_title_buttons(!sidebar_visible);
+                header_ed.set_show_start_title_buttons(!sidebar_visible);
+            }
+        };
         {
             let sb = model.sidebar.widget().clone();
             let other = widgets.sidebar_toggle_ed.clone();
+            let reserve_inset = reserve_inset.clone();
             widgets.sidebar_toggle_lib.connect_toggled(move |b| {
                 sb.set_visible(b.is_active());
+                reserve_inset(b.is_active());
                 if other.is_active() != b.is_active() {
                     other.set_active(b.is_active());
                 }
@@ -1698,8 +1715,10 @@ impl Component for AppModel {
         {
             let sb = model.sidebar.widget().clone();
             let other = widgets.sidebar_toggle_lib.clone();
+            let reserve_inset = reserve_inset.clone();
             widgets.sidebar_toggle_ed.connect_toggled(move |b| {
                 sb.set_visible(b.is_active());
+                reserve_inset(b.is_active());
                 if other.is_active() != b.is_active() {
                     other.set_active(b.is_active());
                 }
@@ -1708,6 +1727,7 @@ impl Component for AppModel {
         widgets.split.set_start_child(Some(model.sidebar.widget()));
         // Hidden until a folder is opened (no sidebar on the welcome/splash screen).
         model.sidebar.widget().set_visible(false);
+        reserve_inset(false); // sidebar starts hidden; reserve the macOS controls inset
         widgets.editor_stars_slot.append(model.editor_stars.widget());
         model.sidebar.emit(SidebarIn::SetAlbums(model.albums.clone()));
         ComponentParts { model, widgets }
