@@ -1100,14 +1100,37 @@ fn brush_controls(
     }
     group.add(&feather);
 
-    let erase = adw::SwitchRow::new();
-    erase.set_title("Eraser");
-    erase.set_subtitle("Paint to subtract from this mask");
+    // Add | Erase as a linked segmented toggle (Tauri BrushTools), not a switch.
+    let seg = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    seg.add_css_class("linked");
+    seg.set_homogeneous(true);
+    seg.set_hexpand(true);
+    let add_btn = gtk::ToggleButton::with_label("Add");
+    let erase_btn = gtk::ToggleButton::with_label("Erase");
+    erase_btn.set_group(Some(&add_btn));
+    add_btn.set_active(true); // default = paint (add)
     {
         let sender = sender.clone();
-        erase.connect_active_notify(move |r| sender.input(AppMsg::SetBrushErase(r.is_active())));
+        add_btn.connect_toggled(move |b| {
+            if b.is_active() {
+                sender.input(AppMsg::SetBrushErase(false));
+            }
+        });
     }
-    group.add(&erase);
+    {
+        let sender = sender.clone();
+        erase_btn.connect_toggled(move |b| {
+            if b.is_active() {
+                sender.input(AppMsg::SetBrushErase(true));
+            }
+        });
+    }
+    seg.append(&add_btn);
+    seg.append(&erase_btn);
+    let erase_row = adw::ActionRow::new();
+    erase_row.set_title("Mode");
+    erase_row.add_suffix(&seg);
+    group.add(&erase_row);
 
     let paint = adw::SwitchRow::new();
     paint.set_title("Paint");
