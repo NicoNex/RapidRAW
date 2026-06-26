@@ -22,3 +22,9 @@ env_logger = "0.11"
 # AI mask generation runs the async model download/init on a tokio runtime in a
 # dedicated worker thread (the GTK main loop is glib, not tokio).
 tokio = { version = "1", features = ["rt", "sync"] }
+
+# build.rs fetches the ONNX Runtime dylib (load-dynamic) for the host target.
+[build-dependencies]
+sha2 = "0.11"
+hex = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }

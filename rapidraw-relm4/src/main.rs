@@ -4161,6 +4161,17 @@ fn main() {
         std::env::set_var("GSK_RENDERER", load_settings().renderer.gsk_value());
     }
 
+    // Point `ort` (load-dynamic) at the ONNX Runtime dylib fetched by build.rs,
+    // unless the user already set ORT_DYLIB_PATH. Without this, AI model loading
+    // panics with "could not load libonnxruntime".
+    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+        if let Some(p) = option_env!("RAPIDRAW_ORT_DYLIB") {
+            if std::path::Path::new(p).exists() {
+                std::env::set_var("ORT_DYLIB_PATH", p);
+            }
+        }
+    }
+
     let ctx = rapidraw_core::headless_context().expect("gpu init");
     let engine = Engine { ctx: Arc::new(ctx) };
     log::info!("GPU context initialized");
