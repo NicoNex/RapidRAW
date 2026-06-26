@@ -3,16 +3,12 @@
 # and the inpaint "create" cards (and other buttons that read clearer with an
 # icon). Keep this list tight — only what's actually referenced.
 icons = [
-    # Right-rail tabs (filled: heavier weight, matches libadwaita symbolic icons)
-    "options-filled",         # Adjust
-    "crop-filled",            # Crop
-    "layer-diagonal-person-filled", # Masks
-    "paint-brush-filled",     # Inpaint / Brush
-    "info-filled",            # Info
-    # Line variants still referenced by mask/sub-mask + create-grid icons.
-    "crop-regular",           # mask_icon: Whole Image
-    "layer-diagonal-regular", # mask_icon: Depth
-    "paint-brush-regular",    # Inpaint card / brush+flow masks
+    # Right-rail tabs
+    "options-regular",        # Adjust
+    "crop-regular",           # Crop
+    "layer-diagonal-regular", # Masks
+    "paint-brush-regular",    # Inpaint / Brush
+    "info-regular",           # Info
     # Inpaint create-grid cards
     "eraser",                 # Quick Erase
     "sparkle-regular",        # Subject
