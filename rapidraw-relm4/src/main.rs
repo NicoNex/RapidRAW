@@ -2433,6 +2433,10 @@ impl Component for AppModel {
                     self.canvas.set_mask_draw(Some((0, ty == "radial")));
                 } else if matches!(ty, "brush" | "flow") {
                     sender.input(AppMsg::ArmPaint(Some(0)));
+                } else if matches!(ty, "color" | "luminance") {
+                    sender.input(AppMsg::ArmPick(Some(0)));
+                } else if matches!(ty, "ai-foreground" | "ai-sky" | "ai-depth") {
+                    sender.input(AppMsg::GenerateAiMask(0));
                 }
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
@@ -2850,12 +2854,18 @@ impl Component for AppModel {
                             // original auto-selecting the brush tool). Without this
                             // the drag just panned and nothing appeared.
                             "brush" | "flow" => sender.input(AppMsg::ArmPaint(Some(new_sub))),
-                            // AI auto-mask tools stay one-click only inside a patch.
-                            "ai-subject" | "quick-eraser" if is_patch => {
+                            // Color/luminance auto-arm point-picking so the user can
+                            // click the image to sample (original seeds isInitialDraw).
+                            "color" | "luminance" => {
                                 sender.input(AppMsg::ArmPick(Some(new_sub)))
                             }
-                            "ai-foreground" if is_patch => {
+                            // Whole-frame AI masks auto-generate on add (original does
+                            // this); subject/quick-eraser stay box-driven in a patch.
+                            "ai-foreground" | "ai-sky" | "ai-depth" => {
                                 sender.input(AppMsg::GenerateAiMask(new_sub))
+                            }
+                            "ai-subject" | "quick-eraser" if is_patch => {
+                                sender.input(AppMsg::ArmPick(Some(new_sub)))
                             }
                             _ => {}
                         }

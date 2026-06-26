@@ -1040,6 +1040,8 @@ pub fn submask_editor(
         let pick = adw::SwitchRow::new();
         pick.set_title("Pick target on image");
         pick.set_subtitle("Click the colour/tone to sample");
+        // Seed ON to match the auto-arm on creation (set before connect: no emit).
+        pick.set_active(true);
         let sender = sender.clone();
         pick.connect_active_notify(move |r| {
             sender.input(AppMsg::ArmPick(r.is_active().then_some(sub_i)));
