@@ -938,8 +938,14 @@ pub fn submask_editor(
     group.set_margin_end(6);
     group.set_margin_top(4);
 
-    // Header controls: visibility, invert, delete.
+    // Header controls: type icon, then visibility, invert, delete.
     let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    if let Some(icon) = mask_icon(&sm.mask_type) {
+        let img = gtk::Image::from_icon_name(icon);
+        img.set_pixel_size(16);
+        img.set_margin_end(4);
+        suffix.append(&img);
+    }
     let eye = gtk::ToggleButton::new();
     eye.set_icon_name(if sm.visible {
         "eye-regular"
