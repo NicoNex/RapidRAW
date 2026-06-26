@@ -49,6 +49,38 @@ fn download(url: &str, dest: &Path, expected: &str) -> Result<(), Box<dyn std::e
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Bundle the icons used by the UI (relm4-icons 0.11 lists them here, not in a
+    // TOML). Generates icon_names.rs in OUT_DIR, included by `mod icon_names`.
+    relm4_icons_build::bundle_icons(
+        "icon_names.rs",
+        Some("com.rapidraw.relm4"),
+        None::<&str>,
+        None::<&str>,
+        [
+            // Right-rail tabs
+            "options-regular",
+            "crop-regular",
+            "layer-diagonal-regular",
+            "paint-brush-regular",
+            "info-regular",
+            // Inpaint create-grid cards
+            "eraser",
+            "sparkle-regular",
+            "person-regular",
+            "line-horizontal-4-regular",
+            "circle-regular",
+            // Masks create-grid cards
+            "cloud-regular",
+            "more-horizontal-regular",
+            // General UI
+            "add-regular",
+            "delete-regular",
+            "arrow-counterclockwise-regular",
+            "eye-regular",
+            "eye-off-regular",
+        ],
+    );
+
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
