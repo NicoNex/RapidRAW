@@ -233,6 +233,11 @@ enum AppMsg {
     /// Masks panel actions.
     AddMask(&'static str),
     ResetAllMasks,
+    CopyMask(usize),
+    PasteMask,
+    DuplicateMask(usize),
+    DuplicateMaskInvert(usize),
+    RenameMask(usize, String),
     SelectMask(Option<usize>),
     DeleteMask(usize),
     ToggleMaskVisible(usize),
@@ -694,6 +699,8 @@ struct AppModel {
     /// patch `i` instead of the selected mask. Set on patch select, cleared when
     /// a mask panel/selection takes over.
     edit_patch: Option<usize>,
+    /// Clipboard for copy/paste of a whole mask container (not persisted).
+    copied_mask: Option<MaskDefinition>,
     /// Inpaint panel: fast local erase (true) vs prompt-driven connector.
     inpaint_fast: bool,
     /// Info (metadata) panel.
@@ -1529,6 +1536,7 @@ impl Component for AppModel {
             inpaint_panel: InpaintPanel::new(&sender),
             selected_patch: None,
             edit_patch: None,
+            copied_mask: None,
             inpaint_fast: true,
             info_panel: InfoPanel::new(),
             brush_size: 50.0,
@@ -2435,6 +2443,52 @@ impl Component for AppModel {
                 self.refresh_mask_preview(&sender);
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::CopyMask(i) => {
+                self.copied_mask = self.session.masks.get(i).cloned();
+                self.masks_panel
+                    .rebuild(&self.session.masks, self.selected_mask, &sender);
+            }
+            AppMsg::PasteMask => {
+                if let Some(src) = self.copied_mask.clone() {
+                    self.session.masks.push(masks::clone_mask(&src, false));
+                    self.selected_mask = Some(self.session.masks.len() - 1);
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.refresh_mask_preview(&sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::DuplicateMask(i) => {
+                if let Some(src) = self.session.masks.get(i).cloned() {
+                    self.session.masks.insert(i + 1, masks::clone_mask(&src, false));
+                    self.selected_mask = Some(i + 1);
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.refresh_mask_preview(&sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::DuplicateMaskInvert(i) => {
+                if let Some(src) = self.session.masks.get(i).cloned() {
+                    self.session.masks.insert(i + 1, masks::clone_mask(&src, true));
+                    self.selected_mask = Some(i + 1);
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.refresh_mask_preview(&sender);
+                    self.schedule_history(&sender);
+                    sender.input(AppMsg::RequestRender);
+                }
+            }
+            AppMsg::RenameMask(i, name) => {
+                if let Some(m) = self.session.masks.get_mut(i) {
+                    m.name = name;
+                    self.masks_panel
+                        .rebuild(&self.session.masks, self.selected_mask, &sender);
+                    self.schedule_history(&sender);
+                }
             }
             AppMsg::SelectMask(idx) => {
                 self.selected_mask = idx;

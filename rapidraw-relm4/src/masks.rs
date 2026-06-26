@@ -247,6 +247,21 @@ pub fn new_mask(label: &str, mask_type: &str, w: f32, h: f32) -> MaskDefinition 
     }
 }
 
+/// Deep-clone a mask container with fresh ids (container + every sub-mask),
+/// mirroring Tauri `cloneMaskContainerData`. `invert` flips the container's
+/// invert flag (for "Duplicate & Invert").
+pub fn clone_mask(m: &MaskDefinition, invert: bool) -> MaskDefinition {
+    let mut c = m.clone();
+    c.id = next_id("mask");
+    for sm in &mut c.sub_masks {
+        sm.id = next_id("sub");
+    }
+    if invert {
+        c.invert = !c.invert;
+    }
+    c
+}
+
 /// Normalized (0..1) drawable shapes for a mask's visible radial/linear
 /// sub-masks, for the canvas overlay. `(w, h)` is the full image size (params are
 /// full-res pixels). Brush/flow/color/luminance/all have no drawable shape.
@@ -537,6 +552,7 @@ fn mask_row(
     }
     row.append(&eye);
 
+    // Name: single-click selects; double-click renames (Stack swaps to an Entry).
     let name = gtk::Button::with_label(&m.name);
     name.add_css_class("flat");
     name.set_hexpand(true);
@@ -550,7 +566,51 @@ fn mask_row(
             sender.input(AppMsg::SelectMask(if is_selected { None } else { Some(i) }))
         });
     }
-    row.append(&name);
+
+    let stack = gtk::Stack::new();
+    stack.set_hexpand(true);
+    stack.add_named(&name, Some("label"));
+    let entry = gtk::Entry::new();
+    entry.set_text(&m.name);
+    entry.set_hexpand(true);
+    stack.add_named(&entry, Some("edit"));
+    stack.set_visible_child_name("label");
+
+    let dbl = gtk::GestureClick::new();
+    dbl.set_button(gtk::gdk::BUTTON_PRIMARY);
+    {
+        let stack = stack.clone();
+        let entry = entry.clone();
+        dbl.connect_pressed(move |g, n, _, _| {
+            if n == 2 {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                stack.set_visible_child_name("edit");
+                entry.grab_focus();
+            }
+        });
+    }
+    name.add_controller(dbl);
+
+    // Commit on Enter or focus-out (idempotent if both fire).
+    let commit = {
+        let sender = sender.clone();
+        let stack = stack.clone();
+        std::rc::Rc::new(move |e: &gtk::Entry| {
+            sender.input(AppMsg::RenameMask(i, e.text().to_string()));
+            stack.set_visible_child_name("label");
+        })
+    };
+    {
+        let commit = commit.clone();
+        entry.connect_activate(move |e| commit(e));
+    }
+    {
+        let entry2 = entry.clone();
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit(&entry2));
+        entry.add_controller(focus);
+    }
+    row.append(&stack);
 
     let del = gtk::Button::from_icon_name("user-trash-symbolic");
     del.add_css_class("flat");
@@ -560,6 +620,49 @@ fn mask_row(
         del.connect_clicked(move |_| sender.input(AppMsg::DeleteMask(i)));
     }
     row.append(&del);
+
+    // Right-click context menu: duplicate / invert / copy / paste / delete.
+    let menu = gtk::Popover::new();
+    menu.set_has_arrow(false);
+    menu.set_parent(&row);
+    let items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    items.set_margin_all(4);
+    // AppMsg isn't Clone, so each item carries a builder closure (captures `i`,
+    // which is Copy) instead of a prebuilt message.
+    let add_item = |label: &str, build: Box<dyn Fn() -> AppMsg>| {
+        let b = gtk::Button::with_label(label);
+        b.add_css_class("flat");
+        b.set_halign(gtk::Align::Fill);
+        let sender = sender.clone();
+        let menu = menu.clone();
+        b.connect_clicked(move |_| {
+            menu.popdown();
+            sender.input(build());
+        });
+        b
+    };
+    items.append(&add_item("Duplicate", Box::new(move || AppMsg::DuplicateMask(i))));
+    items.append(&add_item(
+        "Duplicate & Invert",
+        Box::new(move || AppMsg::DuplicateMaskInvert(i)),
+    ));
+    items.append(&add_item("Copy mask", Box::new(move || AppMsg::CopyMask(i))));
+    // ponytail: Paste always enabled; handler no-ops when clipboard empty.
+    items.append(&add_item("Paste mask", Box::new(|| AppMsg::PasteMask)));
+    items.append(&add_item("Delete", Box::new(move || AppMsg::DeleteMask(i))));
+    menu.set_child(Some(&items));
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_SECONDARY);
+    {
+        let menu = menu.clone();
+        click.connect_pressed(move |_, _, x, y| {
+            menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            menu.popup();
+        });
+    }
+    row.add_controller(click);
+
     row
 }
 
@@ -1152,6 +1255,19 @@ mod tests {
             MASK_CREATE_GRID.len() + OTHERS_TYPES.len(),
             "duplicate type across tables"
         );
+    }
+
+    #[test]
+    fn clone_mask_gives_fresh_ids_and_keeps_data() {
+        let m = new_mask("Radial", "radial", 1000.0, 800.0);
+        let c = clone_mask(&m, false);
+        assert_ne!(c.id, m.id, "container id must be fresh");
+        assert_eq!(c.sub_masks.len(), m.sub_masks.len());
+        assert_ne!(c.sub_masks[0].id, m.sub_masks[0].id, "sub id must be fresh");
+        assert_eq!(c.adjustments, m.adjustments, "adjustments preserved");
+        assert_eq!(c.invert, m.invert);
+        let inv = clone_mask(&m, true);
+        assert_eq!(inv.invert, !m.invert);
     }
 
     #[test]
