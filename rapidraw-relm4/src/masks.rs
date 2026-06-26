@@ -682,6 +682,39 @@ fn mask_details(
 
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     head.set_margin_all(6);
+
+    // Editable name, so the selected mask's name is visible (and renamable) while
+    // its controls are open — mirrors the original's "<name> Properties" header.
+    let name = gtk::Entry::new();
+    name.set_text(&m.name);
+    name.set_hexpand(true);
+    name.add_css_class("heading");
+    let orig = m.name.clone();
+    let rename = {
+        let sender = sender.clone();
+        let orig = orig.clone();
+        std::rc::Rc::new(move |e: &gtk::Entry| {
+            let t = e.text().to_string();
+            // Only emit when changed: a bare focus-out (e.g. clicking a slider)
+            // must not trigger a panel rebuild that steals the click.
+            if t != orig {
+                sender.input(AppMsg::RenameMask(i, t));
+            }
+        })
+    };
+    {
+        let rename = rename.clone();
+        name.connect_activate(move |e| rename(e));
+    }
+    {
+        let rename = rename.clone();
+        let name2 = name.clone();
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |_| rename(&name2));
+        name.add_controller(focus);
+    }
+    head.append(&name);
+
     let invert = gtk::CheckButton::with_label("Invert");
     invert.set_active(m.invert);
     {
