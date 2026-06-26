@@ -1135,6 +1135,11 @@ fn brush_controls(
     let paint = adw::SwitchRow::new();
     paint.set_title("Paint");
     paint.set_subtitle("Drag on the image to paint this mask");
+    // Seed ON to match the auto-arm on creation. Set BEFORE connecting so the
+    // seed doesn't emit ArmPaint. ponytail: a brush mask disarmed then rebuilt
+    // shows ON-but-idle until re-toggled; not worth threading armed state through
+    // every rebuild to fix that rare case.
+    paint.set_active(true);
     {
         let sender = sender.clone();
         paint.connect_active_notify(move |r| {

@@ -2428,8 +2428,11 @@ impl Component for AppModel {
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
                 // Radial/linear: arm "draw to place" so a drag on the image
                 // defines the new mask's geometry (sub-mask 0 of the container).
+                // Brush/flow: auto-arm painting so the first drag paints.
                 if matches!(ty, "radial" | "linear") {
                     self.canvas.set_mask_draw(Some((0, ty == "radial")));
+                } else if matches!(ty, "brush" | "flow") {
+                    sender.input(AppMsg::ArmPaint(Some(0)));
                 }
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
@@ -2840,15 +2843,20 @@ impl Component for AppModel {
                     // patches alike — geometry routes via active_container).
                     if matches!(ty, "radial" | "linear") {
                         self.canvas.set_mask_draw(Some((new_sub, ty == "radial")));
-                    } else if is_patch {
-                        // Patch regions: arm the matching tool immediately so the
-                        // listed inpaint tools are one-click (simple to use).
+                    } else {
                         match ty {
+                            // Brush/flow auto-arm painting for masks AND patches, so
+                            // a fresh brush mask paints on the first drag (mirrors the
+                            // original auto-selecting the brush tool). Without this
+                            // the drag just panned and nothing appeared.
                             "brush" | "flow" => sender.input(AppMsg::ArmPaint(Some(new_sub))),
-                            "ai-subject" | "quick-eraser" => {
+                            // AI auto-mask tools stay one-click only inside a patch.
+                            "ai-subject" | "quick-eraser" if is_patch => {
                                 sender.input(AppMsg::ArmPick(Some(new_sub)))
                             }
-                            "ai-foreground" => sender.input(AppMsg::GenerateAiMask(new_sub)),
+                            "ai-foreground" if is_patch => {
+                                sender.input(AppMsg::GenerateAiMask(new_sub))
+                            }
                             _ => {}
                         }
                     }
