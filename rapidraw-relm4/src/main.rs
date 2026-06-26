@@ -2508,6 +2508,17 @@ impl Component for AppModel {
                 self.canvas.set_mask_draw(None);
                 self.masks_panel
                     .rebuild(&self.session.masks, self.selected_mask, &sender);
+                // Re-arm the canvas tool for a single-tool mask so re-selecting it is
+                // immediately usable (the panel switch shows ON to match).
+                if let Some(m) = idx.and_then(|i| self.session.masks.get(i)) {
+                    if m.sub_masks.len() == 1 {
+                        match m.sub_masks[0].mask_type.as_str() {
+                            "brush" | "flow" => sender.input(AppMsg::ArmPaint(Some(0))),
+                            "color" | "luminance" => sender.input(AppMsg::ArmPick(Some(0))),
+                            _ => {}
+                        }
+                    }
+                }
                 self.refresh_mask_preview(&sender);
             }
             AppMsg::DeleteMask(i) => {
