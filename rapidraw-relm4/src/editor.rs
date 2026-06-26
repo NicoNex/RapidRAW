@@ -173,6 +173,8 @@ pub struct EditorCanvas {
     /// Armed canvas picking (point/box) for parametric/AI masks.
     pick: Rc<Cell<Option<PickArm>>>,
     pick_sink: PickSink,
+    /// In-progress box-pick rectangle (normalized x1,y1,x2,y2) for live preview.
+    pick_box: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     /// Armed "draw to place" for a just-added radial/linear mask.
     draw: Rc<Cell<Option<DrawArm>>>,
     view: View,
@@ -237,6 +239,7 @@ impl EditorCanvas {
         let paint_sink: PaintSink = Rc::new(RefCell::new(None));
         let pick: Rc<Cell<Option<PickArm>>> = Rc::new(Cell::new(None));
         let pick_sink: PickSink = Rc::new(RefCell::new(None));
+        let pick_box: Rc<Cell<Option<(f64, f64, f64, f64)>>> = Rc::new(Cell::new(None));
         // Widget point where a pick drag began (to rebuild the end point).
         let pick_start = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
         // "Draw to place" a freshly-added radial/linear mask: arm + press point.
@@ -249,12 +252,14 @@ impl EditorCanvas {
             let stroke = stroke.clone();
             let preview = mask_preview.clone();
             let preview_shown = mask_preview_shown.clone();
+            let pick_box = pick_box.clone();
             mask_overlay.set_draw_func(move |_, cr, _w, _h| {
                 if preview_shown.get() {
                     draw_mask_preview(cr, &view, preview.borrow().as_ref());
                 }
                 draw_masks(cr, &view, &shapes.borrow());
                 draw_stroke(cr, &view, &stroke.borrow(), paint.get());
+                draw_pick_box(cr, &view, pick_box.get());
             });
         }
         // Track the pointer so the wheel can zoom toward it.
@@ -368,6 +373,8 @@ impl EditorCanvas {
                 let paint_start = paint_start.clone();
                 let mask_w2 = mask_overlay.clone();
                 let pick = pick.clone();
+                let pick_start = pick_start.clone();
+                let pick_box = pick_box.clone();
                 let draw = draw.clone();
                 let draw_start = draw_start.clone();
                 drag.connect_drag_update(move |_, dx, dy| {
@@ -415,8 +422,18 @@ impl EditorCanvas {
                         }
                         return;
                     }
-                    // While picking, swallow the drag (no pan; emit on end).
-                    if pick.get().is_some() {
+                    // While picking, swallow the drag (no pan; emit on end). For a
+                    // box pick, show a live rectangle so the user sees the region.
+                    if let Some(arm) = pick.get() {
+                        if arm.is_box {
+                            let (bx, by) = pick_start.get();
+                            if let (Some(p1), Some(p2)) =
+                                (to_norm(&view, bx, by), to_norm(&view, bx + dx, by + dy))
+                            {
+                                pick_box.set(Some((p1.0, p1.1, p2.0, p2.1)));
+                                mask_w2.queue_draw();
+                            }
+                        }
                         return;
                     }
                     // Editing a mask handle takes precedence over panning.
@@ -447,11 +464,17 @@ impl EditorCanvas {
                 let pick = pick.clone();
                 let pick_sink = pick_sink.clone();
                 let pick_start = pick_start.clone();
+                let pick_box = pick_box.clone();
                 let view = view.clone();
                 let draw = draw.clone();
                 drag.connect_drag_end(move |_, ox, oy| {
-                    // Drawing a new mask is one-shot: disarm after the placement.
-                    if draw.take().is_some() {
+                    // Drawing a new mask is one-shot, but only a real placement drag
+                    // disarms it — a near-zero click must NOT consume the arm (else
+                    // the tool silently disarms before the user draws).
+                    if draw.get().is_some() {
+                        if ox * ox + oy * oy > 4.0 {
+                            draw.take();
+                        }
                         return;
                     }
                     if let Some(arm) = paint.get() {
@@ -477,6 +500,8 @@ impl EditorCanvas {
                                 cb(arm.sub, x1, y1, x2, y2);
                             }
                         }
+                        pick_box.set(None);
+                        mask_w.queue_draw();
                     }
                     mask_drag.set(None);
                 });
@@ -578,6 +603,7 @@ impl EditorCanvas {
             paint_sink,
             pick,
             pick_sink,
+            pick_box,
             draw,
             view,
             crop_rect,
@@ -663,6 +689,13 @@ impl EditorCanvas {
     /// disarms (drag pans again).
     pub fn set_pick(&self, arm: Option<(usize, bool)>) {
         self.pick.set(arm.map(|(sub, is_box)| PickArm { sub, is_box }));
+        if matches!(arm, Some((_, true))) {
+            // Box-pick draws a live rectangle on the mask overlay; keep it shown.
+            self.mask_overlay.set_visible(true);
+        } else {
+            self.pick_box.set(None);
+        }
+        self.mask_overlay.queue_draw();
     }
 
     /// Set the callback fired when a pick completes (normalized image coords).
@@ -1063,6 +1096,27 @@ fn apply_mask_drag(md: MaskDrag, cur: (f64, f64)) -> MaskShape {
         // Grab/shape mismatch can't happen (grab derived from the same shape).
         (_, s) => s,
     }
+}
+
+/// Live dashed rectangle for an in-progress box pick (normalized x1,y1,x2,y2).
+fn draw_pick_box(cr: &cairo::Context, view: &View, bx: Option<(f64, f64, f64, f64)>) {
+    let Some((x1, y1, x2, y2)) = bx else {
+        return;
+    };
+    let (ix, iy, iw, ih) = image_screen_rect(view);
+    if iw <= 0.0 || ih <= 0.0 {
+        return;
+    }
+    let sx = ix + x1.min(x2) * iw;
+    let sy = iy + y1.min(y2) * ih;
+    let sw = (x2 - x1).abs() * iw;
+    let sh = (y2 - y1).abs() * ih;
+    cr.set_source_rgba(0.3, 0.6, 1.0, 0.9);
+    cr.set_line_width(1.5);
+    cr.set_dash(&[4.0, 3.0], 0.0);
+    cr.rectangle(sx, sy, sw, sh);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
 }
 
 /// Distance (px) from point `(px,py)` to segment `(ax,ay)-(bx,by)`.
