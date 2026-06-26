@@ -38,6 +38,42 @@ pub const MASK_TYPES: &[(&str, &str)] = &[
     ("AI Depth", "ai-depth"),
 ];
 
+/// Primary masks-panel create cards, mirroring Tauri `MASK_PANEL_CREATION_TYPES`.
+/// The "Others" card is appended by `create_grid` (it has no single type).
+pub const MASK_CREATE_GRID: &[(&str, &str)] = &[
+    ("Subject", "ai-subject"),
+    ("Sky", "ai-sky"),
+    ("Foreground", "ai-foreground"),
+    ("Linear", "linear"),
+    ("Radial", "radial"),
+];
+
+/// Secondary types shown in the "Others" popover (Tauri `OTHERS_MASK_TYPES`).
+pub const OTHERS_TYPES: &[(&str, &str)] = &[
+    ("Depth", "ai-depth"),
+    ("Color", "color"),
+    ("Luminance", "luminance"),
+    ("Brush", "brush"),
+    ("Flow", "flow"),
+    ("Whole Image", "all"),
+];
+
+/// relm4-icon name for a mask type's create card / row, or None for label-only.
+pub fn mask_icon(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "ai-subject" | "luminance" => "sparkle-regular",
+        "ai-sky" => "cloud-regular",
+        "ai-foreground" => "person-regular",
+        "linear" => "line-horizontal-4-regular",
+        "radial" | "color" => "circle-regular",
+        "brush" | "flow" => "paint-brush-regular",
+        "ai-depth" => "layer-diagonal-regular",
+        "all" => "crop-regular",
+        "quick-eraser" => "eraser",
+        _ => return None,
+    })
+}
+
 /// True for mask types whose bitmap comes from an ONNX model.
 pub fn is_ai_type(t: &str) -> bool {
     matches!(t, "ai-subject" | "ai-foreground" | "ai-sky" | "ai-depth" | "quick-eraser")
@@ -333,7 +369,78 @@ impl MasksPanel {
     }
 }
 
+/// 3-col "Create New Mask" card grid. Primary cards add their mask; the final
+/// "Others" card opens a popover listing [`OTHERS_TYPES`]. Shared by the empty
+/// state and the "Add new mask" popover.
+fn create_grid(sender: &ComponentSender<AppModel>) -> gtk::Grid {
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(6);
+    grid.set_column_spacing(6);
+    grid.set_column_homogeneous(true);
+
+    let card = |icon: Option<&str>, label: &str| {
+        let b = gtk::Button::new();
+        b.add_css_class("card");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        if let Some(icon) = icon {
+            let img = gtk::Image::from_icon_name(icon);
+            img.set_pixel_size(22);
+            content.append(&img);
+        }
+        let lbl = gtk::Label::new(Some(label));
+        lbl.set_wrap(true);
+        lbl.set_justify(gtk::Justification::Center);
+        content.append(&lbl);
+        b.set_child(Some(&content));
+        b
+    };
+
+    for (idx, &(label, ty)) in MASK_CREATE_GRID.iter().enumerate() {
+        let b = card(mask_icon(ty), label);
+        let sender = sender.clone();
+        b.connect_clicked(move |_| sender.input(AppMsg::AddMask(ty)));
+        grid.attach(&b, (idx % 3) as i32, (idx / 3) as i32, 1, 1);
+    }
+
+    // "Others" popover card.
+    let others = gtk::MenuButton::new();
+    others.add_css_class("card");
+    let oc = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    oc.set_margin_top(12);
+    oc.set_margin_bottom(12);
+    oc.append(&gtk::Image::from_icon_name("more-horizontal-regular"));
+    let ol = gtk::Label::new(Some("Others"));
+    ol.set_wrap(true);
+    ol.set_justify(gtk::Justification::Center);
+    oc.append(&ol);
+    others.set_child(Some(&oc));
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.set_margin_all(4);
+    let pop = gtk::Popover::new();
+    pop.set_child(Some(&list));
+    for &(label, ty) in OTHERS_TYPES {
+        let item = gtk::Button::with_label(label);
+        item.add_css_class("flat");
+        item.set_halign(gtk::Align::Fill);
+        let sender = sender.clone();
+        let pop = pop.clone();
+        item.connect_clicked(move |_| {
+            pop.popdown();
+            sender.input(AppMsg::AddMask(ty));
+        });
+        list.append(&item);
+    }
+    others.set_popover(Some(&pop));
+    let n = MASK_CREATE_GRID.len();
+    grid.attach(&others, (n % 3) as i32, (n / 3) as i32, 1, 1);
+
+    grid
+}
+
 /// The "Add mask" menu button (popover of non-AI types).
+#[allow(dead_code)]
 fn add_menu(sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
     let btn = gtk::MenuButton::new();
     btn.set_child(Some(
@@ -1015,6 +1122,29 @@ fn pretty_type(ty: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_create_grid_type_is_a_known_mask_type() {
+        for &(_, ty) in MASK_CREATE_GRID.iter().chain(OTHERS_TYPES.iter()) {
+            assert!(
+                MASK_TYPES.iter().any(|(_, t)| *t == ty),
+                "create-grid type {ty} not in MASK_TYPES"
+            );
+        }
+        // The two tables together offer each type at most once.
+        let mut seen: Vec<&str> = MASK_CREATE_GRID
+            .iter()
+            .chain(OTHERS_TYPES.iter())
+            .map(|(_, t)| *t)
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            MASK_CREATE_GRID.len() + OTHERS_TYPES.len(),
+            "duplicate type across tables"
+        );
+    }
 
     #[test]
     fn new_radial_mask_has_centred_default_geometry() {

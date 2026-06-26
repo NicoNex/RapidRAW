@@ -15,6 +15,9 @@ icons = [
     "person-regular",         # Foreground
     "line-horizontal-4-regular", # Linear
     "circle-regular",         # Radial
+    # Masks create-grid cards
+    "cloud-regular",          # Sky
+    "more-horizontal-regular",# Others
     # General UI
     "add-regular",            # Add mask / region menus
     "delete-regular",         # Delete
