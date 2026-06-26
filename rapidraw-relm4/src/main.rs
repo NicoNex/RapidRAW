@@ -95,6 +95,7 @@ impl ExportFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResizeMode {
     LongEdge,
+    ShortEdge,
     Width,
     Height,
 }
@@ -114,11 +115,28 @@ pub struct ExportOpts {
     /// JPEG quality 1..=100 (ignored for PNG/TIFF).
     pub quality: u8,
     pub resize: Option<Resize>,
+    /// Copy the source file's EXIF/metadata into the export. `serde(default)` so
+    /// older saved settings (without this field) still load.
+    #[serde(default = "default_true")]
+    pub keep_metadata: bool,
+    /// Drop GPS tags when embedding metadata (only relevant if `keep_metadata`).
+    #[serde(default)]
+    pub strip_gps: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ExportOpts {
     fn default() -> Self {
-        Self { format: ExportFormat::Jpeg, quality: 90, resize: None }
+        Self {
+            format: ExportFormat::Jpeg,
+            quality: 90,
+            resize: None,
+            keep_metadata: true,
+            strip_gps: false,
+        }
     }
 }
 
@@ -3189,16 +3207,36 @@ impl Component for AppModel {
                 qrow.append(&qlabel);
                 qrow.append(&q);
 
+                // Last-used options (restored below); declared up here so the
+                // metadata checkboxes can seed from it.
+                let last = self.settings.last_export;
+
                 // Resize: mode + value (0 = full) + don't-enlarge.
-                let resize_mode = gtk::DropDown::from_strings(&["No resize", "Long edge", "Width", "Height"]);
+                let resize_mode = gtk::DropDown::from_strings(&[
+                    "No resize",
+                    "Long edge",
+                    "Short edge",
+                    "Width",
+                    "Height",
+                ]);
                 let resize = gtk::SpinButton::with_range(1.0, 20000.0, 100.0);
                 resize.set_value(2048.0);
                 let dont_enlarge = gtk::CheckButton::with_label("Don't enlarge");
                 dont_enlarge.set_active(true);
 
+                // Metadata: keep source EXIF, optionally drop GPS. Persisted.
+                let keep_meta = gtk::CheckButton::with_label("Keep metadata (EXIF)");
+                keep_meta.set_active(last.keep_metadata);
+                let strip_gps = gtk::CheckButton::with_label("Strip GPS location");
+                strip_gps.set_active(last.strip_gps);
+                strip_gps.set_sensitive(last.keep_metadata);
+                {
+                    let strip_gps = strip_gps.clone();
+                    keep_meta.connect_toggled(move |b| strip_gps.set_sensitive(b.is_active()));
+                }
+
                 // Restore the last-used export options (set before the update
                 // closures fire so visibility matches the restored format).
-                let last = self.settings.last_export;
                 fmt.set_selected(match last.format {
                     ExportFormat::Png => 1,
                     ExportFormat::Tiff => 2,
@@ -3212,8 +3250,9 @@ impl Component for AppModel {
                 if let Some(r) = last.resize {
                     resize_mode.set_selected(match r.mode {
                         ResizeMode::LongEdge => 1,
-                        ResizeMode::Width => 2,
-                        ResizeMode::Height => 3,
+                        ResizeMode::ShortEdge => 2,
+                        ResizeMode::Width => 3,
+                        ResizeMode::Height => 4,
                     });
                     resize.set_value(r.value as f64);
                     dont_enlarge.set_active(r.dont_enlarge);
@@ -3267,7 +3306,22 @@ impl Component for AppModel {
                 vb.append(&qrow);
                 vb.append(&rrow);
                 vb.append(&rrow2);
+                vb.append(&keep_meta);
+                vb.append(&strip_gps);
                 vb.append(&go);
+
+                // Metadata rows are irrelevant for the CUBE LUT export.
+                {
+                    let keep_meta = keep_meta.clone();
+                    let strip_gps2 = strip_gps.clone();
+                    let update = move |d: &gtk::DropDown| {
+                        let raster = !matches!(idx_to_format(d.selected()), ExportFormat::CubeLut);
+                        keep_meta.set_visible(raster);
+                        strip_gps2.set_visible(raster);
+                    };
+                    update(&fmt);
+                    fmt.connect_selected_notify(update);
+                }
                 win.set_child(Some(&vb));
 
                 let sender = sender.clone();
@@ -3281,8 +3335,9 @@ impl Component for AppModel {
                     }
                     let resize = match resize_mode.selected() {
                         1 => Some(ResizeMode::LongEdge),
-                        2 => Some(ResizeMode::Width),
-                        3 => Some(ResizeMode::Height),
+                        2 => Some(ResizeMode::ShortEdge),
+                        3 => Some(ResizeMode::Width),
+                        4 => Some(ResizeMode::Height),
                         _ => None,
                     }
                     .map(|mode| Resize {
@@ -3294,6 +3349,8 @@ impl Component for AppModel {
                         format,
                         quality: q.value() as u8,
                         resize,
+                        keep_metadata: keep_meta.is_active(),
+                        strip_gps: strip_gps.is_active(),
                     }));
                 });
                 win.present();
@@ -4072,6 +4129,7 @@ fn resize_for_export(img: &DynamicImage, r: Resize) -> DynamicImage {
     if r.dont_enlarge {
         let exceeds = match r.mode {
             ResizeMode::LongEdge => r.value < w.max(h),
+            ResizeMode::ShortEdge => r.value < w.min(h),
             ResizeMode::Width => r.value < w,
             ResizeMode::Height => r.value < h,
         };
@@ -4082,6 +4140,11 @@ fn resize_for_export(img: &DynamicImage, r: Resize) -> DynamicImage {
     let f = image::imageops::FilterType::Lanczos3;
     match r.mode {
         ResizeMode::LongEdge => img.resize(r.value, r.value, f),
+        // Scale so the short edge lands on `value` (preserve aspect).
+        ResizeMode::ShortEdge => {
+            let s = r.value as f64 / w.min(h) as f64;
+            img.resize((w as f64 * s).round() as u32, (h as f64 * s).round() as u32, f)
+        }
         ResizeMode::Width => img.resize(r.value, u32::MAX, f),
         ResizeMode::Height => img.resize(u32::MAX, r.value, f),
     }
