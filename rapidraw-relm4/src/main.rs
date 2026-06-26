@@ -661,6 +661,10 @@ struct AppModel {
     hist_gen: u64,
     /// Mask-overlay rasterization generation (latest job wins; stale jobs drop).
     mpreview_gen: u64,
+    /// Signature of the last-rasterized mask-overlay inputs (selection + sub-mask
+    /// shape + geometry). Skips the expensive recompute when only global/scalar
+    /// adjustments changed — those don't move a mask's coverage.
+    mpreview_sig: u64,
     /// While true (during undo/redo restore), changes don't record history.
     suppress_history: bool,
     /// Last processed preview texture (for toggling back from "show original").
@@ -965,11 +969,40 @@ impl AppModel {
         let sel = self.selected_mask.filter(|&i| i < self.session.masks.len());
         let (Some(i), Some(base), true) = (sel, self.session.base_image.clone(), on) else {
             self.canvas.set_mask_preview(None);
+            self.mpreview_sig = 0;
             return;
         };
         let mask_def = self.session.masks[i].clone();
         let geom = self.geom;
         let preview_dim = self.settings.preview_dim;
+        // Coverage depends only on the sub-mask shapes + invert/opacity + geometry +
+        // selection + preview size — NOT on the scalar/global adjustments that a
+        // slider drag changes. Skip the recompute (and its worker thread) when those
+        // are unchanged, else rapid drags spawn overlapping mask rasterizations that
+        // saturate the CPU.
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            i.hash(&mut h);
+            preview_dim.hash(&mut h);
+            geom.orientation_steps.hash(&mut h);
+            geom.flip_h.hash(&mut h);
+            geom.flip_v.hash(&mut h);
+            geom.straighten.to_bits().hash(&mut h);
+            geom.crop
+                .map(|c| c.map(f32::to_bits))
+                .hash(&mut h);
+            serde_json::to_string(&mask_def.sub_masks)
+                .unwrap_or_default()
+                .hash(&mut h);
+            mask_def.invert.hash(&mut h);
+            (mask_def.opacity as i64).hash(&mut h);
+            h.finish()
+        };
+        if sig == self.mpreview_sig {
+            return;
+        }
+        self.mpreview_sig = sig;
         self.mpreview_gen = self.mpreview_gen.wrapping_add(1);
         let gen = self.mpreview_gen;
         spawn_bg(sender, move || {
@@ -1517,6 +1550,7 @@ impl Component for AppModel {
             hist_idx: 0,
             hist_gen: 0,
             mpreview_gen: 0,
+            mpreview_sig: 0,
             suppress_history: false,
             last_tex: None,
             original_tex: None,
