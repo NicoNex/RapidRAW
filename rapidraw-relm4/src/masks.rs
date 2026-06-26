@@ -554,11 +554,14 @@ fn mask_row(
 
     // Name: single-click selects; double-click renames (Stack swaps to an Entry).
     let name = gtk::Button::with_label(&m.name);
-    name.add_css_class("flat");
     name.set_hexpand(true);
     name.set_halign(gtk::Align::Fill);
+    // `flat` and `suggested-action` together cancel the accent background but keep
+    // white text -> invisible name on the card. Use one or the other.
     if is_selected {
         name.add_css_class("suggested-action");
+    } else {
+        name.add_css_class("flat");
     }
     {
         let sender = sender.clone();
