@@ -71,14 +71,15 @@ type MaskEditCb = Rc<RefCell<Option<Box<dyn Fn(MaskShape)>>>>;
 
 /// Callback fired when a brush/flow stroke finishes: `(sub index, normalized
 /// points, erase)`. The model denormalizes and appends a line to the sub-mask.
-type PaintSink = Rc<RefCell<Option<Box<dyn Fn(usize, Vec<(f64, f64)>, bool)>>>>;
+type PaintSink = Rc<RefCell<Option<Box<dyn Fn(usize, Vec<(f64, f64)>, bool, f64)>>>>;
 
-/// Armed brush/flow painting: which sub-mask, the brush radius (normalized to
-/// image width, for the live preview), and whether it erases.
+/// Armed brush/flow painting: which sub-mask, the brush diameter in *screen* px
+/// (constant on screen regardless of zoom, like the original), and whether it
+/// erases. The stored line size is derived from this at stroke end.
 #[derive(Clone, Copy)]
 struct PaintArm {
     sub: usize,
-    size_norm: f64,
+    size_px: f64,
     erase: bool,
 }
 
@@ -480,8 +481,12 @@ impl EditorCanvas {
                     if let Some(arm) = paint.get() {
                         let pts = std::mem::take(&mut *stroke.borrow_mut());
                         if !pts.is_empty() {
+                            // Emit the brush size as a fraction of displayed image
+                            // width, so the model stores it resolution-independently.
+                            let (_, _, iw, _) = image_screen_rect(&view);
+                            let brush_norm = if iw > 0.0 { arm.size_px / iw } else { 0.0 };
                             if let Some(cb) = paint_sink.borrow().as_ref() {
-                                cb(arm.sub, pts, arm.erase);
+                                cb(arm.sub, pts, arm.erase, brush_norm);
                             }
                         }
                         mask_w.queue_draw();
@@ -663,12 +668,12 @@ impl EditorCanvas {
         *self.mask_edit.borrow_mut() = Some(Box::new(cb));
     }
 
-    /// Arm brush/flow painting into sub-mask `sub` with brush radius `size_norm`
-    /// (normalized to image width) and `erase`; `None` disarms (drag pans again).
+    /// Arm brush/flow painting into sub-mask `sub` with brush diameter `size_px`
+    /// (screen px) and `erase`; `None` disarms (drag pans again).
     pub fn set_paint(&self, arm: Option<(usize, f64, bool)>) {
-        self.paint.set(arm.map(|(sub, size_norm, erase)| PaintArm {
+        self.paint.set(arm.map(|(sub, size_px, erase)| PaintArm {
             sub,
-            size_norm,
+            size_px,
             erase,
         }));
         // The live stroke draws on the mask overlay; brush/flow masks have no
@@ -680,7 +685,7 @@ impl EditorCanvas {
     }
 
     /// Set the callback fired when a brush/flow stroke finishes.
-    pub fn set_paint_sink(&self, cb: impl Fn(usize, Vec<(f64, f64)>, bool) + 'static) {
+    pub fn set_paint_sink(&self, cb: impl Fn(usize, Vec<(f64, f64)>, bool, f64) + 'static) {
         *self.paint_sink.borrow_mut() = Some(Box::new(cb));
     }
 
@@ -1150,8 +1155,10 @@ fn draw_stroke(cr: &cairo::Context, view: &View, pts: &[(f64, f64)], arm: Option
     if iw <= 0.0 {
         return;
     }
-    // Brush diameter on screen = 2 * radius_norm * image_screen_width.
-    let width = (arm.size_norm * 2.0 * iw).max(2.0);
+    // Brush diameter is constant on screen (matches the final mask coverage,
+    // which stores it as a fraction of image width).
+    let _ = iw;
+    let width = arm.size_px.max(2.0);
     cr.set_line_cap(cairo::LineCap::Round);
     cr.set_line_join(cairo::LineJoin::Round);
     cr.set_line_width(width);

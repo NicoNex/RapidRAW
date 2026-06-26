@@ -304,10 +304,12 @@ enum AppMsg {
     /// Arm/disarm canvas painting into sub-mask index (within the selected mask).
     ArmPaint(Option<usize>),
     /// A finished brush stroke: normalized points to append to sub-mask `sub`.
+    /// `brush` is the brush diameter as a fraction of image width.
     AddBrushStroke {
         sub: usize,
         points: Vec<(f64, f64)>,
         erase: bool,
+        brush: f64,
     },
     /// Clear all painted strokes from sub-mask `sub`.
     ClearStrokes(usize),
@@ -1912,8 +1914,8 @@ impl Component for AppModel {
         // Brush/flow strokes painted on the canvas append to the sub-mask.
         {
             let sender = sender.clone();
-            model.canvas.set_paint_sink(move |sub, points, erase| {
-                sender.input(AppMsg::AddBrushStroke { sub, points, erase })
+            model.canvas.set_paint_sink(move |sub, points, erase, brush| {
+                sender.input(AppMsg::AddBrushStroke { sub, points, erase, brush })
             });
         }
         // Canvas point/box picks feed parametric (color/luminance) and ai-subject
@@ -2710,14 +2712,19 @@ impl Component for AppModel {
             AppMsg::ArmPaint(sub) => {
                 self.paint_sub = sub;
                 let erase = self.brush_erase;
+                // brush_size is a screen-px diameter (constant on screen, like the
+                // original); the editor converts it to a stored size per stroke.
                 let arm = sub.and_then(|s| {
-                    self.image_dims().map(|(w, _)| (s, self.brush_size / w, erase))
+                    self.image_dims().map(|_| (s, self.brush_size, erase))
                 });
                 self.canvas.set_paint(arm);
             }
-            AppMsg::AddBrushStroke { sub, points, erase } => {
+            AppMsg::AddBrushStroke { sub, points, erase, brush } => {
                 let Some((w, h)) = self.image_dims() else { return };
-                let (bsize, bfeather) = (self.brush_size, self.brush_feather);
+                let bfeather = self.brush_feather;
+                // `brush` is a fraction of image width; store the size in image px
+                // so it scales with the photo (matches the original's behaviour).
+                let bsize = brush * w;
                 let Some(c) = self.active_container() else { return };
                 if let Some(sm) = self.container_subs_mut(c).and_then(|s| s.get_mut(sub)) {
                     let is_flow = sm.mask_type == "flow";
