@@ -1856,23 +1856,23 @@ impl Component for AppModel {
         // Icon tabs (relm4-icons line glyphs), matching the Tauri rail. Tooltips
         // carry the names since the buttons are icon-only.
         let adj_btn = gtk::ToggleButton::new();
-        adj_btn.set_icon_name("options-regular");
+        adj_btn.set_icon_name("options-filled");
         adj_btn.set_tooltip_text(Some("Adjustments"));
         adj_btn.set_active(true);
         let crop_btn = gtk::ToggleButton::new();
-        crop_btn.set_icon_name("crop-regular");
+        crop_btn.set_icon_name("crop-filled");
         crop_btn.set_tooltip_text(Some("Crop & geometry"));
         crop_btn.set_group(Some(&adj_btn));
         let masks_btn = gtk::ToggleButton::new();
-        masks_btn.set_icon_name("layer-diagonal-regular");
+        masks_btn.set_icon_name("layer-diagonal-person-filled");
         masks_btn.set_tooltip_text(Some("Masks"));
         masks_btn.set_group(Some(&adj_btn));
         let ai_btn = gtk::ToggleButton::new();
-        ai_btn.set_icon_name("paint-brush-regular");
+        ai_btn.set_icon_name("paint-brush-filled");
         ai_btn.set_tooltip_text(Some("Inpaint (generative replace)"));
         ai_btn.set_group(Some(&adj_btn));
         let info_btn = gtk::ToggleButton::new();
-        info_btn.set_icon_name("info-regular");
+        info_btn.set_icon_name("info-filled");
         info_btn.set_tooltip_text(Some("Photo info & metadata"));
         info_btn.set_group(Some(&adj_btn));
         {
