@@ -343,15 +343,40 @@ impl MasksPanel {
             self.body.remove(&c);
         }
 
-        self.body.append(&add_menu(sender));
+        // Header: title + reset-all.
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.set_margin_bottom(4);
+        let title = gtk::Label::new(Some("Masking"));
+        title.add_css_class("title-4");
+        title.set_halign(gtk::Align::Start);
+        title.set_hexpand(true);
+        header.append(&title);
+        let reset = gtk::Button::from_icon_name("arrow-counterclockwise-regular");
+        reset.add_css_class("flat");
+        reset.set_tooltip_text(Some("Reset all masks"));
+        reset.set_sensitive(!masks.is_empty());
+        {
+            let sender = sender.clone();
+            reset.connect_clicked(move |_| sender.input(AppMsg::ResetAllMasks));
+        }
+        header.append(&reset);
+        self.body.append(&header);
 
         if masks.is_empty() {
-            let hint = gtk::Label::new(Some("No masks. Add one above."));
-            hint.add_css_class("dim-label");
-            hint.set_margin_top(8);
-            self.body.append(&hint);
+            let heading = gtk::Label::new(Some("Create New Mask"));
+            heading.add_css_class("heading");
+            heading.set_halign(gtk::Align::Start);
+            heading.set_margin_bottom(2);
+            self.body.append(&heading);
+            self.body.append(&create_grid(sender));
             return;
         }
+
+        let heading = gtk::Label::new(Some("Masks"));
+        heading.add_css_class("heading");
+        heading.set_halign(gtk::Align::Start);
+        heading.set_margin_bottom(2);
+        self.body.append(&heading);
 
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         list.add_css_class("card");
@@ -360,6 +385,21 @@ impl MasksPanel {
             list.append(&mask_row(i, m, selected == Some(i), sender));
         }
         self.body.append(&list);
+
+        // "Add new mask" → popover containing the same create grid.
+        let add = gtk::MenuButton::new();
+        add.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name("add-regular")
+                .label("Add new mask")
+                .build(),
+        ));
+        add.add_css_class("flat");
+        add.set_margin_top(2);
+        let pop = gtk::Popover::new();
+        pop.set_child(Some(&create_grid(sender)));
+        add.set_popover(Some(&pop));
+        self.body.append(&add);
 
         if let Some(i) = selected {
             if let Some(m) = masks.get(i) {
@@ -437,38 +477,6 @@ fn create_grid(sender: &ComponentSender<AppModel>) -> gtk::Grid {
     grid.attach(&others, (n % 3) as i32, (n / 3) as i32, 1, 1);
 
     grid
-}
-
-/// The "Add mask" menu button (popover of non-AI types).
-#[allow(dead_code)]
-fn add_menu(sender: &ComponentSender<AppModel>) -> gtk::MenuButton {
-    let btn = gtk::MenuButton::new();
-    btn.set_child(Some(
-        &adw::ButtonContent::builder()
-            .icon_name("add-regular")
-            .label("Add mask")
-            .build(),
-    ));
-    btn.add_css_class("flat");
-
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    list.set_margin_all(4);
-    let pop = gtk::Popover::new();
-    pop.set_child(Some(&list));
-    for &(label, ty) in MASK_TYPES {
-        let item = gtk::Button::with_label(label);
-        item.add_css_class("flat");
-        item.set_halign(gtk::Align::Fill);
-        let sender = sender.clone();
-        let pop = pop.clone();
-        item.connect_clicked(move |_| {
-            pop.popdown();
-            sender.input(AppMsg::AddMask(ty));
-        });
-        list.append(&item);
-    }
-    btn.set_popover(Some(&pop));
-    btn
 }
 
 /// "Add sub-mask" menu for a container (non-AI types), emitting `AddSubMask`.

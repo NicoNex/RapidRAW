@@ -232,6 +232,7 @@ enum AppMsg {
     SetColorLabel(Option<String>),
     /// Masks panel actions.
     AddMask(&'static str),
+    ResetAllMasks,
     SelectMask(Option<usize>),
     DeleteMask(usize),
     ToggleMaskVisible(usize),
@@ -2422,6 +2423,16 @@ impl Component for AppModel {
                 if matches!(ty, "radial" | "linear") {
                     self.canvas.set_mask_draw(Some((0, ty == "radial")));
                 }
+                self.schedule_history(&sender);
+                sender.input(AppMsg::RequestRender);
+            }
+            AppMsg::ResetAllMasks => {
+                self.session.masks.clear();
+                self.selected_mask = None;
+                self.edit_patch = None;
+                self.canvas.set_mask_draw(None);
+                self.masks_panel.rebuild(&self.session.masks, None, &sender);
+                self.refresh_mask_preview(&sender);
                 self.schedule_history(&sender);
                 sender.input(AppMsg::RequestRender);
             }
